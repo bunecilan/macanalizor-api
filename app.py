@@ -732,13 +732,27 @@ def format_report_short(data: Dict[str, Any]) -> str:
     lines.append(f"🏠 {t['home']} vs 🚶 {t['away']}")
     lines.append(f"\n⚽ Beklenen Goller:")
     lines.append(f"  Ev: {lh:.2f} | Dep: {la:.2f} | Top: {total:.2f}")
+    
+    # YENİ: Top 3 skorları emoji ile göster
     lines.append(f"\n🎯 En Olası Skorlar:")
-    lines.append(f"  1) {top7[0][0]} ({top7[0][1]*100:.1f}%)")
-    lines.append(f"  2) {top7[1][0]} ({top7[1][1]*100:.1f}%)")
-    lines.append(f"  3) {top7[2][0]} ({top7[2][1]*100:.1f}%)")
+    for i in range(min(3, len(top7))):
+        emoji = ["1️⃣", "2️⃣", "3️⃣"][i]
+        lines.append(f"  {emoji} {top7[i][0]} ({top7[i][1]*100:.1f}%)")
+    
     lines.append(f"\n📊 Tahminler:")
-    lines.append(f"  Alt/Üst: {net_ou} ({net_ou_p*100:.1f}%)")
-    lines.append(f"  BTTS: {net_btts} ({net_btts_p*100:.1f}%)")
+    
+    # Alt/Üst tahmini - güven seviyesi göster
+    ou_emoji = "✅" if net_ou_c == "Yüksek" else "⚠️" if net_ou_c == "Orta" else "❓"
+    lines.append(f"  Alt/Üst: {net_ou} ({net_ou_p*100:.1f}%) {ou_emoji}")
+    
+    # BTTS tahmini - güven seviyesi göster
+    btts_emoji = "✅" if net_btts_c == "Yüksek" else "⚠️" if net_btts_c == "Orta" else "❓"
+    lines.append(f"  BTTS: {net_btts} ({net_btts_p*100:.1f}%) {btts_emoji}")
+    
+    # Tempo bilgisi ekle
+    tempo = determine_tempo(total)
+    tempo_emoji = "🔥" if tempo == "Yüksek" else "⚖️" if tempo == "Orta" else "🐌"
+    lines.append(f"  Tempo: {tempo} {tempo_emoji}")
     
     vb = data.get("value_bets")
     if vb and vb.get("used_odds"):
