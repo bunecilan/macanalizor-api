@@ -1,6 +1,7 @@
-Flask==3.0.3
+flask==3.0.3
 gunicorn==23.0.0
 requests==2.32.3
 beautifulsoup4==4.12.3
-lxml==5.2.2
-numpy==2.0.1
+lxml==5.3.0
+numpy==2.1.1
+flask-cors==4.0.1
