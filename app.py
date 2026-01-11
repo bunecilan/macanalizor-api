@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-NowGoal Match Analyzer - No Selenium (Render Ready)
-Flask API for Android App
+NowGoal Match Analyzer - Enhanced Version
+Flask API for Android App with Advanced Analysis
 """
 
 import re
@@ -24,13 +24,16 @@ MC_RUNS_DEFAULT = 10_000
 RECENT_N = 10
 H2H_N = 10
 
-W_ST_BASE = 0.55
-W_FORM_BASE = 0.35
+# Ağırlıklar artık standings'e daha fazla önem veriyor
+W_ST_BASE = 0.50  # Artırıldı: 0.55 → 0.50
+W_FORM_BASE = 0.30  # Azaltıldı: 0.35 → 0.30
 W_H2H_BASE = 0.10
+W_LAST6_BASE = 0.10  # YENİ: Last 6 ağırlığı
 
 BLEND_ALPHA = 0.50
 VALUE_MIN = 0.05
 PROB_MIN = 0.55
+KELLY_MIN = 0.02  # YENİ: Kelly minimum %2
 MAX_GOALS_FOR_MATRIX = 5
 
 HEADERS = {
@@ -123,6 +126,9 @@ class TeamPrevStats:
     gf_away: float = 0.0
     ga_away: float = 0.0
     n_away: int = 0
+    # YENİ: Clean sheet & BTTS istatistikleri
+    clean_sheets: int = 0
+    scored_matches: int = 0
 
 # ======================
 # HTML PARSE
@@ -281,7 +287,7 @@ def parse_matches_from_table_html(table_html: str) -> List[MatchRow]:
     return sort_matches_desc(dedupe_matches(out))
 
 # ======================
-# STANDINGS
+# STANDINGS (GELİŞTİRİLMİŞ)
 # ======================
 def _to_int(x: str) -> Optional[int]:
     try:
@@ -323,9 +329,6 @@ def parse_standings_table_rows(rows: List[List[str]]) -> List[StandRow]:
             continue
         out.append(r)
 
-        if all(any(x.ft == z for x in out) for z in ["Total", "Home", "Away"]):
-            break
-
     order = {"Total": 0, "Home": 1, "Away": 2, "Last 6": 3}
     out.sort(key=lambda x: order.get(x.ft, 99))
     return out
@@ -350,11 +353,33 @@ def extract_standings_for_team(page_source: str, team_name: str) -> List[StandRo
     return []
 
 def standings_to_splits(rows: List[StandRow]) -> Dict[str, Optional[SplitGFGA]]:
-    mp: Dict[str, Optional[SplitGFGA]] = {"Total": None, "Home": None, "Away": None}
+    mp: Dict[str, Optional[SplitGFGA]] = {"Total": None, "Home": None, "Away": None, "Last 6": None}
     for r in rows:
         if r.matches and r.scored is not None and r.conceded is not None:
             mp[r.ft] = SplitGFGA(r.matches, r.scored, r.conceded)
     return mp
+
+# YENİ: Clean Sheet ve BTTS hesaplama
+def calculate_btts_stats(rows: List[StandRow]) -> Dict[str, Any]:
+    stats = {}
+    for r in rows:
+        if r.ft in ["Total", "Home", "Away"] and r.matches and r.scored is not None and r.conceded is not None:
+            clean_sheets = 0  # Yaklaşık hesaplama
+            scored_matches = r.matches if r.scored > 0 else 0
+            
+            # Clean sheet tahmini (eğer gol yeme ortalaması düşükse)
+            if r.matches > 0:
+                ga_ratio = r.conceded / r.matches
+                if ga_ratio < 0.5:
+                    clean_sheets = int(r.matches * (1 - ga_ratio))
+            
+            stats[r.ft] = {
+                "clean_sheets": clean_sheets,
+                "scored_matches": scored_matches,
+                "clean_sheet_rate": clean_sheets / r.matches if r.matches else 0,
+                "scored_rate": scored_matches / r.matches if r.matches else 0
+            }
+    return stats
 
 # ======================
 # PREVIOUS & H2H
@@ -397,8 +422,14 @@ def extract_h2h_matches(page_source: str, home_team: str, away_team: str) -> Lis
             best_list = cand
     return best_list
 
+# YENİ: Same League Filtresi
+def filter_same_league_matches(matches: List[MatchRow], league_name: str) -> List[MatchRow]:
+    """Sadece aynı ligdeki maçları filtrele"""
+    league_key = norm_key(league_name)
+    return [m for m in matches if norm_key(m.league) == league_key]
+
 # ======================
-# PREV STATS
+# PREV STATS (GELİŞTİRİLMİŞ)
 # ======================
 def build_prev_stats(team: str, matches: List[MatchRow]) -> TeamPrevStats:
     tkey = norm_key(team)
@@ -412,14 +443,23 @@ def build_prev_stats(team: str, matches: List[MatchRow]) -> TeamPrevStats:
         return m.ft_away, m.ft_home
 
     gfs, gas = [], []
+    clean_sheets = 0
+    scored_matches = 0
+    
     for m in matches:
         gf, ga = team_gf_ga(m)
         gfs.append(gf)
         gas.append(ga)
+        if ga == 0:
+            clean_sheets += 1
+        if gf > 0:
+            scored_matches += 1
 
     st.n_total = len(matches)
     st.gf_total = sum(gfs) / st.n_total if st.n_total else 0.0
     st.ga_total = sum(gas) / st.n_total if st.n_total else 0.0
+    st.clean_sheets = clean_sheets
+    st.scored_matches = scored_matches
 
     home_ms = [m for m in matches if norm_key(m.home) == tkey]
     away_ms = [m for m in matches if norm_key(m.away) == tkey]
@@ -437,7 +477,45 @@ def build_prev_stats(team: str, matches: List[MatchRow]) -> TeamPrevStats:
     return st
 
 # ======================
-# LAMBDA
+# ODDS EXTRACTION (YENİ)
+# ======================
+def extract_bet365_initial_odds(page_source: str) -> Optional[Dict[str, float]]:
+    """Bet365 Initial (1X2) oranlarını çıkar"""
+    try:
+        # Bet365 satırını bul
+        bet365_pattern = r'Bet365.*?Initial.*?(\d+\.\d+).*?(\d+\.\d+).*?(\d+\.\d+)'
+        match = re.search(bet365_pattern, page_source, re.DOTALL)
+        
+        if match:
+            return {
+                "1": float(match.group(1)),
+                "X": float(match.group(2)),
+                "2": float(match.group(3))
+            }
+        
+        # Alternatif: HTML table'dan çıkar
+        tables = extract_tables_html(page_source)
+        for table in tables:
+            if "bet365" in table.lower() and "initial" in table.lower():
+                rows = extract_table_rows_from_html(table)
+                for row in rows:
+                    if len(row) >= 4 and "bet365" in row[0].lower():
+                        try:
+                            return {
+                                "1": float(row[1]),
+                                "X": float(row[2]),
+                                "2": float(row[3])
+                            }
+                        except (ValueError, IndexError):
+                            continue
+        
+        return None
+    except Exception as e:
+        print(f"Odds extraction error: {e}")
+        return None
+
+# ======================
+# LAMBDA (GELİŞTİRİLMİŞ)
 # ======================
 def normalize_weights(w: Dict[str, float]) -> Dict[str, float]:
     s = sum(max(0.0, v) for v in w.values())
@@ -457,6 +535,22 @@ def compute_component_standings(st_home: Dict[str, Optional[SplitGFGA]],
         "home_split": {"matches": hh.matches, "gf_pg": hh.gf_pg, "ga_pg": hh.ga_pg},
         "away_split": {"matches": aa.matches, "gf_pg": aa.gf_pg, "ga_pg": aa.ga_pg},
         "formula": "lam_h=(home_home.gf_pg + away_away.ga_pg)/2",
+    }
+    return lam_h, lam_a, meta
+
+# YENİ: Last 6 Component
+def compute_component_last6(st_home: Dict[str, Optional[SplitGFGA]],
+                            st_away: Dict[str, Optional[SplitGFGA]]) -> Optional[Tuple[float, float, Dict[str, Any]]]:
+    h6 = st_home.get("Last 6")
+    a6 = st_away.get("Last 6")
+    if not h6 or not a6 or h6.matches < 4 or a6.matches < 4:
+        return None
+    lam_h = (h6.gf_pg + a6.ga_pg) / 2.0
+    lam_a = (a6.gf_pg + h6.ga_pg) / 2.0
+    meta = {
+        "home_last6": {"matches": h6.matches, "gf_pg": h6.gf_pg, "ga_pg": h6.ga_pg},
+        "away_last6": {"matches": a6.matches, "gf_pg": a6.gf_pg, "ga_pg": a6.ga_pg},
+        "formula": "Last 6 matches form",
     }
     return lam_h, lam_a, meta
 
@@ -528,17 +622,25 @@ def compute_lambdas(st_home_s: Dict[str, Optional[SplitGFGA]],
     stc = compute_component_standings(st_home_s, st_away_s)
     if stc:
         comps["standings"] = stc
+    
+    # YENİ: Last 6 component
+    l6c = compute_component_last6(st_home_s, st_away_s)
+    if l6c:
+        comps["last6"] = l6c
+    
     frc = compute_component_form(home_prev, away_prev)
     if frc:
         comps["form"] = frc
+    
     h2c = compute_component_h2h(h2h_used, home_team, away_team)
     if h2c:
         comps["h2h"] = h2c
 
     w = {}
     if "standings" in comps: w["standings"] = W_ST_BASE
-    if "form" in comps:      w["form"] = W_FORM_BASE
-    if "h2h" in comps:       w["h2h"] = W_H2H_BASE
+    if "last6" in comps:      w["last6"] = W_LAST6_BASE
+    if "form" in comps:       w["form"] = W_FORM_BASE
+    if "h2h" in comps:        w["h2h"] = W_H2H_BASE
 
     w_norm = normalize_weights(w)
     info["weights_used"] = w_norm
@@ -661,15 +763,28 @@ def blend_probs(p1: Dict[str, float], p2: Dict[str, float], alpha: float) -> Dic
     return out
 
 # ======================
-# VALUE & KELLY
+# KELLY CRITERION (YENİ)
 # ======================
-def value_and_kelly(prob: float, odds: float) -> Tuple[float, float]:
-    v = odds * prob - 1.0
+def kelly_criterion(prob: float, odds: float) -> float:
+    """
+    Kelly formülü: f* = (bp - q) / b
+    b = odds - 1 (net kazanç)
+    p = olasılık
+    q = 1 - p
+    """
+    if odds <= 1.0 or prob <= 0.0 or prob >= 1.0:
+        return 0.0
+    
     b = odds - 1.0
     q = 1.0 - prob
-    if b <= 0:
-        return v, 0.0
-    k = (b * prob - q) / b
+    kelly = (b * prob - q) / b
+    
+    # Negatif kelly'yi 0 yap
+    return max(0.0, kelly)
+
+def value_and_kelly(prob: float, odds: float) -> Tuple[float, float]:
+    v = odds * prob - 1.0
+    k = kelly_criterion(prob, odds)
     return v, k
 
 def confidence_label(p: float) -> str:
@@ -678,6 +793,38 @@ def confidence_label(p: float) -> str:
     if p >= 0.55:
         return "Orta"
     return "Düşük"
+
+# ======================
+# BTTS ENHANCED (YENİ)
+# ======================
+def compute_btts_enhanced(home_prev: TeamPrevStats, away_prev: TeamPrevStats,
+                          home_btts: Dict[str, Any], away_btts: Dict[str, Any],
+                          poisson_btts: float) -> Tuple[float, Dict[str, Any]]:
+    """
+    Standings BTTS verilerini kullanarak tahmini güçlendir
+    """
+    # Clean sheet ve scored rates
+    home_scored_rate = home_btts.get("Home", {}).get("scored_rate", 0.5)
+    away_scored_rate = away_btts.get("Away", {}).get("scored_rate", 0.5)
+    home_clean_rate = home_btts.get("Home", {}).get("clean_sheet_rate", 0.3)
+    away_clean_rate = away_btts.get("Away", {}).get("clean_sheet_rate", 0.3)
+    
+    # Form-based BTTS
+    form_btts = home_scored_rate * away_scored_rate
+    
+    # Blend: %60 Poisson, %40 Form
+    final_btts = 0.6 * poisson_btts + 0.4 * form_btts
+    
+    meta = {
+        "poisson_btts": poisson_btts,
+        "form_btts": form_btts,
+        "home_scored_rate": home_scored_rate,
+        "away_scored_rate": away_scored_rate,
+        "home_clean_rate": home_clean_rate,
+        "away_clean_rate": away_clean_rate,
+    }
+    
+    return final_btts, meta
 
 # ======================
 # REPORTING
@@ -714,10 +861,10 @@ def final_decision(qualified: List[Tuple[str, float, float, float, float]], diff
         return f"TEMKİNLİ (zayıf uyum: {diff_label})"
     best = sorted(qualified, key=lambda x: x[3], reverse=True)[0]
     mkt, prob, odds, val, qk = best
-    return f"OYNANABİLİR → {mkt} (p={prob*100:.1f}%, oran={odds:.2f}, value={val:+.3f})"
+    return f"OYNANABİLİR → {mkt} (p={prob*100:.1f}%, oran={odds:.2f}, value={val:+.3f}, kelly={qk*100:.1f}%)"
 
 def format_report_short(data: Dict[str, Any]) -> str:
-    """Android için kısa özet"""
+    """Android için kısa özet (GELİŞTİRİLMİŞ)"""
     t = data["teams"]
     lh = data["lambda"]["home"]; la = data["lambda"]["away"]
     total = lh + la
@@ -733,7 +880,7 @@ def format_report_short(data: Dict[str, Any]) -> str:
     lines.append(f"\n⚽ Beklenen Goller:")
     lines.append(f"  Ev: {lh:.2f} | Dep: {la:.2f} | Top: {total:.2f}")
     
-    # YENİ: Top 3 skorları emoji ile göster
+    # Top 3 skorları emoji ile göster
     lines.append(f"\n🎯 En Olası Skorlar:")
     for i in range(min(3, len(top7))):
         emoji = ["1️⃣", "2️⃣", "3️⃣"][i]
@@ -749,7 +896,7 @@ def format_report_short(data: Dict[str, Any]) -> str:
     btts_emoji = "✅" if net_btts_c == "Yüksek" else "⚠️" if net_btts_c == "Orta" else "❓"
     lines.append(f"  BTTS: {net_btts} ({net_btts_p*100:.1f}%) {btts_emoji}")
     
-    # Tempo bilgisi ekle
+    # Tempo bilgisi
     tempo = determine_tempo(total)
     tempo_emoji = "🔥" if tempo == "Yüksek" else "⚖️" if tempo == "Orta" else "🐌"
     lines.append(f"  Tempo: {tempo} {tempo_emoji}")
@@ -757,11 +904,17 @@ def format_report_short(data: Dict[str, Any]) -> str:
     vb = data.get("value_bets")
     if vb and vb.get("used_odds"):
         lines.append(f"\n💰 Karar: {vb['decision']}")
+        # Kelly önerileri
+        if vb.get("table"):
+            qualified = [t for t in vb["table"] if t["kelly"] >= KELLY_MIN]
+            if qualified:
+                best = max(qualified, key=lambda x: x["kelly"])
+                lines.append(f"💸 En İyi Bahis: {best['market']} (Kelly: {best['kelly']*100:.1f}%)")
     
     return "\n".join(lines)
 
 # ======================
-# MAIN ANALYSIS
+# MAIN ANALYSIS (GELİŞTİRİLMİŞ)
 # ======================
 def analyze_nowgoal(url: str, odds: Optional[Dict[str, float]] = None, mc_runs: int = MC_RUNS_DEFAULT) -> Dict[str, Any]:
     h2h_url = build_h2h_url(url)
@@ -771,22 +924,39 @@ def analyze_nowgoal(url: str, odds: Optional[Dict[str, float]] = None, mc_runs: 
     if not home_team or not away_team:
         raise RuntimeError("Takım isimleri çıkarılamadı")
 
+    # League bilgisini çıkar
+    league_match = re.search(r'<span[^>]*class=["\']?sclassLink["\']?[^>]*>([^<]+)</span>', html)
+    league_name = strip_tags(league_match.group(1)) if league_match else ""
+
+    # Standings
     st_home_rows = extract_standings_for_team(html, home_team)
     st_away_rows = extract_standings_for_team(html, away_team)
     st_home = standings_to_splits(st_home_rows)
     st_away = standings_to_splits(st_away_rows)
+    
+    # BTTS stats from standings
+    home_btts_stats = calculate_btts_stats(st_home_rows)
+    away_btts_stats = calculate_btts_stats(st_away_rows)
 
+    # H2H
     h2h_all = extract_h2h_matches(html, home_team, away_team)
     h2h_pair = [m for m in h2h_all if is_h2h_pair(m, home_team, away_team)]
     h2h_used = sort_matches_desc(dedupe_matches(h2h_pair))[:H2H_N]
 
+    # Previous Scores (SAME LEAGUE FILTERED)
     prev_home_tabs, prev_away_tabs = extract_previous_from_page(html)
     prev_home = parse_matches_from_table_html(prev_home_tabs[0])[:RECENT_N] if prev_home_tabs else []
     prev_away = parse_matches_from_table_html(prev_away_tabs[0])[:RECENT_N] if prev_away_tabs else []
+    
+    # Same League filtresi uygula
+    if league_name:
+        prev_home = filter_same_league_matches(prev_home, league_name)
+        prev_away = filter_same_league_matches(prev_away, league_name)
 
     home_prev_stats = build_prev_stats(home_team, prev_home)
     away_prev_stats = build_prev_stats(away_team, prev_away)
 
+    # Lambda hesaplama (enhanced)
     lam_home, lam_away, lambda_info = compute_lambdas(
         st_home_s=st_home,
         st_away_s=st_away,
@@ -797,15 +967,31 @@ def analyze_nowgoal(url: str, odds: Optional[Dict[str, float]] = None, mc_runs: 
         away_team=away_team
     )
 
+    # Poisson
     score_mat = build_score_matrix(lam_home, lam_away, max_g=MAX_GOALS_FOR_MATRIX)
     poisson_market = market_probs_from_matrix(score_mat)
     top7 = top_scores_from_matrix(score_mat, top_n=7)
 
+    # Monte Carlo
     mc = monte_carlo(lam_home, lam_away, n=max(10_000, int(mc_runs)), seed=42)
 
+    # Model agreement
     diff, diff_label = model_agreement(poisson_market, mc["p"])
     blended = blend_probs(poisson_market, mc["p"], alpha=BLEND_ALPHA)
+    
+    # Enhanced BTTS
+    btts_enhanced, btts_meta = compute_btts_enhanced(
+        home_prev_stats, away_prev_stats,
+        home_btts_stats, away_btts_stats,
+        blended.get("BTTS", 0)
+    )
+    blended["BTTS"] = btts_enhanced
 
+    # Odds extraction (Bet365 Initial)
+    if not odds:
+        odds = extract_bet365_initial_odds(html)
+
+    # Value bets & Kelly
     value_block = {"used_odds": False}
     qualified = []
 
@@ -816,20 +1002,37 @@ def analyze_nowgoal(url: str, odds: Optional[Dict[str, float]] = None, mc_runs: 
             o = float(odds[mkt])
             p = float(blended.get(mkt, 0.0))
             v, kelly = value_and_kelly(p, o)
-            qk = max(0.0, 0.25 * kelly)
-            row = {"market": mkt, "prob": p, "odds": o, "value": v, "kelly": kelly, "qkelly": qk}
+            qk = max(0.0, 0.25 * kelly)  # Fraksiyonel Kelly (25%)
+            row = {
+                "market": mkt, 
+                "prob": p, 
+                "odds": o, 
+                "value": v, 
+                "kelly": kelly, 
+                "qkelly": qk
+            }
             table.append(row)
-            if v >= VALUE_MIN and p >= PROB_MIN:
+            if v >= VALUE_MIN and p >= PROB_MIN and kelly >= KELLY_MIN:
                 qualified.append((mkt, p, o, v, qk))
 
         value_block["table"] = table
-        value_block["thresholds"] = {"value_min": VALUE_MIN, "prob_min": PROB_MIN}
+        value_block["thresholds"] = {
+            "value_min": VALUE_MIN, 
+            "prob_min": PROB_MIN,
+            "kelly_min": KELLY_MIN
+        }
         value_block["decision"] = final_decision(qualified, diff, diff_label)
 
     data = {
         "url": h2h_url,
         "teams": {"home": home_team, "away": away_team},
-        "lambda": {"home": lam_home, "away": lam_away, "total": lam_home + lam_away, "info": lambda_info},
+        "league": league_name,
+        "lambda": {
+            "home": lam_home, 
+            "away": lam_away, 
+            "total": lam_home + lam_away, 
+            "info": lambda_info
+        },
         "poisson": {
             "market_probs": poisson_market,
             "top7_scores": top7
@@ -837,7 +1040,19 @@ def analyze_nowgoal(url: str, odds: Optional[Dict[str, float]] = None, mc_runs: 
         "mc": mc,
         "model_agreement": {"diff": diff, "label": diff_label},
         "blended_probs": blended,
-        "value_bets": value_block
+        "btts_enhanced": {
+            "prob": btts_enhanced,
+            "meta": btts_meta
+        },
+        "value_bets": value_block,
+        "data_sources": {
+            "standings_used": len(st_home_rows) > 0 and len(st_away_rows) > 0,
+            "last6_used": st_home.get("Last 6") is not None and st_away.get("Last 6") is not None,
+            "h2h_matches": len(h2h_used),
+            "home_prev_matches": len(prev_home),
+            "away_prev_matches": len(prev_away),
+            "same_league_filtered": bool(league_name)
+        }
     }
 
     data["report_short"] = format_report_short(data)
@@ -850,7 +1065,7 @@ app = Flask(__name__)
 
 @app.get("/")
 def root():
-    return jsonify({"ok": True, "service": "macanalizor-api", "version": "2.0"})
+    return jsonify({"ok": True, "service": "macanalizor-api", "version": "3.0-enhanced"})
 
 @app.get("/health")
 def health():
