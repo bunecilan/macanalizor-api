@@ -4,6 +4,7 @@ NowGoal Match Analyzer - Ultimate Version 5.0
 Flask API with Fixed Weight System & Render.com Deployment
 """
 
+import os
 import re
 import math
 import json
@@ -29,10 +30,15 @@ MC_RUNS_DEFAULT = 10_000
 RECENT_N = 10
 H2H_N = 10
 
+# Render için optimize edilmiş timeout
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept-Language": "en-US,en;q=0.9,tr;q=0.8",
 }
+
+# Render free tier için cache sistemi
+ANALYSIS_CACHE = {}
+CACHE_TIMEOUT = 300  # 5 dakika
 
 # ======================
 # UTILITY FUNCTIONS
@@ -45,8 +51,6 @@ def parse_corners(corner_str: str) -> Tuple[Optional[int], Optional[int]]:
     """
     Parse corner string like "12-1(3-1)" into:
     total_home, total_away
-    Format: toplam korner (ilk yarı korner)
-    Example: "12-1(3-1)" -> home: 12, away: 1
     """
     if not corner_str:
         return None, None
@@ -59,6 +63,16 @@ def parse_corners(corner_str: str) -> Tuple[Optional[int], Optional[int]]:
         return home_corners, away_corners
     
     return None, None
+
+def safe_get_url(url: str, timeout: int = 15):
+    """Safe URL fetching with retry for Render"""
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=timeout)
+        response.raise_for_status()
+        return response.text
+    except Exception as e:
+        print(f"URL fetch error: {e}")
+        return ""
 
 # ======================
 # DATA CLASSES
@@ -73,8 +87,6 @@ class MatchRow:
     ft_away: int
     corner_home: Optional[int] = None
     corner_away: Optional[int] = None
-    first_half_home: Optional[int] = None
-    first_half_away: Optional[int] = None
 
 @dataclass
 class StandRow:
@@ -104,64 +116,77 @@ class TeamStats:
     btts: int = 0
 
 # ======================
-# HTML PARSING FUNCTIONS
+# HTML PARSING FUNCTIONS (Simplified for Render)
 # ======================
 def extract_tables_html(html: str) -> List[str]:
     """Extract all table tags from HTML"""
+    if not html:
+        return []
     return re.findall(r'<table[^>]*>.*?</table>', html, re.DOTALL | re.IGNORECASE)
 
 def extract_table_rows(table_html: str) -> List[List[str]]:
     """Extract rows and cells from table HTML"""
     rows = []
-    row_matches = re.findall(r'<tr[^>]*>(.*?)</tr>', table_html, re.DOTALL | re.IGNORECASE)
-    
-    for row in row_matches:
-        row_clean = re.sub(r'<img[^>]*>', '', row)
-        cells = re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', row_clean, re.DOTALL | re.IGNORECASE)
-        if cells:
-            cleaned_cells = []
-            for cell in cells:
-                text = re.sub(r'<[^>]+>', '', cell)
-                text = re.sub(r'&nbsp;', ' ', text)
-                text = re.sub(r'\s+', ' ', text).strip()
-                cleaned_cells.append(text)
-            if cleaned_cells:
-                rows.append(cleaned_cells)
+    try:
+        row_matches = re.findall(r'<tr[^>]*>(.*?)</tr>', table_html, re.DOTALL | re.IGNORECASE)
+        
+        for row in row_matches:
+            row_clean = re.sub(r'<img[^>]*>', '', row)
+            cells = re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', row_clean, re.DOTALL | re.IGNORECASE)
+            if cells:
+                cleaned_cells = []
+                for cell in cells:
+                    text = re.sub(r'<[^>]+>', '', cell)
+                    text = re.sub(r'&nbsp;', ' ', text)
+                    text = re.sub(r'\s+', ' ', text).strip()
+                    if text:  # Skip empty cells
+                        cleaned_cells.append(text)
+                if cleaned_cells and len(cleaned_cells) >= 3:
+                    rows.append(cleaned_cells)
+    except Exception as e:
+        print(f"Table row extraction error: {e}")
     return rows
 
 def find_section(html: str, section_name: str) -> str:
     """Find a specific section in HTML"""
-    pattern = rf'(?i){re.escape(section_name)}.*?(?=<h\d>|$)'
-    match = re.search(pattern, html, re.DOTALL)
-    return match.group(0) if match else ""
+    try:
+        pattern = rf'(?i){re.escape(section_name)}.*?(?=<h\d>|$)'
+        match = re.search(pattern, html, re.DOTALL)
+        return match.group(0) if match else ""
+    except:
+        return ""
 
 def extract_match_from_row(row: List[str]) -> Optional[MatchRow]:
-    """Extract match data from a table row with corner parsing"""
+    """Extract match data from a table row"""
     if len(row) < 6:
         return None
     
     try:
-        score_idx = -1
+        # Find score
         score_match = None
+        score_idx = -1
         
         for idx, cell in enumerate(row):
             if re.search(r'\d+\s*-\s*\d+', cell):
                 score_match = re.search(r'(\d+)\s*-\s*(\d+)', cell)
-                score_idx = idx
-                break
+                if score_match:
+                    score_idx = idx
+                    break
         
-        if not score_match:
+        if not score_match or score_idx == -1:
             return None
         
         home_score = int(score_match.group(1))
         away_score = int(score_match.group(2))
         
+        # Get teams (assuming teams are around the score)
         if score_idx > 0 and score_idx < len(row) - 1:
             home_team = row[score_idx - 1].strip()
             away_team = row[score_idx + 1].strip()
         else:
             return None
         
+        # Find corners
         corner_home = corner_away = None
         for cell in row:
             corners_match = re.search(r'(\d+)\s*-\s*(\d+)\s*(?:\([^)]+\))?', cell)
@@ -170,8 +195,9 @@ def extract_match_from_row(row: List[str]) -> Optional[MatchRow]:
                 corner_away = int(corners_match.group(2))
                 break
         
+        # Date (usually in first column)
         match_date = ""
-        for cell in row[:2]:
+        for cell in row[:3]:
             if re.match(r'\d{2}-\d{2}-\d{4}', cell):
                 match_date = cell
                 break
@@ -189,7 +215,6 @@ def extract_match_from_row(row: List[str]) -> Optional[MatchRow]:
             corner_away=corner_away
         )
     except Exception as e:
-        print(f"Error parsing row: {e}")
         return None
 
 # ======================
@@ -210,8 +235,7 @@ def extract_standings_data(html: str, team_name: str) -> Dict[str, StandRow]:
         if len(rows) < 3:
             continue
         
-        header_row = rows[0] if rows else []
-        header_text = ' '.join(header_row).lower()
+        header_text = ' '.join(rows[0]).lower() if rows else ""
         
         if any(keyword in header_text for keyword in ['matches', 'win', 'draw', 'loss', 'pts']):
             for row in rows[1:]:
@@ -240,23 +264,23 @@ def extract_standings_data(html: str, team_name: str) -> Dict[str, StandRow]:
     return standings
 
 def extract_h2h_matches(html: str) -> List[MatchRow]:
-    """Extract Head-to-Head matches from H2H section"""
+    """Extract Head-to-Head matches"""
     matches = []
     
-    h2h_section = find_section(html, "Head to Head Statistics")
-    if not h2h_section:
-        h2h_section = find_section(html, "H2H Statistics")
+    for section_name in ["Head to Head Statistics", "H2H Statistics", "Head to Head"]:
+        h2h_section = find_section(html, section_name)
+        if h2h_section:
+            tables = extract_tables_html(h2h_section)
+            for table in tables[:2]:  # İlk 2 tablo
+                rows = extract_table_rows(table)
+                for row in rows:
+                    match_data = extract_match_from_row(row)
+                    if match_data:
+                        matches.append(match_data)
+            if matches:
+                break
     
-    if h2h_section:
-        tables = extract_tables_html(h2h_section)
-        for table in tables:
-            rows = extract_table_rows(table)
-            for row in rows:
-                match_data = extract_match_from_row(row)
-                if match_data:
-                    matches.append(match_data)
-    
-    return matches
+    return matches[:10]  # Max 10 maç
 
 def extract_previous_matches(html: str, team_type: str = "home") -> List[MatchRow]:
     """
@@ -283,15 +307,15 @@ def extract_previous_matches(html: str, team_type: str = "home") -> List[MatchRo
             if match_data:
                 matches.append(match_data)
     
-    return matches
+    return matches[:8]  # Max 8 maç
 
 def extract_bet365_odds(html: str) -> Dict[str, float]:
     """Extract Bet365 Initial 1X2 odds"""
     odds = {}
     
     patterns = [
-        r'Bet365\s*Initial.*?(\d+\.\d+).*?(\d+\.\d+).*?(\d+\.\d+)',
-        r'bet365\s*initial.*?(\d+\.\d+).*?(\d+\.\d+).*?(\d+\.\d+)',
+        r'Bet365.*?Initial.*?(\d+\.\d+).*?(\d+\.\d+).*?(\d+\.\d+)',
+        r'bet365.*?initial.*?(\d+\.\d+).*?(\d+\.\d+).*?(\d+\.\d+)',
         r'1\s*[/:]\s*(\d+\.\d+).*?X\s*[/:]\s*(\d+\.\d+).*?2\s*[/:]\s*(\d+\.\d+)'
     ]
     
@@ -312,6 +336,7 @@ def extract_bet365_odds(html: str) -> Dict[str, float]:
 
 def extract_teams_from_html(html: str) -> Tuple[str, str]:
     """Extract team names from HTML"""
+    # Title'dan çıkar
     title_match = re.search(r'<title>(.*?)</title>', html, re.IGNORECASE)
     if title_match:
         title = title_match.group(1)
@@ -319,14 +344,7 @@ def extract_teams_from_html(html: str) -> Tuple[str, str]:
         if vs_match:
             return vs_match.group(1).strip(), vs_match.group(2).strip()
     
-    h1_match = re.search(r'<h1[^>]*>(.*?)</h1>', html, re.IGNORECASE | re.DOTALL)
-    if h1_match:
-        h1_text = re.sub(r'<[^>]+>', '', h1_match.group(1))
-        vs_match = re.search(r'([^VS]+)\s+VS\s+([^<|]+)', h1_text, re.IGNORECASE)
-        if vs_match:
-            return vs_match.group(1).strip(), vs_match.group(2).strip()
-    
-    return "Home Team", "Away Team"
+    return "Ev Sahibi", "Deplasman"
 
 # ======================
 # STATISTICAL ANALYSIS - SABİT AĞIRLIK SİSTEMİ
@@ -391,14 +409,12 @@ def calculate_expected_goals(home_stats: TeamStats, away_stats: TeamStats,
     
     # 1. STANDING BİLEŞENİ (%50 Ağırlık)
     standing_home_xg = standing_away_xg = 0.0
-    standing_weight = WEIGHT_STANDINGS  # 0.50
     
     if "Home" in home_standings and "Away" in away_standings:
         home_stand = home_standings["Home"]
         away_stand = away_standings["Away"]
         
         if home_stand.matches > 5 and away_stand.matches > 5:
-            # Gol ortalamalarından hesapla
             home_gf_avg = home_stand.scored / home_stand.matches
             home_ga_avg = home_stand.conceded / home_stand.matches
             away_gf_avg = away_stand.scored / away_stand.matches
@@ -409,13 +425,12 @@ def calculate_expected_goals(home_stats: TeamStats, away_stats: TeamStats,
     
     # 2. H2H BİLEŞENİ (%30 Ağırlık)
     h2h_home_xg = h2h_away_xg = 0.0
-    h2h_weight = WEIGHT_H2H  # 0.30
     
     if h2h_matches and len(h2h_matches) >= 3:
         h2h_home_goals = []
         h2h_away_goals = []
         
-        for match in h2h_matches[:6]:  # Son 6 H2H maçı
+        for match in h2h_matches[:6]:
             h2h_home_goals.append(match.ft_home)
             h2h_away_goals.append(match.ft_away)
         
@@ -425,12 +440,10 @@ def calculate_expected_goals(home_stats: TeamStats, away_stats: TeamStats,
     # 3. PREVIOUS SCORES BİLEŞENİ (%20 Ağırlık)
     prev_home_xg = home_stats.goals_for if home_stats.matches > 0 else 0
     prev_away_xg = away_stats.goals_for if away_stats.matches > 0 else 0
-    prev_weight = WEIGHT_PREVIOUS  # 0.20
     
     # SABİT AĞIRLIKLARLA BİRLEŞTİR
-    # Formül: (%50 * Standing) + (%30 * H2H) + (%20 * Previous)
-    home_xg = (standing_home_xg * standing_weight) + (h2h_home_xg * h2h_weight) + (prev_home_xg * prev_weight)
-    away_xg = (standing_away_xg * standing_weight) + (h2h_away_xg * h2h_weight) + (prev_away_xg * prev_weight)
+    home_xg = (standing_home_xg * WEIGHT_STANDINGS) + (h2h_home_xg * WEIGHT_H2H) + (prev_home_xg * WEIGHT_PREVIOUS)
+    away_xg = (standing_away_xg * WEIGHT_STANDINGS) + (h2h_away_xg * WEIGHT_H2H) + (prev_away_xg * WEIGHT_PREVIOUS)
     
     # Minimum ve maksimum sınırlar
     home_xg = max(0.2, min(3.5, home_xg))
@@ -440,7 +453,7 @@ def calculate_expected_goals(home_stats: TeamStats, away_stats: TeamStats,
 
 def calculate_corner_predictions(home_stats: TeamStats, away_stats: TeamStats,
                                h2h_matches: List[MatchRow]) -> Dict[str, Any]:
-    """Calculate corner predictions using team stats and H2H data"""
+    """Calculate corner predictions"""
     
     home_corners = (home_stats.corners_for + away_stats.corners_against) / 2
     away_corners = (away_stats.corners_for + home_stats.corners_against) / 2
@@ -468,31 +481,17 @@ def calculate_corner_predictions(home_stats: TeamStats, away_stats: TeamStats,
     corner_lines = [8.5, 9.5, 10.5]
     
     for line in corner_lines:
-        if total_corners > line:
-            predictions[f"O{line}"] = "Evet"
-            predictions[f"U{line}"] = "Hayır"
-        else:
-            predictions[f"O{line}"] = "Hayır"
-            predictions[f"U{line}"] = "Evet"
+        predictions[f"O{line}"] = "Evet" if total_corners > line else "Hayır"
+        predictions[f"U{line}"] = "Hayır" if total_corners > line else "Evet"
     
-    if len(h2h_matches) >= 5 and home_stats.matches >= 5 and away_stats.matches >= 5:
-        confidence = "Yüksek"
-    elif len(h2h_matches) >= 3 and home_stats.matches >= 3 and away_stats.matches >= 3:
-        confidence = "Orta"
-    else:
-        confidence = "Düşük"
+    confidence = "Yüksek" if len(h2h_matches) >= 5 else "Orta" if len(h2h_matches) >= 3 else "Düşük"
     
     return {
         "home_corners": round(home_corners, 1),
         "away_corners": round(away_corners, 1),
         "total_corners": round(total_corners, 1),
         "predictions": predictions,
-        "confidence": confidence,
-        "weight_info": {
-            "standings": f"%{WEIGHT_STANDINGS*100:.0f}",
-            "h2h": f"%{WEIGHT_H2H*100:.0f}",
-            "previous": f"%{WEIGHT_PREVIOUS*100:.0f}"
-        }
+        "confidence": confidence
     }
 
 # ======================
@@ -502,17 +501,19 @@ def poisson_probability(k: int, lam: float) -> float:
     """Calculate Poisson probability"""
     if lam <= 0:
         return 0.0
-    return math.exp(-lam) * (lam ** k) / math.factorial(k)
+    try:
+        return math.exp(-lam) * (lam ** k) / math.factorial(k)
+    except:
+        return 0.0
 
 def calculate_score_probabilities(home_xg: float, away_xg: float) -> Dict[str, Any]:
     """Calculate score probabilities using Poisson distribution"""
-    max_goals = 5
+    max_goals = 4  # Render için daha az hesaplama
     score_probs = {}
     
     for home_goals in range(max_goals + 1):
         for away_goals in range(max_goals + 1):
-            prob = (poisson_probability(home_goals, home_xg) * 
-                   poisson_probability(away_goals, away_xg))
+            prob = poisson_probability(home_goals, home_xg) * poisson_probability(away_goals, away_xg)
             score_probs[f"{home_goals}-{away_goals}"] = round(prob * 100, 2)
     
     sorted_scores = sorted(score_probs.items(), key=lambda x: x[1], reverse=True)[:5]
@@ -526,7 +527,6 @@ def calculate_score_probabilities(home_xg: float, away_xg: float) -> Dict[str, A
     
     over_25_prob = sum(prob for score, prob in score_probs.items() 
                       if sum(map(int, score.split('-'))) > 2.5)
-    under_25_prob = 100 - over_25_prob
     
     btts_prob = sum(prob for score, prob in score_probs.items() 
                    if int(score.split('-')[0]) > 0 and int(score.split('-')[1]) > 0)
@@ -539,7 +539,7 @@ def calculate_score_probabilities(home_xg: float, away_xg: float) -> Dict[str, A
             "draw": round(draw_prob, 1),
             "away_win": round(away_win_prob, 1),
             "over_2.5": round(over_25_prob, 1),
-            "under_2.5": round(under_25_prob, 1),
+            "under_2.5": round(100 - over_25_prob, 1),
             "btts": round(btts_prob, 1)
         }
     }
@@ -549,15 +549,14 @@ def calculate_value_bets(predicted_probs: Dict[str, float], odds: Dict[str, floa
     value_bets = []
     
     for market, prob in predicted_probs.items():
-        if market in odds:
+        if market in odds and odds[market] > 0:
             decimal_prob = prob / 100
             odds_value = odds[market]
             
             value = (decimal_prob * odds_value) - 1
             
             if odds_value > 1:
-                kelly = (decimal_prob * odds_value - 1) / (odds_value - 1)
-                kelly = max(0, min(0.25, kelly))
+                kelly = max(0, (decimal_prob * odds_value - 1) / (odds_value - 1))
             else:
                 kelly = 0
             
@@ -581,12 +580,30 @@ def calculate_value_bets(predicted_probs: Dict[str, float], odds: Dict[str, floa
 def analyze_nowgoal_match(url: str) -> Dict[str, Any]:
     """Main analysis function for NowGoal matches"""
     
+    # Cache kontrolü
+    cache_key = hash(url)
+    current_time = time.time()
+    if cache_key in ANALYSIS_CACHE:
+        cached_data, timestamp = ANALYSIS_CACHE[cache_key]
+        if current_time - timestamp < CACHE_TIMEOUT:
+            print(f"📦 Cache'ten yüklendi: {url}")
+            return cached_data
+    
     print(f"🔍 Analiz başlatılıyor: {url}")
     
     try:
         print("1. Sayfa yükleniyor...")
-        response = requests.get(url, headers=HEADERS, timeout=30)
-        html = response.text
+        html = safe_get_url(url)
+        
+        if not html:
+            return {
+                "success": False,
+                "error": "Sayfa yüklenemedi",
+                "match_info": {
+                    "url": url,
+                    "analysis_date": time.strftime("%d-%m-%Y %H:%M:%S")
+                }
+            }
         
         print("2. Takım isimleri çıkarılıyor...")
         home_team, away_team = extract_teams_from_html(html)
@@ -601,28 +618,21 @@ def analyze_nowgoal_match(url: str) -> Dict[str, Any]:
         print(f"   {len(h2h_matches)} H2H maçı bulundu")
         
         print("5. Önceki maçlar çıkarılıyor...")
-        print("   - Ev sahibi (Home+Same League)...")
         home_previous = extract_previous_matches(html, "home")
-        print(f"   - {len(home_previous)} maç bulundu")
-        
-        print("   - Deplasman (Away+Same League)...")
         away_previous = extract_previous_matches(html, "away")
-        print(f"   - {len(away_previous)} maç bulundu")
         
         print("6. Bet365 oranları çıkarılıyor...")
         odds = extract_bet365_odds(html)
-        print(f"   Oranlar: {odds}")
         
         print("7. Takım istatistikleri hesaplanıyor...")
         home_stats = calculate_team_stats(home_previous, home_team)
         away_stats = calculate_team_stats(away_previous, away_team)
         
-        print("8. Beklenen goller hesaplanıyor (Sabit Ağırlıklar: %50-%30-%20)...")
+        print("8. Beklenen goller hesaplanıyor...")
         home_xg, away_xg = calculate_expected_goals(
             home_stats, away_stats, h2h_matches, 
             home_standings, away_standings
         )
-        print(f"   xG: {home_team} {home_xg} - {away_team} {away_xg}")
         
         print("9. Skor olasılıkları hesaplanıyor...")
         score_predictions = calculate_score_probabilities(home_xg, away_xg)
@@ -642,6 +652,7 @@ def analyze_nowgoal_match(url: str) -> Dict[str, Any]:
         
         print("12. Rapor oluşturuluyor...")
         report = {
+            "success": True,
             "match_info": {
                 "home_team": home_team,
                 "away_team": away_team,
@@ -673,15 +684,25 @@ def analyze_nowgoal_match(url: str) -> Dict[str, Any]:
             "value_bets": value_bets
         }
         
-        summary = generate_summary(report)
-        report["summary"] = summary
+        report["summary"] = generate_summary(report)
+        
+        # Cache'e kaydet
+        ANALYSIS_CACHE[cache_key] = (report, time.time())
         
         print("✅ Analiz tamamlandı!")
         return report
         
     except Exception as e:
-        print(f"❌ Analiz hatası: {str(e)}")
-        return {"error": str(e), "traceback": traceback.format_exc()}
+        error_msg = f"❌ Analiz hatası: {str(e)}"
+        print(error_msg)
+        return {
+            "success": False,
+            "error": str(e),
+            "match_info": {
+                "url": url,
+                "analysis_date": time.strftime("%d-%m-%Y %H:%M:%S")
+            }
+        }
 
 def generate_summary(report: Dict) -> str:
     """Generate human-readable summary"""
@@ -692,16 +713,13 @@ def generate_summary(report: Dict) -> str:
     
     lines = []
     lines.append("=" * 60)
-    lines.append("📊 NOWGOAL MAÇ ANALİZ RAPORU (Sabit Ağırlık Sistemi)")
+    lines.append("📊 NOWGOAL MAÇ ANALİZ RAPORU")
     lines.append("=" * 60)
     
     lines.append(f"\n⚽ TAKIMLAR: {report['match_info']['home_team']} vs {report['match_info']['away_team']}")
     lines.append(f"📅 Analiz Tarihi: {report['match_info']['analysis_date']}")
     
-    lines.append(f"\n⚖️  KULLANILAN AĞIRLIKLAR:")
-    lines.append(f"   • Standing: {report['match_info']['weights_used']['standings']}")
-    lines.append(f"   • H2H: {report['match_info']['weights_used']['h2h']}")
-    lines.append(f"   • Previous Scores: {report['match_info']['weights_used']['previous']}")
+    lines.append(f"\n⚖️  AĞIRLIKLAR: %50 Standing, %30 H2H, %20 Previous")
     
     lines.append(f"\n🎯 TAHMİN EDİLEN SKOR: {pred['main_score']}")
     
@@ -720,22 +738,15 @@ def generate_summary(report: Dict) -> str:
     lines.append(f"   • Ev Sahibi: {corners['home_corners']:.1f}")
     lines.append(f"   • Deplasman: {corners['away_corners']:.1f}")
     lines.append(f"   • Toplam: {corners['total_corners']:.1f}")
-    lines.append(f"   • Güven Seviyesi: {corners['confidence']}")
+    lines.append(f"   • Güven: {corners['confidence']}")
     
     if value_bets:
         lines.append(f"\n💰 DEĞERLİ BAHİSLER:")
-        for bet in value_bets[:3]:
+        for bet in value_bets[:2]:
             lines.append(f"   • {bet['market']}: Oran {bet['odds']:.2f}, "
-                        f"Value %{bet['value']:+.1f}, Kelly %{bet['kelly']:.1f} "
-                        f"({bet['recommendation']})")
+                        f"Value %{bet['value']:+.1f} ({bet['recommendation']})")
     else:
         lines.append(f"\nℹ️  Değerli bahis bulunamadı")
-    
-    lines.append(f"\n📊 KULLANILAN VERİLER:")
-    lines.append(f"   • H2H Maçları: {data['h2h_matches']}")
-    lines.append(f"   • Ev Önceki Maçlar: {data['home_previous_matches']}")
-    lines.append(f"   • Dep Önceki Maçlar: {data['away_previous_matches']}")
-    lines.append(f"   • Oranlar: {'Var' if data['odds_available'] else 'Yok'}")
     
     lines.append(f"\n" + "=" * 60)
     lines.append("✅ NET TAVSİYE:")
@@ -758,26 +769,25 @@ def generate_summary(report: Dict) -> str:
     return "\n".join(lines)
 
 # ======================
-# FLASK API - RENDER.COM İÇİN OPTİMİZE
+# FLASK API
 # ======================
 app = Flask(__name__)
-CORS(app)  # CORS desteği - Render için gerekli
+CORS(app)
 
 @app.route('/')
 def home():
     return jsonify({
         "status": "online",
-        "service": "NowGoal Match Analyzer v5.0 (Sabit Ağırlık Sistemi)",
-        "endpoints": {
-            "/analyze": "POST - Maç analizi yap",
-            "/health": "GET - Sağlık kontrolü"
-        },
+        "service": "NowGoal Match Analyzer v5.0",
         "weights": {
             "standings": f"%{WEIGHT_STANDINGS*100:.0f}",
             "h2h": f"%{WEIGHT_H2H*100:.0f}",
             "previous": f"%{WEIGHT_PREVIOUS*100:.0f}"
         },
-        "deployment": "Render.com Optimized"
+        "endpoints": {
+            "/analyze": "POST - Maç analizi yap",
+            "/health": "GET - Sağlık kontrolü"
+        }
     })
 
 @app.route('/health')
@@ -785,11 +795,7 @@ def health():
     return jsonify({
         "status": "healthy",
         "timestamp": time.time(),
-        "weights": {
-            "standings": WEIGHT_STANDINGS,
-            "h2h": WEIGHT_H2H,
-            "previous": WEIGHT_PREVIOUS
-        }
+        "cache_size": len(ANALYSIS_CACHE)
     })
 
 @app.route('/analyze', methods=['POST'])
@@ -810,22 +816,15 @@ def analyze():
         if not url.startswith('http'):
             return jsonify({"success": False, "error": "Geçersiz URL formatı"}), 400
         
-        print(f"🔍 API İsteği: {url}")
+        print(f"📩 API İsteği: {url}")
         result = analyze_nowgoal_match(url)
         
-        if 'error' in result:
-            return jsonify({
-                "success": False,
-                "error": result['error'],
-                "processing_time": round(time.time() - start_time, 2)
-            }), 500
+        result["processing_time"] = round(time.time() - start_time, 2)
         
-        return jsonify({
-            "success": True,
-            "data": result,
-            "summary": result.get("summary", ""),
-            "processing_time": round(time.time() - start_time, 2)
-        })
+        if result.get("success"):
+            return jsonify(result)
+        else:
+            return jsonify(result), 500
         
     except Exception as e:
         return jsonify({
@@ -841,15 +840,10 @@ if __name__ == '__main__':
     print("=" * 60)
     print("NOWGOAL MAÇ ANALİZ SİSTEMİ v5.0")
     print("SABİT AĞIRLIK SİSTEMİ: %50 Standing, %30 H2H, %20 Previous")
-    print("RENDER.COM DEPLOYMENT - Optimized")
-    print("=" * 60)
-    print("\nAPI Endpoint: http://localhost:5000/analyze")
-    print("Render URL: https://macanalizor-api.onrender.com")
+    print("RENDER.COM OPTİMİZE EDİLMİŞ")
     print("=" * 60)
     
-    # Render için optimize edilmiş ayarlar
-    app.run(
-        host='0.0.0.0',
-        port=int(os.environ.get('PORT', 5000)),
-        debug=os.environ.get('DEBUG', 'False') == 'True'
-    )
+    port = int(os.environ.get('PORT', 5000))
+    debug = os.environ.get('DEBUG', 'False').lower() == 'true'
+    
+    app.run(host='0.0.0.0', port=port, debug=debug, threaded=True)
