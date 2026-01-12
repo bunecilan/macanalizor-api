@@ -1176,9 +1176,6 @@ app = Flask(__name__)
 def root():
     return jsonify({"ok": True, "service": "nowgoal-analyzer-api", "version": "4.2"})
 
-@app GET_error_handler():
-    pass
-
 @app.get("/health")
 def health():
     return jsonify({"ok": True, "status": "healthy"})
