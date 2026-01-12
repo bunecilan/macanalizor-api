@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FUTBOL MAÇ ANALİZ API - ULTRA ROBUST VERSION
-Her adımda hata kontrolü + Detaylı logging
+FUTBOL MAÇ ANALİZ API - SYNTAX FIXED VERSION
 """
 
 from flask import Flask, request, jsonify
@@ -27,10 +26,6 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-W_STANDING = 0.45
-W_PREVIOUS = 0.30
-W_H2H = 0.25
-
 # ============================================================
 # VERİ YAPILARI
 # ============================================================
@@ -46,20 +41,6 @@ class MatchData:
 # ============================================================
 # YARDIMCI FONKSİYONLAR
 # ============================================================
-def safe_float(value: Any, default: float = 0.0) -> float:
-    """Güvenli float dönüşümü"""
-    try:
-        return float(value) if value else default
-    except:
-        return default
-
-def safe_int(value: Any, default: int = 0) -> int:
-    """Güvenli int dönüşümü"""
-    try:
-        return int(value) if value else default
-    except:
-        return default
-
 def log_info(message: str):
     """Log mesajı"""
     print(f"[INFO] {message}")
@@ -134,21 +115,17 @@ def extract_team_names(html: str) -> Tuple[str, str]:
         match = re.search(r'<title>\s*(.*?)\s*</title>', html, flags=re.IGNORECASE | re.DOTALL)
         if match:
             title = strip_html(match.group(1))
+            # vs, VS, v, V ile ayır
             vs_match = re.search(r'(.+?)\s+(?:vs|VS|v|V)\s+(.+?)(?:\s+-|\s+\||$)', title, flags=re.IGNORECASE)
             if vs_match:
                 home = vs_match.group(1).strip()
                 away = vs_match.group(2).strip()
-                # İlk kelimeleri al (çok uzunsa)
+                # İlk 3 kelimeyi al (çok uzunsa)
                 home = ' '.join(home.split()[:3])
                 away = ' '.join(away.split()[:3])
                 if home and away and len(home) > 2 and len(away) > 2:
                     log_info(f"Teams found: {home} vs {away}")
                     return home, away
-
-        # Yöntem 2: Meta tag'lerden
-        meta_match = re.search(r'<meta[^>]*content=["'].*?([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+(?:vs|VS)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)', html, re.IGNORECASE)
-        if meta_match:
-            return meta_match.group(1).strip(), meta_match.group(2).strip()
 
         log_error("Could not extract team names")
         return "", ""
@@ -159,14 +136,13 @@ def extract_team_names(html: str) -> Tuple[str, str]:
 def extract_odds(html: str) -> Optional[Dict[str, float]]:
     """Bet365 oranlarını çıkar"""
     try:
-        # Basitleştirilmiş yaklaşım - sadece sayıları ara
+        # Basitleştirilmiş yaklaşım
         bet365_section = ""
         bet365_pos = html.lower().find('bet365')
         if bet365_pos != -1:
             bet365_section = html[bet365_pos:bet365_pos+5000]
 
         if bet365_section:
-            # Initial kelimesini ara
             initial_pos = bet365_section.lower().find('initial')
             if initial_pos != -1:
                 odds_section = bet365_section[initial_pos:initial_pos+500]
@@ -174,13 +150,12 @@ def extract_odds(html: str) -> Optional[Dict[str, float]]:
                 odds_pattern = r'\b([1-9]\d*\.\d{2})\b'
                 odds = re.findall(odds_pattern, odds_section)
                 if len(odds) >= 3:
-                    # İlk 3 oranı al (genelde 1-X-2 sırasında)
                     result = {
                         "1": float(odds[0]),
                         "X": float(odds[1]),
                         "2": float(odds[2])
                     }
-                    # Makul aralıkta mı kontrol et
+                    # Makul aralıkta mı
                     if all(1.01 <= v <= 50.0 for v in result.values()):
                         log_info(f"Odds found: {result}")
                         return result
@@ -207,17 +182,16 @@ def parse_match_row(cells: List[str]) -> Optional[MatchData]:
                 away = strip_html(cells[i+1])
 
                 if home and away and len(home) > 2 and len(away) > 2:
-                    ft_home = safe_int(match.group(1))
-                    ft_away = safe_int(match.group(2))
+                    ft_home = int(match.group(1))
+                    ft_away = int(match.group(2))
 
-                    # Korner ara (genelde skordan sonra)
+                    # Korner ara
                     corner_home, corner_away = None, None
                     for j in range(i+2, min(i+5, len(cells))):
                         corner_match = re.search(r'(\d{1,2})\s*[-:]\s*(\d{1,2})', cells[j])
                         if corner_match:
-                            ch = safe_int(corner_match.group(1))
-                            ca = safe_int(corner_match.group(2))
-                            # Makul korner sayısı mı? (0-20 arası)
+                            ch = int(corner_match.group(1))
+                            ca = int(corner_match.group(2))
                             if 0 <= ch <= 20 and 0 <= ca <= 20:
                                 corner_home = ch
                                 corner_away = ca
@@ -229,7 +203,7 @@ def parse_match_row(cells: List[str]) -> Optional[MatchData]:
                         corner_home=corner_home, corner_away=corner_away
                     )
         return None
-    except Exception as e:
+    except:
         return None
 
 def extract_matches(html: str, team1: str, team2: str, match_type: str = "all") -> List[MatchData]:
@@ -252,34 +226,29 @@ def extract_matches(html: str, team1: str, team2: str, match_type: str = "all") 
                 match_home_key = match.home.lower().replace(' ', '')
                 match_away_key = match.away.lower().replace(' ', '')
 
-                # Filtre uygula
                 if match_type == "h2h":
-                    # H2H: İki takım arasında
                     is_h2h = (match_home_key == team1_key and match_away_key == team2_key) or \
                              (match_home_key == team2_key and match_away_key == team1_key)
                     if is_h2h:
                         matches.append(match)
                 elif match_type == "home":
-                    # Ev sahibi maçları
                     if match_home_key == team1_key:
                         matches.append(match)
                 elif match_type == "away":
-                    # Deplasman maçları
                     if match_away_key == team1_key:
                         matches.append(match)
                 else:
-                    # Tüm maçlar
                     if team1_key in match_home_key or team1_key in match_away_key:
                         matches.append(match)
 
         log_info(f"Extracted {len(matches)} matches (type: {match_type})")
-        return matches[:10]  # En fazla 10 maç
+        return matches[:10]
     except Exception as e:
         log_error(f"Error extracting matches ({match_type})", e)
         return []
 
 # ============================================================
-# İSTATİSTİK HESAPLAMA
+# İSTATİSTİK
 # ============================================================
 def calculate_stats(team_name: str, matches: List[MatchData]) -> Dict[str, float]:
     """Takım istatistiklerini hesapla"""
@@ -321,21 +290,18 @@ def calculate_stats(team_name: str, matches: List[MatchData]) -> Dict[str, float
 def calculate_lambda(home_stats: Dict, away_stats: Dict, h2h_matches: List[MatchData]) -> Tuple[float, float]:
     """Lambda hesapla"""
     try:
-        # Basit yaklaşım
         lambda_home = home_stats["goals_scored"] * 0.6 + away_stats["goals_conceded"] * 0.4
         lambda_away = away_stats["goals_scored"] * 0.6 + home_stats["goals_conceded"] * 0.4
 
-        # H2H etkisi
         if h2h_matches:
-            h2h_home_goals = sum(m.score_home if m.home.lower().replace(' ','') in home_stats else m.score_away for m in h2h_matches)
-            h2h_away_goals = sum(m.score_away if m.home.lower().replace(' ','') in home_stats else m.score_home for m in h2h_matches)
+            h2h_home_goals = sum(m.score_home for m in h2h_matches)
+            h2h_away_goals = sum(m.score_away for m in h2h_matches)
             h2h_avg_home = h2h_home_goals / len(h2h_matches)
             h2h_avg_away = h2h_away_goals / len(h2h_matches)
 
             lambda_home = lambda_home * 0.7 + h2h_avg_home * 0.3
             lambda_away = lambda_away * 0.7 + h2h_avg_away * 0.3
 
-        # Sınırlama
         lambda_home = max(0.3, min(3.5, lambda_home))
         lambda_away = max(0.3, min(3.5, lambda_away))
 
@@ -360,7 +326,6 @@ def poisson_prob(k: int, lam: float) -> float:
 def calculate_predictions(lambda_home: float, lambda_away: float) -> Dict[str, Any]:
     """Tahminleri hesapla"""
     try:
-        # Skor matrisi
         scores = []
         for h in range(6):
             for a in range(6):
@@ -368,7 +333,6 @@ def calculate_predictions(lambda_home: float, lambda_away: float) -> Dict[str, A
                 scores.append((f"{h}-{a}", prob))
         scores.sort(key=lambda x: x[1], reverse=True)
 
-        # Market olasılıkları
         prob_1 = sum(poisson_prob(h, lambda_home) * poisson_prob(a, lambda_away) 
                      for h in range(6) for a in range(6) if h > a)
         prob_X = sum(poisson_prob(k, lambda_home) * poisson_prob(k, lambda_away) 
@@ -376,12 +340,10 @@ def calculate_predictions(lambda_home: float, lambda_away: float) -> Dict[str, A
         prob_2 = sum(poisson_prob(h, lambda_home) * poisson_prob(a, lambda_away) 
                      for h in range(6) for a in range(6) if h < a)
 
-        # Alt/Üst 2.5
         prob_over = sum(poisson_prob(h, lambda_home) * poisson_prob(a, lambda_away) 
                         for h in range(6) for a in range(6) if h + a > 2.5)
         prob_under = 1.0 - prob_over
 
-        # BTTS
         prob_btts_yes = sum(poisson_prob(h, lambda_home) * poisson_prob(a, lambda_away) 
                             for h in range(1, 6) for a in range(1, 6))
         prob_btts_no = 1.0 - prob_btts_yes
@@ -462,7 +424,6 @@ def analyze_match(url: str) -> Dict[str, Any]:
     try:
         log_info(f"Starting analysis for: {url}")
 
-        # 1. Sayfa çek
         html = get_page(url)
         if not html:
             return {
@@ -470,7 +431,6 @@ def analyze_match(url: str) -> Dict[str, Any]:
                 "error": "Sayfa yüklenemedi. NowGoal sitesi erişilebilir değil veya timeout oluştu."
             }
 
-        # 2. Takım isimlerini bul
         home_team, away_team = extract_team_names(html)
         if not home_team or not away_team:
             return {
@@ -478,33 +438,25 @@ def analyze_match(url: str) -> Dict[str, Any]:
                 "error": "Takım isimleri bulunamadı. URL formatı doğru mu kontrol edin."
             }
 
-        # 3. Maçları çıkar
         h2h_matches = extract_matches(html, home_team, away_team, "h2h")
         home_matches = extract_matches(html, home_team, "", "home")
         away_matches = extract_matches(html, away_team, "", "away")
 
         log_info(f"Matches found - H2H: {len(h2h_matches)}, Home: {len(home_matches)}, Away: {len(away_matches)}")
 
-        # 4. İstatistikleri hesapla
         home_stats = calculate_stats(home_team, home_matches)
         away_stats = calculate_stats(away_team, away_matches)
 
-        # 5. Lambda hesapla
         lambda_home, lambda_away = calculate_lambda(home_stats, away_stats, h2h_matches)
 
-        # 6. Tahminleri hesapla
         predictions = calculate_predictions(lambda_home, lambda_away)
 
-        # 7. Oranları çek
         odds = extract_odds(html)
 
-        # 8. Value bet analizi
         value_analysis = analyze_value_bets(predictions, odds)
 
-        # 9. Korner tahmini
         corner_total = (home_stats["corners"] + away_stats["corners"]) / 2
 
-        # 10. Sonuç
         return {
             "success": True,
             "match_info": {
@@ -549,7 +501,7 @@ def home():
     return jsonify({
         "status": "online",
         "service": "Futbol Maç Analiz API",
-        "version": "1.2-robust",
+        "version": "1.3-syntax-fixed",
         "health": "healthy"
     })
 
@@ -564,7 +516,7 @@ def analyze():
         if not data or 'url' not in data:
             return jsonify({
                 "success": False,
-                "error": "URL gerekli. Body: {\"url\": \"https://live3.nowgoal26.com/match/h2h-XXXXXX\"}"
+                "error": "URL gerekli"
             }), 400
 
         url = data['url']
