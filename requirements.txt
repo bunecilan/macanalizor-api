@@ -4,3 +4,4 @@ requests==2.31.0
 numpy==1.26.3
 gunicorn==21.2.0
 Werkzeug==3.0.1
+playwright
