@@ -213,33 +213,36 @@ def _slice_section(html: str, start_marker: str, end_markers: List[str], max_len
 # ======================
 def fetch_with_browser(url: str) -> str:
     """
-    Playwright kullanarak sayfayı açar, JavaScript'in yüklenmesini bekler ve HTML'i döndürür.
-    Bu kısım 'Aşçının Gözlüğü'dür.
+    Playwright kullanarak sayfayı açar, yavaş yavaş aşağı kaydırır (Lazy Load için) ve HTML'i alır.
     """
     print(f"[BROWSER] Sayfa açılıyor: {url}")
     try:
         with sync_playwright() as p:
-            # Chromium tarayıcısını başlat (headless=True demek ekranda pencere açmadan çalış demek)
+            # Chromium başlat
             browser = p.chromium.launch(headless=True)
             
-            # Yeni bir sayfa sekmesi aç
-            page = browser.new_page(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            # Context oluştur (Mobile view bazen daha sade olabilir ama Desktop garantidir)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 800}
             )
+            page = context.new_page()
             
-            # Sayfaya git
-            page.goto(url, timeout=60000, wait_until="domcontentloaded")
+            # Sayfaya git (Timeout süresini 90 saniyeye çıkardık)
+            page.goto(url, timeout=90000, wait_until="domcontentloaded")
             
-            # ÖNEMLİ: Sayfanın tam yüklenmesi için biraz bekle. 
-            # NowGoal verileri sonradan yüklediği için bu bekleme süresi kritik.
-            # Veri gelmezse bu süreyi artırabilirsin (örn: 5000 -> 8000)
-            page.wait_for_timeout(5000)
+            # --- YAVAŞ KAYDIRMA OPERASYONU ---
+            # Sayfanın en altına tek seferde inmek yerine, parça parça iniyoruz.
+            # Bu, sitenin "kullanıcı aşağı iniyor, verileri yükleyeyim" demesini sağlar.
+            for i in range(7): # 7 kere aşağı tuşuna basmış gibi yap
+                page.keyboard.press("PageDown")
+                page.wait_for_timeout(1000) # Her basışta 1 saniye bekle
             
-            # Sayfanın en altına kaydır ki "lazy load" olan kısımlar da yüklensin
+            # Garanti olsun diye en sona da git
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(1000)
+            page.wait_for_timeout(3000) # En sonda 3 saniye daha bekle
             
-            # Dolu HTML'i al
+            # İçeriği al
             content = page.content()
             
             browser.close()
@@ -248,6 +251,7 @@ def fetch_with_browser(url: str) -> str:
             
     except Exception as e:
         print(f"[BROWSER ERROR] Hata oluştu: {str(e)}")
+        # Hata olsa bile boş dönme, hatayı fırlat
         raise RuntimeError(f"Tarayıcı hatası: {e}")
 
 def extract_match_id(url: str) -> str:
