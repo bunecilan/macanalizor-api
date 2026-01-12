@@ -21,8 +21,8 @@ from flask import Flask, request, jsonify
 # CONFIG
 # ======================
 MC_RUNS_DEFAULT = 10_000
-RECENT_N = 10
-H2H_N = 10
+RECENT_N = 10         # Previous Scores: maksimum 10 maç
+H2H_N = 10            # H2H: maksimum 10 maç
 
 # Ağırlıklar - EN ÖNEMLĠDEN EN AZ ÖNEMLĠYE
 W_ST_BASE = 0.45      # Standing (Resmi lig verileri)
@@ -238,17 +238,30 @@ def is_h2h_pair(m: MatchRow, home_team: str, away_team: str) -> bool:
 def extract_corners_from_cell(cell: str) -> Optional[Tuple[int, int]]:
     """
     Hücrede korner verisi varsa çıkar
-    Örnek: "5-3" veya "(5-3)" formatında
+    Formatlar: "5-3", "(5-3)", "6-2(5-0)"
     """
-    m = re.search(r"\(?(\d{1,2})\s*-\s*(\d{1,2})\)?", cell)
+    # Önce parantez içindeki rakamları ara (genellikle korner)
+    m = re.search(r'\((\d{1,2})-(\d{1,2})\)', cell)
     if m:
         return int(m.group(1)), int(m.group(2))
+    
+    # Parantez yoksa, skor dışındaki rakam çiftini ara
+    # Skordan sonra gelen ikinci rakam çifti genelde korner
+    all_pairs = re.findall(r'(\d{1,2})-(\d{1,2})', cell)
+    if len(all_pairs) >= 2:  # İkinci çift korner olabilir
+        return int(all_pairs[1][0]), int(all_pairs[1][1])
+    
     return None
 
 # ======================
 # MATCH PARSE (KORNER DESTEKLİ)
 # ======================
 def parse_match_from_cells(cells: List[str]) -> Optional[MatchRow]:
+    """Maç satırını parse et - NowGoal formatına özel"""
+    if not cells or len(cells) < 4:
+        return None
+    
+    # Tarih bulma
     date_idx = None
     date_val = None
     for i, c in enumerate(cells):
@@ -257,45 +270,68 @@ def parse_match_from_cells(cells: List[str]) -> Optional[MatchRow]:
             date_idx = i
             date_val = d
             break
-    if date_idx is None or not date_val:
+    
+    # Tarih yoksa atla (header satırı olabilir)
+    if not date_val:
         return None
-
+    
+    # Skor bulma - "1-1" veya "3-3(2-2)" formatı
     score_idx = None
     score_m = None
     for i, c in enumerate(cells):
+        if i == date_idx:
+            continue
         c0 = (c or "").strip()
-        if normalize_date(c0):
-            continue
         m = SCORE_RE.search(c0)
-        if not m:
-            continue
-        score_idx = i
-        score_m = m
-        break
-    if score_idx is None or score_m is None:
+        if m:
+            score_idx = i
+            score_m = m
+            break
+    
+    if not score_m:
         return None
-
+    
     ft_h = int(score_m.group(1))
     ft_a = int(score_m.group(2))
     ht_h = int(score_m.group(3)) if score_m.group(3) else None
     ht_a = int(score_m.group(4)) if score_m.group(4) else None
-
-    if score_idx - 1 < 0 or score_idx + 1 >= len(cells):
-        return None
-    home = cells[score_idx - 1].strip()
-    away = cells[score_idx + 1].strip()
+    
+    # Ev/Deplasman takım bulma
+    home = None
+    away = None
+    
+    for i in range(score_idx - 1, -1, -1):
+        if cells[i] and cells[i] != date_val:
+            home = cells[i].strip()
+            break
+    
+    for i in range(score_idx + 1, len(cells)):
+        if cells[i]:
+            away = cells[i].strip()
+            break
+    
     if not home or not away:
         return None
-
-    league = cells[0].strip() if cells else "—"
     
-    # Korner verisi ara (skor hücresinden sonra genelde)
+    # Lig bilgisi (genelde ilk hücre)
+    league = cells[0].strip() if cells[0] and cells[0] != date_val else "—"
+    
+    # Korner bilgisi ara - skor hücresinde veya sonraki hücrelerde
     corner_home, corner_away = None, None
-    for i in range(score_idx + 2, len(cells)):
-        corners = extract_corners_from_cell(cells[i])
-        if corners:
-            corner_home, corner_away = corners
-            break
+    
+    # 1. Skor hücresinin kendisinde ara (örn: "3-3(2-2)" sonrası "6-2" gibi)
+    score_cell = cells[score_idx]
+    corners = extract_corners_from_cell(score_cell)
+    if corners:
+        corner_home, corner_away = corners
+    
+    # 2. Bulamadıysa sonraki hücrelerde ara
+    if not corners:
+        for i in range(score_idx + 1, min(score_idx + 5, len(cells))):
+            corners = extract_corners_from_cell(cells[i])
+            if corners:
+                corner_home, corner_away = corners
+                break
     
     return MatchRow(
         league=league, date=date_val, home=home, away=away,
@@ -360,23 +396,37 @@ def parse_standings_table_rows(rows: List[List[str]]) -> List[StandRow]:
     return out
 
 def extract_standings_for_team(page_source: str, team_name: str) -> List[StandRow]:
+    """Standing tablosunu çıkar - geliştirilmiş"""
     team_key = norm_key(team_name)
     candidates: List[Tuple[int, List[StandRow]]] = []
 
+    print(f"[DEBUG] Standing arıyor: {team_name}")
+    
     for tbl in extract_tables_html(page_source):
         text_low = strip_tags(tbl).lower()
-        if not all(k in text_low for k in ["matches", "win", "draw", "loss", "scored", "conceded"]):
+        
+        # Tablo başlıklarını kontrol et
+        required_keywords = ["matches", "win", "draw", "loss", "scored", "conceded"]
+        if not all(k in text_low for k in required_keywords):
             continue
+        
+        # Takım adı tabloda geçiyor mu?
+        if team_key not in norm_key(strip_tags(tbl)):
+            continue
+        
         rows = extract_table_rows_from_html(tbl)
         parsed = parse_standings_table_rows(rows)
-        if not parsed:
-            continue
-        if team_key and team_key in norm_key(strip_tags(tbl)):
+        
+        if parsed:
+            print(f"[DEBUG] Standing bulundu: {len(parsed)} satır")
             candidates.append((len(candidates), parsed))
-
-    if candidates:
-        return candidates[0][1]
-    return []
+            break  # İlkini al
+    
+    if not candidates:
+        print(f"[DEBUG] Standing bulunamadı!")
+        return []
+    
+    return candidates[0][1]
 
 def standings_to_splits(rows: List[StandRow]) -> Dict[str, Optional[SplitGFGA]]:
     mp: Dict[str, Optional[SplitGFGA]] = {"Total": None, "Home": None, "Away": None, "Last 6": None}
@@ -432,47 +482,59 @@ def extract_bet365_initial_odds(page_source: str) -> Optional[Dict[str, float]]:
 # PREVIOUS & H2H
 # ======================
 def extract_previous_from_page(page_source: str) -> Tuple[List[str], List[str]]:
-    """Previous Scores Statistics tablosunu bul"""
-    # Daha geniş arama
+    """
+    Previous Scores Statistics tablosunu bul
+    NowGoal yapısı: 2 tablo (Ev sahibi, Deplasman)
+    Ne kadar maç varsa o kadar al (1-10 arası)
+    """
+    print(f"[DEBUG] Previous Scores arıyor...")
+    
     markers = [
         "Previous Scores Statistics",
         "Previous Scores",
-        "Recent Matches",
-        "Recent Form"
+        "Recent Matches"
     ]
     
     tabs = []
     for marker in markers:
-        found_tabs = section_tables_by_marker(page_source, marker, max_tables=8)
+        found_tabs = section_tables_by_marker(page_source, marker, max_tables=10)
         if found_tabs:
+            print(f"[DEBUG] '{marker}' marker ile {len(found_tabs)} tablo bulundu")
             tabs = found_tabs
             break
     
     if not tabs:
-        # Fallback: Tüm tabloları tara, maç içerenleri bul
+        print(f"[DEBUG] Previous Scores marker bulunamadı, fallback...")
         all_tables = extract_tables_html(page_source)
         for t in all_tables:
-            if parse_matches_from_table_html(t):
+            matches = parse_matches_from_table_html(t)
+            if matches and len(matches) >= 3:  # En az 3 maç
                 tabs.append(t)
-                if len(tabs) >= 6:
-                    break
+                print(f"[DEBUG] Fallback: {len(matches)} maçlı tablo bulundu")
+            if len(tabs) >= 4:
+                break
     
     if not tabs:
+        print(f"[DEBUG] Hiç Previous maç tablosu bulunamadı!")
         return [], []
     
-    # Maç içeren tabloları filtrele
+    # Maç içeren tabloları filtrele (1-10 arası ne kadar varsa)
     match_tables: List[str] = []
     for t in tabs:
         ms = parse_matches_from_table_html(t)
-        if ms and len(ms) >= 3:  # En az 3 maç içermeli
+        if ms:  # En az 1 maç varsa ekle
             match_tables.append(t)
+            print(f"[DEBUG] Geçerli tablo eklendi: {len(ms)} maç")
         if len(match_tables) >= 2:
             break
+    
+    print(f"[DEBUG] Toplam {len(match_tables)} geçerli Previous tablo bulundu")
     
     if len(match_tables) == 0:
         return [], []
     if len(match_tables) == 1:
         return [match_tables[0]], []
+    
     return [match_tables[0]], [match_tables[1]]
 
 def extract_h2h_matches(page_source: str, home_team: str, away_team: str) -> List[MatchRow]:
@@ -580,47 +642,73 @@ def build_prev_stats(team: str, matches: List[MatchRow]) -> TeamPrevStats:
 # ======================
 def analyze_corners(home_prev: TeamPrevStats, away_prev: TeamPrevStats, 
                     h2h_matches: List[MatchRow]) -> Dict[str, Any]:
-    """Korner analizi ve tahmini"""
+    """
+    Korner analizi ve tahmini
+    H2H ve Previous Scores'daki korner verilerini kullan
+    """
     
-    # H2H korner ortalaması
-    h2h_corners = []
+    # H2H korner verileri
+    h2h_corners_total = []
+    h2h_corners_home = []
+    h2h_corners_away = []
+    
     for m in h2h_matches[:H2H_N]:
         if m.corner_home is not None and m.corner_away is not None:
-            h2h_corners.append(m.corner_home + m.corner_away)
+            h2h_corners_total.append(m.corner_home + m.corner_away)
+            h2h_corners_home.append(m.corner_home)
+            h2h_corners_away.append(m.corner_away)
     
-    h2h_avg = sum(h2h_corners) / len(h2h_corners) if h2h_corners else 0.0
+    h2h_total_avg = sum(h2h_corners_total) / len(h2h_corners_total) if h2h_corners_total else 0.0
+    h2h_home_avg = sum(h2h_corners_home) / len(h2h_corners_home) if h2h_corners_home else 0.0
+    h2h_away_avg = sum(h2h_corners_away) / len(h2h_corners_away) if h2h_corners_away else 0.0
     
-    # Takım ortalamaları
-    home_corners_for = home_prev.corners_for
-    home_corners_against = home_prev.corners_against
-    away_corners_for = away_prev.corners_for
-    away_corners_against = away_prev.corners_against
+    # Previous Scores korner ortalamaları (zaten TeamPrevStats'te var)
+    pss_home_for = home_prev.corners_for
+    pss_home_against = home_prev.corners_against
+    pss_away_for = away_prev.corners_for
+    pss_away_against = away_prev.corners_against
     
-    # Tahmini total korner
-    if h2h_avg > 0:
-        # H2H verisi varsa %60 H2H, %40 form
-        predicted_home_corners = 0.6 * (h2h_avg / 2) + 0.4 * ((home_corners_for + away_corners_against) / 2)
-        predicted_away_corners = 0.6 * (h2h_avg / 2) + 0.4 * ((away_corners_for + home_corners_against) / 2)
+    # Tahmini korner sayıları
+    if h2h_total_avg > 0:
+        # H2H verisi varsa: %60 H2H, %40 PSS
+        predicted_home_corners = 0.6 * h2h_home_avg + 0.4 * ((pss_home_for + pss_away_against) / 2)
+        predicted_away_corners = 0.6 * h2h_away_avg + 0.4 * ((pss_away_for + pss_home_against) / 2)
+    elif pss_home_for > 0 or pss_away_for > 0:
+        # Sadece PSS verisi varsa
+        predicted_home_corners = (pss_home_for + pss_away_against) / 2
+        predicted_away_corners = (pss_away_for + pss_home_against) / 2
     else:
-        # H2H yoksa sadece form
-        predicted_home_corners = (home_corners_for + away_corners_against) / 2
-        predicted_away_corners = (away_corners_for + home_corners_against) / 2
+        # Hiç veri yoksa
+        predicted_home_corners = 0.0
+        predicted_away_corners = 0.0
     
     total_corners = predicted_home_corners + predicted_away_corners
     
-    # Korner tahminleri
+    # Korner tahminleri (Over/Under)
     predictions = {}
-    for line in [9.5, 10.5, 11.5]:
-        predictions[f"O{line}"] = 1.0 if total_corners > line else 0.0
+    for line in [8.5, 9.5, 10.5, 11.5]:
+        over_prob = 1.0 if total_corners > line else max(0.0, (total_corners - line + 1) / 2)
+        predictions[f"O{line}"] = min(1.0, over_prob)
         predictions[f"U{line}"] = 1.0 - predictions[f"O{line}"]
+    
+    # Güven seviyesi
+    data_points = len(h2h_corners_total) + (1 if pss_home_for > 0 else 0)
+    if data_points >= 8:
+        confidence = "Yüksek"
+    elif data_points >= 4:
+        confidence = "Orta"
+    else:
+        confidence = "Düşük"
     
     return {
         "predicted_home_corners": round(predicted_home_corners, 1),
         "predicted_away_corners": round(predicted_away_corners, 1),
         "total_corners": round(total_corners, 1),
-        "h2h_avg": round(h2h_avg, 1),
+        "h2h_avg": round(h2h_total_avg, 1),
+        "h2h_data_count": len(h2h_corners_total),
+        "pss_data_available": pss_home_for > 0 or pss_away_for > 0,
         "predictions": predictions,
-        "confidence": "Yüksek" if len(h2h_corners) >= 5 else "Orta" if len(h2h_corners) >= 3 else "Düşük"
+        "confidence": confidence
     }
 
 # ======================
@@ -1022,19 +1110,70 @@ def analyze_nowgoal(url: str, odds: Optional[Dict[str, float]] = None, mc_runs: 
     st_home = standings_to_splits(st_home_rows)
     st_away = standings_to_splits(st_away_rows)
 
-    # H2H
+    # H2H (Maksimum 10 maç - güncel veriler için)
+    print(f"\n{'='*60}")
+    print(f"[H2H EXTRACTION]")
+    print(f"{'='*60}")
+    
     h2h_all = extract_h2h_matches(html, home_team, away_team)
     h2h_pair = [m for m in h2h_all if is_h2h_pair(m, home_team, away_team)]
-    h2h_used = sort_matches_desc(dedupe_matches(h2h_pair))[:H2H_N]
+    h2h_used = sort_matches_desc(dedupe_matches(h2h_pair))[:H2H_N]  # Maksimum 10
+    
+    if h2h_used:
+        print(f"[DEBUG] ✓ {len(h2h_used)} H2H maç bulundu:")
+        corner_count = 0
+        for i, m in enumerate(h2h_used[:3], 1):
+            corner_info = f" [Korner: {m.corner_home}-{m.corner_away}]" if m.corner_home else ""
+            print(f"  {i}. {m.home} {m.ft_home}-{m.ft_away} {m.away}{corner_info}")
+            if m.corner_home:
+                corner_count += 1
+        print(f"  → Toplam {len(h2h_used)} H2H maç, {corner_count} tanesinde korner verisi var")
+    else:
+        print(f"[DEBUG] ⚠️  H2H maç bulunamadı!")
+    
+    print(f"{'='*60}\n")
 
-    # Previous (Same League Filtered) - DEBUG EKLE
+    # Previous (Ne kadar varsa o kadar al: 1-10 arası)
+    print(f"\n{'='*60}")
+    print(f"[PREVIOUS SCORES EXTRACTION]")
+    print(f"{'='*60}")
+    
     prev_home_tabs, prev_away_tabs = extract_previous_from_page(html)
     
-    prev_home_raw = parse_matches_from_table_html(prev_home_tabs[0])[:RECENT_N] if prev_home_tabs else []
-    prev_away_raw = parse_matches_from_table_html(prev_away_tabs[0])[:RECENT_N] if prev_away_tabs else []
+    # Maksimum 10 maç al, ama ne kadar varsa o kadar kullan
+    prev_home_raw = parse_matches_from_table_html(prev_home_tabs[0]) if prev_home_tabs else []
+    prev_away_raw = parse_matches_from_table_html(prev_away_tabs[0]) if prev_away_tabs else []
     
-    # Debug log
+    # En fazla 10 maç
+    prev_home_raw = prev_home_raw[:RECENT_N]
+    prev_away_raw = prev_away_raw[:RECENT_N]
+    
     print(f"[DEBUG] Raw Previous - Home: {len(prev_home_raw)}, Away: {len(prev_away_raw)}")
+    
+    # İlk 3 maçı göster (debug) + Korner kontrolü
+    if prev_home_raw:
+        print(f"[DEBUG] Ev Sahibi Maçlar:")
+        corner_count = 0
+        for i, m in enumerate(prev_home_raw[:3], 1):
+            corner_info = f" [Korner: {m.corner_home}-{m.corner_away}]" if m.corner_home else ""
+            print(f"  {i}. {m.league}: {m.home} {m.ft_home}-{m.ft_away} {m.away}{corner_info}")
+            if m.corner_home:
+                corner_count += 1
+        print(f"  → Toplam {len(prev_home_raw)} maç, {corner_count} tanesinde korner verisi var")
+    else:
+        print(f"[DEBUG] ⚠️  Ev sahibi maçları PARSE EDİLEMEDİ!")
+    
+    if prev_away_raw:
+        print(f"[DEBUG] Deplasman Maçlar:")
+        corner_count = 0
+        for i, m in enumerate(prev_away_raw[:3], 1):
+            corner_info = f" [Korner: {m.corner_home}-{m.corner_away}]" if m.corner_home else ""
+            print(f"  {i}. {m.league}: {m.home} {m.ft_home}-{m.ft_away} {m.away}{corner_info}")
+            if m.corner_home:
+                corner_count += 1
+        print(f"  → Toplam {len(prev_away_raw)} maç, {corner_count} tanesinde korner verisi var")
+    else:
+        print(f"[DEBUG] ⚠️  Deplasman maçları PARSE EDİLEMEDİ!")
     
     prev_home = prev_home_raw
     prev_away = prev_away_raw
@@ -1043,20 +1182,21 @@ def analyze_nowgoal(url: str, odds: Optional[Dict[str, float]] = None, mc_runs: 
     if league_name:
         prev_home = filter_same_league_matches(prev_home_raw, league_name)
         prev_away = filter_same_league_matches(prev_away_raw, league_name)
-        print(f"[DEBUG] After Same League Filter - Home: {len(prev_home)}, Away: {len(prev_away)}")
+        print(f"[DEBUG] Same League Filter ({league_name}) - Home: {len(prev_home)}, Away: {len(prev_away)}")
     
     # Eğer filtre sonrası çok az veri kaldıysa, filtresiz kullan
     if len(prev_home) < 3 and len(prev_home_raw) >= 5:
-        print(f"[DEBUG] Same League filter çok veri kaybetti, filtresiz kullanılıyor")
+        print(f"[DEBUG] ⚠️  Same League filter çok veri kaybetti (Home), filtresiz kullanılıyor")
         prev_home = prev_home_raw
     if len(prev_away) < 3 and len(prev_away_raw) >= 5:
-        print(f"[DEBUG] Same League filter çok veri kaybetti, filtresiz kullanılıyor")
+        print(f"[DEBUG] ⚠️  Same League filter çok veri kaybetti (Away), filtresiz kullanılıyor")
         prev_away = prev_away_raw
 
     home_prev_stats = build_prev_stats(home_team, prev_home)
     away_prev_stats = build_prev_stats(away_team, prev_away)
     
-    print(f"[DEBUG] Final stats - Home matches: {home_prev_stats.n_total}, Away matches: {away_prev_stats.n_total}")
+    print(f"[DEBUG] ✓ Final stats - Home: {home_prev_stats.n_total} maç, Away: {away_prev_stats.n_total} maç")
+    print(f"{'='*60}\n")
 
     # Lambda
     lam_home, lam_away, lambda_info = compute_lambdas(
