@@ -432,16 +432,43 @@ def extract_bet365_initial_odds(page_source: str) -> Optional[Dict[str, float]]:
 # PREVIOUS & H2H
 # ======================
 def extract_previous_from_page(page_source: str) -> Tuple[List[str], List[str]]:
-    tabs = section_tables_by_marker(page_source, "Previous Scores Statistics", max_tables=6)
+    """Previous Scores Statistics tablosunu bul"""
+    # Daha geniş arama
+    markers = [
+        "Previous Scores Statistics",
+        "Previous Scores",
+        "Recent Matches",
+        "Recent Form"
+    ]
+    
+    tabs = []
+    for marker in markers:
+        found_tabs = section_tables_by_marker(page_source, marker, max_tables=8)
+        if found_tabs:
+            tabs = found_tabs
+            break
+    
+    if not tabs:
+        # Fallback: Tüm tabloları tara, maç içerenleri bul
+        all_tables = extract_tables_html(page_source)
+        for t in all_tables:
+            if parse_matches_from_table_html(t):
+                tabs.append(t)
+                if len(tabs) >= 6:
+                    break
+    
     if not tabs:
         return [], []
+    
+    # Maç içeren tabloları filtrele
     match_tables: List[str] = []
     for t in tabs:
         ms = parse_matches_from_table_html(t)
-        if ms:
+        if ms and len(ms) >= 3:  # En az 3 maç içermeli
             match_tables.append(t)
         if len(match_tables) >= 2:
             break
+    
     if len(match_tables) == 0:
         return [], []
     if len(match_tables) == 1:
@@ -449,16 +476,32 @@ def extract_previous_from_page(page_source: str) -> Tuple[List[str], List[str]]:
     return [match_tables[0]], [match_tables[1]]
 
 def extract_h2h_matches(page_source: str, home_team: str, away_team: str) -> List[MatchRow]:
-    markers = ["Head to Head Statistics", "Head to Head", "H2H Statistics", "H2H"]
+    """H2H maçlarını bul - geliştirilmiş"""
+    markers = [
+        "Head to Head Statistics",
+        "Head to Head",
+        "H2H Statistics", 
+        "H2H",
+        "VS Statistics"
+    ]
+    
+    # Önce marker ile ara
     for mk in markers:
-        tabs = section_tables_by_marker(page_source, mk, max_tables=4)
+        tabs = section_tables_by_marker(page_source, mk, max_tables=5)
         for t in tabs:
             cand = parse_matches_from_table_html(t)
+            if not cand:
+                continue
             pair_count = sum(1 for m in cand if is_h2h_pair(m, home_team, away_team))
-            if pair_count >= 3:
+            if pair_count >= 2:  # En az 2 H2H maç
+                print(f"[DEBUG] H2H bulundu: {pair_count} maç")
                 return cand
+    
+    # Fallback: Tüm tablolarda ara
+    print(f"[DEBUG] H2H marker bulunamadı, tüm tablolarda aranıyor...")
     best_pair = 0
     best_list: List[MatchRow] = []
+    
     for tbl in extract_tables_html(page_source):
         cand = parse_matches_from_table_html(tbl)
         if not cand:
@@ -467,6 +510,8 @@ def extract_h2h_matches(page_source: str, home_team: str, away_team: str) -> Lis
         if pair_count > best_pair:
             best_pair = pair_count
             best_list = cand
+    
+    print(f"[DEBUG] En iyi H2H: {best_pair} maç")
     return best_list
 
 def filter_same_league_matches(matches: List[MatchRow], league_name: str) -> List[MatchRow]:
@@ -923,12 +968,34 @@ def format_comprehensive_report(data: Dict[str, Any]) -> str:
     else:
         lines.append(f"\n💰 Oran verisi yok - value analizi yapılamadı")
     
-    # VERİ KAYNAKLARI
+    # VERİ KAYNAKLARI (Debug için daha detaylı)
     ds = data["data_sources"]
+    lambda_info = data["lambda"]["info"]
+    
     lines.append(f"\n📂 Kullanılan Veriler:")
     lines.append(f"  Standing: {'✓' if ds['standings_used'] else '✗'}")
-    lines.append(f"  PSS (Same League): ✓ (Ev:{ds['home_prev_matches']} | Dep:{ds['away_prev_matches']})")
-    lines.append(f"  H2H: ✓ ({ds['h2h_matches']} maç)")
+    
+    # PSS detayı
+    pss_home = ds['home_prev_matches']
+    pss_away = ds['away_prev_matches']
+    if pss_home > 0 or pss_away > 0:
+        lines.append(f"  PSS (Same League): ✓ (Ev:{pss_home} | Dep:{pss_away})")
+    else:
+        lines.append(f"  PSS (Same League): ✗ (Veri yok)")
+    
+    # H2H detayı
+    h2h_count = ds['h2h_matches']
+    if h2h_count > 0:
+        lines.append(f"  H2H: ✓ ({h2h_count} maç)")
+    else:
+        lines.append(f"  H2H: ✗ (Veri yok)")
+    
+    # Ağırlıklar (sadece kullanılanlar)
+    if lambda_info.get("weights_used"):
+        lines.append(f"\n⚖️  Ağırlıklar:")
+        for k, v in lambda_info["weights_used"].items():
+            k_name = {"standing": "Standing", "pss": "PSS", "h2h": "H2H"}.get(k, k)
+            lines.append(f"  {k_name}: %{v*100:.0f}")
     
     lines.append("=" * 60)
     
@@ -960,17 +1027,36 @@ def analyze_nowgoal(url: str, odds: Optional[Dict[str, float]] = None, mc_runs: 
     h2h_pair = [m for m in h2h_all if is_h2h_pair(m, home_team, away_team)]
     h2h_used = sort_matches_desc(dedupe_matches(h2h_pair))[:H2H_N]
 
-    # Previous (Same League Filtered)
+    # Previous (Same League Filtered) - DEBUG EKLE
     prev_home_tabs, prev_away_tabs = extract_previous_from_page(html)
-    prev_home = parse_matches_from_table_html(prev_home_tabs[0])[:RECENT_N] if prev_home_tabs else []
-    prev_away = parse_matches_from_table_html(prev_away_tabs[0])[:RECENT_N] if prev_away_tabs else []
     
+    prev_home_raw = parse_matches_from_table_html(prev_home_tabs[0])[:RECENT_N] if prev_home_tabs else []
+    prev_away_raw = parse_matches_from_table_html(prev_away_tabs[0])[:RECENT_N] if prev_away_tabs else []
+    
+    # Debug log
+    print(f"[DEBUG] Raw Previous - Home: {len(prev_home_raw)}, Away: {len(prev_away_raw)}")
+    
+    prev_home = prev_home_raw
+    prev_away = prev_away_raw
+    
+    # Same League filtresi (varsa uygula)
     if league_name:
-        prev_home = filter_same_league_matches(prev_home, league_name)
-        prev_away = filter_same_league_matches(prev_away, league_name)
+        prev_home = filter_same_league_matches(prev_home_raw, league_name)
+        prev_away = filter_same_league_matches(prev_away_raw, league_name)
+        print(f"[DEBUG] After Same League Filter - Home: {len(prev_home)}, Away: {len(prev_away)}")
+    
+    # Eğer filtre sonrası çok az veri kaldıysa, filtresiz kullan
+    if len(prev_home) < 3 and len(prev_home_raw) >= 5:
+        print(f"[DEBUG] Same League filter çok veri kaybetti, filtresiz kullanılıyor")
+        prev_home = prev_home_raw
+    if len(prev_away) < 3 and len(prev_away_raw) >= 5:
+        print(f"[DEBUG] Same League filter çok veri kaybetti, filtresiz kullanılıyor")
+        prev_away = prev_away_raw
 
     home_prev_stats = build_prev_stats(home_team, prev_home)
     away_prev_stats = build_prev_stats(away_team, prev_away)
+    
+    print(f"[DEBUG] Final stats - Home matches: {home_prev_stats.n_total}, Away matches: {away_prev_stats.n_total}")
 
     # Lambda
     lam_home, lam_away, lambda_info = compute_lambdas(
@@ -1095,7 +1181,14 @@ def analiz_et_route():
         return jsonify({"ok": False, "error": "Geçersiz URL formatı"}), 400
 
     try:
+        print(f"\n{'='*60}")
+        print(f"[ANALİZ BAŞLADI] {url}")
+        print(f"{'='*60}")
+        
         data = analyze_nowgoal(url, odds=None, mc_runs=10_000)
+        
+        print(f"\n[ANALİZ TAMAMLANDI]")
+        print(f"{'='*60}\n")
         
         # Android için basitleştirilmiş response
         top_skor = data["poisson"]["top7_scores"][0][0]
@@ -1114,6 +1207,8 @@ def analiz_et_route():
         })
         
     except Exception as e:
+        print(f"\n[HATA] {str(e)}")
+        print(traceback.format_exc())
         return jsonify({
             "ok": False,
             "error": f"Analiz hatası: {str(e)}",
