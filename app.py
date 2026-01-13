@@ -1,17 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-NowGoal Match Analyzer - Enhanced Version 4.1 (ODDS+PSS FIX)
+NowGoal Match Analyzer - Enhanced Version 4.2 (SAME LEAGUE FIX)
 Flask API with Corner Analysis & Enhanced Value Betting
 
-FIX PACK (v4.1):
-1) Bet365 Initial 1X2 odds artık H2H sayfasından değil /oddscomp/{matchid} üzerinden çekilir.
-   - Hücre text'i boşsa title/data-* gibi attribute içinden de sayı yakalanır.
-2) PSS "tıklama" mantığı taklit edildi:
-   - Home team: Same League + HOME-only
-   - Away team: Same League + AWAY-only
-   Böylece bazı maçlarda 10 yerine 7 maç doğal olarak kalır.
-3) H2H için Same League filtre (en az 3 maç varsa) uygulanır; yoksa all H2H fallback.
-4) Corner O/U olasılıkları lineer yaklaşık yerine Poisson ile hesaplanır.
+FIX PACK (v4.2):
+1) "Same League" filtresi düzeltildi:
+   - Artık kelime bazlı (Token) eşleşme ile lig isimlerini daha iyi yakalar.
+   - Filtre sonucunda maç bulunamazsa tüm listeyi döndüren hata (fallback) kaldırıldı.
+   - Böylece PSS hesaplanırken lig dışı maçlar analize dahil edilmez.
+2) Bet365 Initial 1X2 odds entegrasyonu korunmuştur.
+3) PSS "tıklama" mantığı (Same League + Home/Away Only) tam olarak uygulanır.
 """
 
 import re
@@ -680,15 +678,52 @@ def extract_h2h_matches(page_source: str, home_team: str, away_team: str) -> Lis
     return best_list
 
 def filter_same_league_matches(matches: List[MatchRow], league_name: str) -> List[MatchRow]:
+    """
+    GELİŞMİŞ SAME LEAGUE FİLTRESİ (Token + Substring):
+    Eski yöntem sadece basit 'substring' kontrolü yapıyordu ve bulamazsa
+    TÜM listeyi döndürüyordu (bu da 10 maç sorunu yaratıyordu).
+    
+    Yeni yöntem:
+    1. Kelime bazlı (Token) eşleşme yapar (Örn: "Premier" kelimesi varsa kabul et).
+    2. Fallback'i kaldırır: Eğer lig eşleşmiyorsa, boş döndürür.
+    """
     if not league_name:
         return matches
+
     lk = norm_key(league_name)
+    # Hedef lig isminin anlamlı kelimelerini çıkar (Örn: "English Premier League" -> {english, premier, league})
+    target_words = set(re.findall(r'[a-z0-9]+', league_name.lower()))
+    # Çok genel kelimeleri filtreleme dışı bırakabiliriz ama basitlik adına 
+    # en az 1 anlamlı (uzunluğu > 2) kelime tutuyorsa kabul edeceğiz.
+    filtered_target_words = {w for w in target_words if len(w) > 2 and w not in {"the", "and", "lig"}}
+
     out = []
     for m in matches:
         ml = norm_key(m.league)
-        if lk and (lk in ml or ml in lk):
+        # Maç liginin kelimeleri
+        m_words = set(re.findall(r'[a-z0-9]+', m.league.lower()))
+
+        # YÖNTEM 1: Klasik Substring (norm_key üzerinden)
+        # "turkeysuperlig" vs "tursl" -> Eşleşmez
+        # "uefachampionsleague" vs "ucl" -> Eşleşmez
+        # "premierleague" vs "engpr" -> Eşleşmez
+        if lk and ml and (lk in ml or ml in lk):
             out.append(m)
-    return out if out else matches
+            continue
+        
+        # YÖNTEM 2: Token Kesişimi
+        # Örn: Lig="Turkey Super Lig", Maç="Super Lig". Kesişim={"super", "lig"} -> EŞLEŞİR.
+        # Örn: Lig="UEFA Champions League", Maç="Champions League". -> EŞLEŞİR.
+        if filtered_target_words:
+            # Eğer hedef kelimelerden herhangi biri maç liginde geçiyorsa
+            if not filtered_target_words.isdisjoint(m_words):
+                out.append(m)
+                continue
+    
+    # DÜZELTME: Eskiden "return out if out else matches" vardı.
+    # Bu durum, filtre hiç maç bulamazsa tüm listeyi (farklı ligleri) döndürüyordu.
+    # Kullanıcı "Same League" istediyse ve maç yoksa, boş dönmeli (veya sadece bulunanları dönmeli).
+    return out
 
 def filter_team_home_only(matches: List[MatchRow], team: str) -> List[MatchRow]:
     tk = norm_key(team)
@@ -1289,7 +1324,7 @@ app = Flask(__name__)
 
 @app.get("/")
 def root():
-    return jsonify({"ok": True, "service": "nowgoal-analyzer-api", "version": "4.1-odds-pss-fix"})
+    return jsonify({"ok": True, "service": "nowgoal-analyzer-api", "version": "4.2-same-league-fix"})
 
 @app.get("/health")
 def health():
@@ -1375,7 +1410,7 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "serve":
         app.run(host="0.0.0.0", port=5000, debug=False)
     else:
-        print("NowGoal Analyzer v4.1 (ODDS+PSS FIX)")
+        print("NowGoal Analyzer v4.2 (SAME LEAGUE FIX)")
         print("Usage: python script.py serve")
         print("Endpoints:")
         print("  POST /analiz_et - Android app (Turkish)")
