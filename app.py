@@ -1,4 +1,3 @@
-```python
 # -*- coding: utf-8 -*-
 """
 NowGoal Match Analyzer - Enhanced Version 4.1 (ODDS+PSS FIX)
@@ -1292,4 +1291,3 @@ def health():
 if __name__ == "__main__":
     # development server
     app.run(host="0.0.0.0", port=5000, debug=False)
-```
