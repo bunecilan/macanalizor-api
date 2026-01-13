@@ -1,16 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-NowGoal Match Analyzer - Enhanced Version 4.2
-FIX: Home/Away selection restored + Safe Same League application (won't wipe PSS)
-
-Özet Fix:
-- PSS Home/Away artık "ilk iki tablo" mantığıyla değil, PSS bölümünden çıkan tablolar arasından
-  takım yoğunluğuna göre otomatik seçilir.
-- Same League filtresi güvenli uygulanır:
-  - PSS satırlarında league_id yakalanabiliyorsa ID ile filtre
-  - Yakalanamıyorsa league name ile filtre
-  - Filtre 0'a düşürüyorsa ham liste korunur (Home/Away bozulmaz)
-- league_id artık satır bazında sadece ilk hücreden değil, bütün satır HTML'inden aranır.
+NowGoal Match Analyzer - Enhanced Version 4.3
+Fixes:
+- PSS Home/Away table selection hardened: exclude H2H-like tables, use context scoring
+- Same League applied only if it actually filters (and doesn't wipe data)
+- Better debug fields to see why Same League didn't apply
 """
 
 import re
@@ -60,8 +54,10 @@ CORNER_FT_RE = re.compile(r"\b(\d{1,2})\s*-\s*(\d{1,2})\b")
 CORNER_HT_RE = re.compile(r"\((\d{1,2})\s*-\s*(\d{1,2})\)")
 ODDS_DEC_RE = re.compile(r"^\d+\.\d+$")
 
+
 def norm_key(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
 
 def normalize_date(d: str) -> Optional[str]:
     if not d:
@@ -79,11 +75,13 @@ def normalize_date(d: str) -> Optional[str]:
         return f"{int(dd):02d}-{int(mm):02d}-{yyyy}"
     return None
 
+
 def parse_date_key(date_str: str) -> Tuple[int, int, int]:
     if not date_str or not re.match(r"^\d{2}-\d{2}-\d{4}$", date_str):
         return (0, 0, 0)
     dd, mm, yyyy = date_str.split("-")
     return (int(yyyy), int(mm), int(dd))
+
 
 # ======================
 # DATA CLASSES
@@ -104,6 +102,7 @@ class MatchRow:
     corner_ht_away: Optional[int] = None
     league_id: Optional[str] = None
 
+
 @dataclass
 class SplitGFGA:
     matches: int
@@ -118,6 +117,7 @@ class SplitGFGA:
     def ga_pg(self) -> float:
         return self.ga / self.matches if self.matches else 0.0
 
+
 @dataclass
 class StandRow:
     ft: str
@@ -130,6 +130,7 @@ class StandRow:
     pts: Optional[int]
     rank: Optional[int]
     rate: Optional[str]
+
 
 @dataclass
 class TeamPrevStats:
@@ -148,6 +149,7 @@ class TeamPrevStats:
     corners_for: float = 0.0
     corners_against: float = 0.0
 
+
 # ======================
 # HTML PARSE
 # ======================
@@ -159,10 +161,27 @@ def strip_tags(s: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s.strip()
 
+
 def extract_tables_html(page_source: str) -> List[str]:
     return [m.group(0) for m in re.finditer(
         r"<table\b[^>]*>.*?</table>", page_source or "", flags=re.IGNORECASE | re.DOTALL
     )]
+
+
+def extract_tables_html_with_context(page_source: str, window: int = 500) -> List[Tuple[str, str]]:
+    """
+    Returns list of (table_html, context_text) where context_text is surrounding text.
+    Helps pick the correct PSS table instead of accidentally picking H2H.
+    """
+    html = page_source or ""
+    out: List[Tuple[str, str]] = []
+    for m in re.finditer(r"<table\b[^>]*>.*?</table>", html, flags=re.IGNORECASE | re.DOTALL):
+        start, end = m.start(), m.end()
+        ctx = html[max(0, start - window):min(len(html), end + window)]
+        ctx_text = strip_tags(ctx)
+        out.append((m.group(0), ctx_text))
+    return out
+
 
 def extract_table_rows_from_html(table_html: str) -> List[List[str]]:
     rows: List[List[str]] = []
@@ -186,6 +205,7 @@ def extract_table_rows_from_html(table_html: str) -> List[List[str]]:
 
     return rows
 
+
 def extract_table_rows_from_html_with_raw(table_html: str) -> List[List[Tuple[str, str]]]:
     rows: List[List[Tuple[str, str]]] = []
     trs = re.findall(r"<tr\b[^>]*>.*?</tr>", table_html or "", flags=re.IGNORECASE | re.DOTALL)
@@ -208,14 +228,15 @@ def extract_table_rows_from_html_with_raw(table_html: str) -> List[List[Tuple[st
 
     return rows
 
-def section_tables_by_marker(page_source: str, marker: str, max_tables: int = 12) -> List[str]:
+
+def section_tables_by_marker_with_context(page_source: str, marker: str, max_tables: int = 16) -> List[Tuple[str, str]]:
     low = (page_source or "").lower()
     pos = low.find(marker.lower())
     if pos == -1:
         return []
     sub = page_source[pos:]
-    tabs = extract_tables_html(sub)
-    return tabs[:max_tables]
+    return extract_tables_html_with_context(sub)[:max_tables]
+
 
 # ======================
 # LEAGUE ID HELPERS
@@ -239,8 +260,10 @@ def extract_league_id_from_html_blob(html_blob: str) -> Optional[str]:
             return m.group(1)
     return None
 
+
 def extract_primary_league_id(page_source: str) -> Optional[str]:
     return extract_league_id_from_html_blob(page_source or "")
+
 
 # ======================
 # FETCH
@@ -258,6 +281,7 @@ def safe_get(url: str, timeout: int = 25, retries: int = 2) -> str:
             time.sleep(0.7)
     raise RuntimeError(f"Fetch failed: {url} ({last_err})")
 
+
 def extract_match_id(url: str) -> str:
     m = re.search(r"(?:h2h-|/match/h2h-)(\d+)", url)
     if m:
@@ -267,14 +291,17 @@ def extract_match_id(url: str) -> str:
         raise ValueError("Match ID çıkaramadım")
     return nums[-1]
 
+
 def extract_base_domain(url: str) -> str:
     m = re.match(r"^(https?://[^/]+)", url.strip())
     return m.group(1) if m else "https://live3.nowgoal26.com"
+
 
 def build_h2h_url(url: str) -> str:
     match_id = extract_match_id(url)
     base = extract_base_domain(url)
     return f"{base}/match/h2h-{match_id}"
+
 
 def parse_teams_from_title(html: str) -> Tuple[str, str]:
     m = re.search(r"<title>\s*(.*?)\s*</title>", html, flags=re.IGNORECASE | re.DOTALL)
@@ -286,11 +313,13 @@ def parse_teams_from_title(html: str) -> Tuple[str, str]:
         return "", ""
     return mm.group(1).strip(), mm.group(2).strip()
 
+
 def sort_matches_desc(matches: List[MatchRow]) -> List[MatchRow]:
     has_real_date = any(parse_date_key(m.date) != (0, 0, 0) for m in matches)
     if not has_real_date:
         return matches
     return sorted(matches, key=lambda x: parse_date_key(x.date), reverse=True)
+
 
 def dedupe_matches(matches: List[MatchRow]) -> List[MatchRow]:
     seen = set()
@@ -303,10 +332,12 @@ def dedupe_matches(matches: List[MatchRow]) -> List[MatchRow]:
         out.append(m)
     return out
 
+
 def is_h2h_pair(m: MatchRow, home_team: str, away_team: str) -> bool:
     hk, ak = norm_key(home_team), norm_key(away_team)
     mh, ma = norm_key(m.home), norm_key(m.away)
     return (mh == hk and ma == ak) or (mh == ak and ma == hk)
+
 
 # ======================
 # CORNER PARSE
@@ -325,6 +356,7 @@ def parse_corner_cell(cell: str) -> Tuple[Optional[Tuple[int, int]], Optional[Tu
     ht = (int(ht_m.group(1)), int(ht_m.group(2))) if ht_m else None
     return ft, ht
 
+
 # ======================
 # MATCH PARSE
 # ======================
@@ -335,7 +367,6 @@ def parse_match_from_cells(cells: List[str], league_id: Optional[str] = None) ->
     def get(i: int) -> str:
         return (cells[i] or "").strip() if i < len(cells) else ""
 
-    # Standart düzen (date boş olabilir)
     league = get(0) or "—"
     date_cell = get(1)
     home = get(2)
@@ -372,7 +403,7 @@ def parse_match_from_cells(cells: List[str], league_id: Optional[str] = None) ->
             league_id=league_id
         )
 
-    # Fallback tarama
+    # fallback scan
     score_idx = None
     score_m = None
     for i, c in enumerate(cells):
@@ -438,6 +469,7 @@ def parse_match_from_cells(cells: List[str], league_id: Optional[str] = None) ->
         league_id=league_id
     )
 
+
 def parse_matches_from_table_html(table_html: str) -> List[MatchRow]:
     out: List[MatchRow] = []
     rows = extract_table_rows_from_html_with_raw(table_html)
@@ -452,6 +484,7 @@ def parse_matches_from_table_html(table_html: str) -> List[MatchRow]:
 
     return sort_matches_desc(dedupe_matches(out))
 
+
 # ======================
 # STANDINGS
 # ======================
@@ -463,6 +496,7 @@ def _to_int(x: str) -> Optional[int]:
         return int(x)
     except Exception:
         return None
+
 
 def parse_standings_table_rows(rows: List[List[str]]) -> List[StandRow]:
     wanted = {"Total", "Home", "Away", "Last 6", "Last6"}
@@ -500,6 +534,7 @@ def parse_standings_table_rows(rows: List[List[str]]) -> List[StandRow]:
     out.sort(key=lambda x: order.get(x.ft, 99))
     return out
 
+
 def extract_standings_for_team(page_source: str, team_name: str) -> List[StandRow]:
     team_key = norm_key(team_name)
     for tbl in extract_tables_html(page_source):
@@ -515,6 +550,7 @@ def extract_standings_for_team(page_source: str, team_name: str) -> List[StandRo
             return parsed
     return []
 
+
 def standings_to_splits(rows: List[StandRow]) -> Dict[str, Optional[SplitGFGA]]:
     mp: Dict[str, Optional[SplitGFGA]] = {"Total": None, "Home": None, "Away": None, "Last 6": None}
     for r in rows:
@@ -522,113 +558,193 @@ def standings_to_splits(rows: List[StandRow]) -> Dict[str, Optional[SplitGFGA]]:
             mp[r.ft] = SplitGFGA(r.matches, r.scored, r.conceded)
     return mp
 
+
 # ======================
-# PSS (HOME/AWAY SELECTION RESTORED)
+# PSS TABLE SELECTION (HARDENED)
 # ======================
-def extract_previous_section_tables(page_source: str) -> List[str]:
+def extract_previous_section_tables_with_context(page_source: str) -> List[Tuple[str, str]]:
     markers = ["Previous Scores Statistics", "Previous Scores", "Recent Matches"]
     for marker in markers:
-        tabs = section_tables_by_marker(page_source, marker, max_tables=14)
+        tabs = section_tables_by_marker_with_context(page_source, marker, max_tables=20)
         if tabs:
             return tabs
-    # fallback: hiç marker yoksa tüm tablolar
-    return extract_tables_html(page_source)
+    return extract_tables_html_with_context(page_source)
+
 
 def team_presence_score(matches: List[MatchRow], team_name: str) -> int:
     tk = norm_key(team_name)
     return sum(1 for m in matches if norm_key(m.home) == tk or norm_key(m.away) == tk)
 
-def choose_pss_home_away_tables(page_source: str, home_team: str, away_team: str) -> Tuple[List[MatchRow], List[MatchRow]]:
-    """
-    PSS bölümünden çıkan tüm tabloları parse eder, sonra:
-    - Home table: home_team maç yoğunluğu en yüksek tablo
-    - Away table: away_team maç yoğunluğu en yüksek tablo (home table ile aynı değil)
-    Bu yaklaşım, "ilk iki tablo" kırılganlığını ortadan kaldırır.
-    """
-    candidate_tables = extract_previous_section_tables(page_source)
 
-    parsed_candidates: List[Tuple[int, int, List[MatchRow]]] = []
-    for tbl in candidate_tables:
-        ms = parse_matches_from_table_html(tbl)
+def h2h_likeness(matches: List[MatchRow], home_team: str, away_team: str) -> float:
+    if not matches:
+        return 0.0
+    pair = sum(1 for m in matches if is_h2h_pair(m, home_team, away_team))
+    return pair / max(1, len(matches))
+
+
+def context_contains_team(ctx_text: str, team: str) -> bool:
+    return norm_key(team) in norm_key(ctx_text or "")
+
+
+def choose_pss_home_away_tables(
+    page_source: str, home_team: str, away_team: str
+) -> Tuple[List[MatchRow], List[MatchRow], Dict[str, Any]]:
+    """
+    Parse candidate tables around PSS section, exclude H2H-like tables,
+    pick best home-team table and best away-team table using presence + context scoring.
+    """
+    candidates = extract_previous_section_tables_with_context(page_source)
+
+    scored: List[Dict[str, Any]] = []
+    for tbl_html, ctx in candidates:
+        ms = parse_matches_from_table_html(tbl_html)
         if not ms or len(ms) < 3:
             continue
-        hs = team_presence_score(ms, home_team)
-        as_ = team_presence_score(ms, away_team)
-        if hs == 0 and as_ == 0:
+
+        # Exclude tables that are mostly H2H between these two teams (common cause of breakage)
+        likeness = h2h_likeness(ms, home_team, away_team)
+        if likeness >= 0.45 and len(ms) >= 4:
             continue
-        parsed_candidates.append((hs, as_, ms))
 
-    if not parsed_candidates:
-        return [], []
+        hs = team_presence_score(ms, home_team)
+        a_s = team_presence_score(ms, away_team)
 
-    # Home için en iyi
-    best_home = max(parsed_candidates, key=lambda x: (x[0], len(x[2])))
-    home_ms = best_home[2]
+        if hs == 0 and a_s == 0:
+            continue
 
-    # Away için en iyi (home_ms ile aynı listeyi seçme)
-    remaining = [x for x in parsed_candidates if x[2] is not home_ms]
-    if remaining:
-        best_away = max(remaining, key=lambda x: (x[1], len(x[2])))
-        away_ms = best_away[2]
+        ctx_h = 1 if context_contains_team(ctx, home_team) else 0
+        ctx_a = 1 if context_contains_team(ctx, away_team) else 0
+
+        # Scores: prefer table clearly about that team; penalize the other team being frequent
+        score_home = (hs * 3) + (ctx_h * 10) - (a_s * 1)
+        score_away = (a_s * 3) + (ctx_a * 10) - (hs * 1)
+
+        scored.append({
+            "ms": ms,
+            "hs": hs,
+            "as": a_s,
+            "ctx_h": ctx_h,
+            "ctx_a": ctx_a,
+            "score_home": score_home,
+            "score_away": score_away,
+            "len": len(ms),
+        })
+
+    debug = {
+        "pss_candidates": len(scored),
+        "home_pick": None,
+        "away_pick": None,
+    }
+
+    if not scored:
+        return [], [], debug
+
+    # Pick best for home
+    scored_sorted_home = sorted(scored, key=lambda x: (x["score_home"], x["len"]), reverse=True)
+    home_pick = scored_sorted_home[0]
+    home_ms = home_pick["ms"]
+
+    debug["home_pick"] = {
+        "score_home": home_pick["score_home"],
+        "hs": home_pick["hs"],
+        "as": home_pick["as"],
+        "ctx_h": home_pick["ctx_h"],
+        "len": home_pick["len"],
+    }
+
+    # Pick best for away; avoid same table if possible
+    scored_sorted_away = sorted(scored, key=lambda x: (x["score_away"], x["len"]), reverse=True)
+
+    away_pick = None
+    for item in scored_sorted_away:
+        if item["ms"] is not home_ms:
+            away_pick = item
+            break
+
+    # If can't find distinct away table, fallback to same list (better than empty)
+    if away_pick is None:
+        away_ms = home_ms
+        debug["away_pick"] = {"fallback": "same_as_home"}
     else:
-        # tek aday varsa, ikinci tablo yoktur; yine de boş dön
-        away_ms = []
+        away_ms = away_pick["ms"]
+        debug["away_pick"] = {
+            "score_away": away_pick["score_away"],
+            "hs": away_pick["hs"],
+            "as": away_pick["as"],
+            "ctx_a": away_pick["ctx_a"],
+            "len": away_pick["len"],
+        }
 
-    return home_ms, away_ms
+    return home_ms, away_ms, debug
+
 
 # ======================
-# SAME LEAGUE (SAFE)
+# SAME LEAGUE (SAFE + REAL APPLIED FLAG)
 # ======================
+def league_name_tokens(s: str) -> List[str]:
+    s = (s or "").lower()
+    s = re.sub(r"[^a-z0-9\s]+", " ", s)
+    toks = [t for t in s.split() if len(t) >= 3]
+    return toks
+
+
+def league_name_match(a: str, b: str) -> bool:
+    ta = set(league_name_tokens(a))
+    tb = set(league_name_tokens(b))
+    if not ta or not tb:
+        return False
+    inter = len(ta & tb)
+    ratio = inter / max(1, min(len(ta), len(tb)))
+    return ratio >= 0.6
+
+
 def filter_same_league_by_id_safe(matches: List[MatchRow], league_id: str) -> Optional[List[MatchRow]]:
     if not matches or not league_id:
         return None
-    # ID coverage kontrolü: PSS satırlarında ID gerçekten var mı?
     with_id = sum(1 for m in matches if m.league_id)
-    if with_id < max(2, int(0.4 * len(matches))):
-        # ID çok az yakalanıyorsa ID ile filtre güvenilmez
+    # ID yakalama yeterli değilse ID ile filtre güvenilmez
+    if with_id < max(3, int(0.6 * len(matches))):
         return None
     filtered = [m for m in matches if m.league_id == league_id]
     return filtered
 
+
 def filter_same_league_by_name(matches: List[MatchRow], league_name: str) -> Optional[List[MatchRow]]:
     if not matches or not league_name:
         return None
-    lk = norm_key(league_name)
-    if not lk:
-        return None
     out = []
     for m in matches:
-        ml = norm_key(m.league)
-        if lk in ml or ml in lk:
+        if league_name_match(m.league, league_name):
             out.append(m)
     return out
 
-def apply_same_league_safely(matches: List[MatchRow], league_id: Optional[str], league_name: Optional[str]) -> List[MatchRow]:
+
+def apply_same_league_safely(matches: List[MatchRow], league_id: Optional[str], league_name: Optional[str]) -> Tuple[List[MatchRow], bool, str]:
     """
-    Kullanıcı isteği: Same League uygulansın.
-    Ama teknik gerçek: bazen PSS satırlarından league_id çekilemiyor.
-    Bu yüzden:
-      1) ID ile filtre dene (yeterli coverage varsa)
-      2) olmadı isim ile dene
-      3) filtre 0'a düşürüyorsa ham listeyi koru (Home/Away bozulmasın)
+    Returns (list, applied, method)
+    applied=True only if filtering succeeded without wiping data and meaningfully reduced list.
     """
     if not matches:
-        return matches
+        return matches, False, "none"
 
-    # 1) ID
+    original_len = len(matches)
+
+    # 1) Try ID
     if league_id:
         f = filter_same_league_by_id_safe(matches, league_id)
-        if f is not None and len(f) > 0:
-            return f
+        if f is not None and len(f) >= 3 and len(f) < original_len:
+            return f, True, "id"
 
-    # 2) Name
+    # 2) Try league name
     if league_name:
         f2 = filter_same_league_by_name(matches, league_name)
-        if f2 is not None and len(f2) > 0:
-            return f2
+        if f2 is not None and len(f2) >= 3 and len(f2) < original_len:
+            return f2, True, "name"
 
-    # 3) Koruma
-    return matches
+    # 3) No safe filter
+    return matches, False, "none"
+
 
 # ======================
 # ODDS EXTRACTION
@@ -671,6 +787,7 @@ def extract_bet365_initial_odds_robust(page_source: str) -> Optional[Dict[str, f
     except Exception:
         return None
 
+
 def extract_bet365_initial_odds(page_source: str) -> Optional[Dict[str, float]]:
     got = extract_bet365_initial_odds_robust(page_source)
     if got:
@@ -684,15 +801,16 @@ def extract_bet365_initial_odds(page_source: str) -> Optional[Dict[str, float]]:
     except Exception:
         return None
 
+
 # ======================
 # H2H
 # ======================
 def extract_h2h_matches(page_source: str, home_team: str, away_team: str) -> List[MatchRow]:
     markers = ["Head to Head Statistics", "Head to Head", "H2H Statistics", "H2H", "VS Statistics"]
     for mk in markers:
-        tabs = section_tables_by_marker(page_source, mk, max_tables=6)
-        for t in tabs:
-            cand = parse_matches_from_table_html(t)
+        tabs = section_tables_by_marker_with_context(page_source, mk, max_tables=8)
+        for t_html, _ctx in tabs:
+            cand = parse_matches_from_table_html(t_html)
             if not cand:
                 continue
             pair_count = sum(1 for m in cand if is_h2h_pair(m, home_team, away_team))
@@ -710,6 +828,7 @@ def extract_h2h_matches(page_source: str, home_team: str, away_team: str) -> Lis
             best_pair = pair_count
             best_list = cand
     return best_list
+
 
 # ======================
 # PREV STATS
@@ -764,6 +883,7 @@ def build_prev_stats(team: str, matches: List[MatchRow]) -> TeamPrevStats:
         st.ga_away = sum(m.ft_home for m in away_ms) / st.n_away
 
     return st
+
 
 # ======================
 # CORNER ANALYSIS
@@ -823,6 +943,7 @@ def analyze_corners(home_prev: TeamPrevStats, away_prev: TeamPrevStats, h2h_matc
         "confidence": conf
     }
 
+
 # ======================
 # LAMBDA COMPUTATION
 # ======================
@@ -831,6 +952,7 @@ def normalize_weights(w: Dict[str, float]) -> Dict[str, float]:
     if s <= 1e-9:
         return {}
     return {k: max(0.0, v) / s for k, v in w.items()}
+
 
 def compute_component_standings(st_home: Dict[str, Optional[SplitGFGA]],
                                 st_away: Dict[str, Optional[SplitGFGA]]) -> Optional[Tuple[float, float, Dict[str, Any]]]:
@@ -846,6 +968,7 @@ def compute_component_standings(st_home: Dict[str, Optional[SplitGFGA]],
         "formula": "Standing-based lambda",
     }
     return lam_h, lam_a, meta
+
 
 def compute_component_pss(home_prev: TeamPrevStats, away_prev: TeamPrevStats) -> Optional[Tuple[float, float, Dict[str, Any]]]:
     if home_prev.n_total < 3 or away_prev.n_total < 3:
@@ -867,6 +990,7 @@ def compute_component_pss(home_prev: TeamPrevStats, away_prev: TeamPrevStats) ->
     }
     return lam_h, lam_a, meta
 
+
 def compute_component_h2h(h2h_matches: List[MatchRow], home_team: str, away_team: str) -> Optional[Tuple[float, float, Dict[str, Any]]]:
     if not h2h_matches or len(h2h_matches) < 3:
         return None
@@ -886,6 +1010,7 @@ def compute_component_h2h(h2h_matches: List[MatchRow], home_team: str, away_team
     meta = {"matches": len(hg), "hg_avg": lam_h, "ag_avg": lam_a}
     return lam_h, lam_a, meta
 
+
 def clamp_lambda(lh: float, la: float) -> Tuple[float, float, List[str]]:
     warn = []
     def c(x: float, name: str) -> float:
@@ -897,6 +1022,7 @@ def clamp_lambda(lh: float, la: float) -> Tuple[float, float, List[str]]:
             return 3.80
         return x
     return c(lh, "λ_home"), c(la, "λ_away"), warn
+
 
 def compute_lambdas(st_home_s: Dict[str, Optional[SplitGFGA]],
                     st_away_s: Dict[str, Optional[SplitGFGA]],
@@ -942,6 +1068,7 @@ def compute_lambdas(st_home_s: Dict[str, Optional[SplitGFGA]],
         info["warnings"].extend(clamp_warn)
     return lh, la, info
 
+
 # ======================
 # POISSON & MC
 # ======================
@@ -955,6 +1082,7 @@ def poisson_pmf(k: int, lam: float) -> float:
     except (OverflowError, ValueError):
         return 0.0
 
+
 def build_score_matrix(lh: float, la: float, max_g: int = 5) -> Dict[Tuple[int, int], float]:
     mat = {}
     for h in range(max_g + 1):
@@ -962,6 +1090,7 @@ def build_score_matrix(lh: float, la: float, max_g: int = 5) -> Dict[Tuple[int, 
         for a in range(max_g + 1):
             mat[(h, a)] = ph * poisson_pmf(a, la)
     return mat
+
 
 def market_probs_from_matrix(mat: Dict[Tuple[int, int], float]) -> Dict[str, float]:
     p1 = sum(p for (h, a), p in mat.items() if h > a)
@@ -975,6 +1104,7 @@ def market_probs_from_matrix(mat: Dict[Tuple[int, int], float]) -> Dict[str, flo
         out[f"O{ln}"] = sum(p for (h, a), p in mat.items() if (h + a) >= need)
         out[f"U{ln}"] = 1.0 - out[f"O{ln}"]
     return out
+
 
 def monte_carlo(lh: float, la: float, n: int, seed: Optional[int] = 42) -> Dict[str, Any]:
     rng = np.random.default_rng(seed)
@@ -1011,6 +1141,7 @@ def monte_carlo(lh: float, la: float, n: int, seed: Optional[int] = 42) -> Dict[
     }
     return out
 
+
 def model_agreement(p_po: Dict[str, float], p_mc: Dict[str, float]) -> Tuple[float, str]:
     keys = ["1", "X", "2", "BTTS", "O2.5", "U2.5"]
     diffs = [abs(p_po.get(k, 0) - p_mc.get(k, 0)) for k in keys]
@@ -1023,6 +1154,7 @@ def model_agreement(p_po: Dict[str, float], p_mc: Dict[str, float]) -> Tuple[flo
         return d, "Orta"
     return d, "Zayıf"
 
+
 def blend_probs(p1: Dict[str, float], p2: Dict[str, float], alpha: float) -> Dict[str, float]:
     out = {}
     for k in set(list(p1.keys()) + list(p2.keys())):
@@ -1031,6 +1163,7 @@ def blend_probs(p1: Dict[str, float], p2: Dict[str, float], alpha: float) -> Dic
         else:
             out[k] = p1.get(k, p2.get(k, 0.0))
     return out
+
 
 # ======================
 # KELLY & VALUE
@@ -1043,10 +1176,12 @@ def kelly_criterion(prob: float, odds: float) -> float:
     kelly = (b * prob - q) / b
     return max(0.0, kelly)
 
+
 def value_and_kelly(prob: float, odds: float) -> Tuple[float, float]:
     v = odds * prob - 1.0
     k = kelly_criterion(prob, odds)
     return v, k
+
 
 def confidence_label(p: float) -> str:
     if p >= 0.65:
@@ -1055,12 +1190,14 @@ def confidence_label(p: float) -> str:
         return "Orta"
     return "Düşük"
 
+
 # ======================
 # REPORT HELPERS
 # ======================
 def top_scores_from_matrix(mat: Dict[Tuple[int, int], float], top_n: int = 7) -> List[Tuple[str, float]]:
     items = sorted(mat.items(), key=lambda x: x[1], reverse=True)[:top_n]
     return [(f"{h}-{a}", p) for (h, a), p in items]
+
 
 def net_ou_prediction(probs: Dict[str, float]) -> Tuple[str, float, str]:
     p_o25 = probs.get("O2.5", 0)
@@ -1069,12 +1206,14 @@ def net_ou_prediction(probs: Dict[str, float]) -> Tuple[str, float, str]:
         return "2.5 ÜST", p_o25, confidence_label(p_o25)
     return "2.5 ALT", p_u25, confidence_label(p_u25)
 
+
 def net_btts_prediction(probs: Dict[str, float]) -> Tuple[str, float, str]:
     p_btts = probs.get("BTTS", 0)
     p_no = 1.0 - p_btts
     if p_btts >= p_no:
         return "VAR", p_btts, confidence_label(p_btts)
     return "YOK", p_no, confidence_label(p_no)
+
 
 def final_decision(qualified: List[Tuple[str, float, float, float, float]], diff: float, diff_label: str) -> str:
     if not qualified:
@@ -1084,6 +1223,7 @@ def final_decision(qualified: List[Tuple[str, float, float, float, float]], diff
     best = sorted(qualified, key=lambda x: x[3], reverse=True)[0]
     mkt, prob, odds, val, qk = best
     return f"OYNANABİLİR → {mkt} (Prob: %{prob*100:.1f}, Oran: {odds:.2f}, Value: %{val*100:+.1f}, Kelly: %{qk*100:.1f})"
+
 
 def format_comprehensive_report(data: Dict[str, Any]) -> str:
     t = data["teams"]
@@ -1146,6 +1286,7 @@ def format_comprehensive_report(data: Dict[str, Any]) -> str:
     lines.append("=" * 60)
     return "\n".join(lines)
 
+
 # ======================
 # MAIN ANALYSIS
 # ======================
@@ -1172,12 +1313,15 @@ def analyze_nowgoal(url: str, odds: Optional[Dict[str, float]] = None, mc_runs: 
     h2h_pair = [m for m in h2h_all if is_h2h_pair(m, home_team, away_team)]
     h2h_used = sort_matches_desc(dedupe_matches(h2h_pair))[:H2H_N]
 
-    # PSS: Home/Away tablolarını seç (fix)
-    prev_home_raw, prev_away_raw = choose_pss_home_away_tables(html, home_team, away_team)
+    # PSS: hardened selection
+    prev_home_raw, prev_away_raw, pss_debug = choose_pss_home_away_tables(html, home_team, away_team)
 
-    # Same League: güvenli uygula (fix)
-    prev_home = apply_same_league_safely(prev_home_raw, league_id, league_name)[:RECENT_N]
-    prev_away = apply_same_league_safely(prev_away_raw, league_id, league_name)[:RECENT_N]
+    # Same League: apply only if safe and meaningful
+    prev_home_filtered, applied_home, method_home = apply_same_league_safely(prev_home_raw, league_id, league_name)
+    prev_away_filtered, applied_away, method_away = apply_same_league_safely(prev_away_raw, league_id, league_name)
+
+    prev_home = prev_home_filtered[:RECENT_N]
+    prev_away = prev_away_filtered[:RECENT_N]
 
     home_prev_stats = build_prev_stats(home_team, prev_home)
     away_prev_stats = build_prev_stats(away_team, prev_away)
@@ -1225,6 +1369,8 @@ def analyze_nowgoal(url: str, odds: Optional[Dict[str, float]] = None, mc_runs: 
         value_block["thresholds"] = {"value_min": VALUE_MIN, "prob_min": PROB_MIN, "kelly_min": KELLY_MIN}
         value_block["decision"] = final_decision(qualified, diff, diff_label)
 
+    same_league_applied = bool(applied_home or applied_away)
+
     data = {
         "url": h2h_url,
         "teams": {"home": home_team, "away": away_team},
@@ -1242,25 +1388,38 @@ def analyze_nowgoal(url: str, odds: Optional[Dict[str, float]] = None, mc_runs: 
             "h2h_matches": len(h2h_used),
             "home_prev_matches": len(prev_home),
             "away_prev_matches": len(prev_away),
-            "same_league_applied": bool(league_id or league_name),
+            "same_league_applied": same_league_applied,
+        },
+        "debug": {
+            "pss_selection": pss_debug,
+            "same_league": {
+                "home": {"applied": applied_home, "method": method_home, "before": len(prev_home_raw), "after": len(prev_home_filtered)},
+                "away": {"applied": applied_away, "method": method_away, "before": len(prev_away_raw), "after": len(prev_away_filtered)},
+                "league_id": league_id,
+                "league_name": league_name
+            }
         }
     }
 
     data["report_comprehensive"] = format_comprehensive_report(data)
     return data
 
+
 # ======================
 # FLASK APP
 # ======================
 app = Flask(__name__)
 
+
 @app.get("/")
 def root():
-    return jsonify({"ok": True, "service": "nowgoal-analyzer-api", "version": "4.2-homeaway-restore-sameleague-safe"})
+    return jsonify({"ok": True, "service": "nowgoal-analyzer-api", "version": "4.3-pss-hardened-sameleague-realflag"})
+
 
 @app.get("/health")
 def health():
     return jsonify({"ok": True, "status": "healthy"})
+
 
 @app.post("/analiz_et")
 def analiz_et_route():
@@ -1292,13 +1451,8 @@ def analiz_et_route():
             "btts": f"{net_btts} (%{net_btts_p*100:.1f})",
             "karar": data["value_bets"].get("decision", "Oran gerekli"),
             "detay": data["report_comprehensive"],
-            "debug": {
-                "league_id": data.get("league_id"),
-                "league": data.get("league"),
-                "pss_home_count": data["data_sources"]["home_prev_matches"],
-                "pss_away_count": data["data_sources"]["away_prev_matches"],
-                "same_league_applied": data["data_sources"]["same_league_applied"],
-            }
+            # Debug'i geri döndürüyorum ki "neden Same League olmadı / Home-Away ne seçti" net görünsün
+            "debug": data.get("debug", {})
         })
 
     except Exception as e:
@@ -1307,6 +1461,7 @@ def analiz_et_route():
             "error": f"Analiz hatası: {str(e)}",
             "traceback": traceback.format_exc()
         }), 500
+
 
 @app.post("/analyze")
 def analyze_route():
@@ -1341,6 +1496,7 @@ def analyze_route():
             "traceback": traceback.format_exc()
         }), 500
 
+
 # ======================
 # MAIN
 # ======================
@@ -1349,7 +1505,7 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "serve":
         app.run(host="0.0.0.0", port=5000, debug=False)
     else:
-        print("NowGoal Analyzer v4.2 (Home/Away restored + Same League safe)")
+        print("NowGoal Analyzer v4.3")
         print("Usage: python script.py serve")
         print("\nEndpoints:")
         print("  POST /analiz_et - Android app (Turkish)")
