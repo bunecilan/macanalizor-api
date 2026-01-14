@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-NowGoal Match Analyzer - PRODUCTION VERSION 5.1 FINAL
+NowGoal Match Analyzer - PRODUCTION VERSION 5.2 FINAL
 - FIXED: Team name parsing (og:title support)
+- FIXED: Comprehensive report with ALL statistics
 - Enhanced corner analysis with HT data
 - Detailed error logging
-- Production ready
+- Full output for Android app
 """
 
 import re
@@ -245,18 +246,12 @@ def build_oddscomp_url(url: str) -> str:
 def parse_teams_from_title(html: str) -> Tuple[str, str]:
     """
     FIXED VERSION: Supports og:title meta tag
-    Tries multiple sources in order:
-    1. <meta property="og:title" content="...">
-    2. <title> tag
-    3. <h1> tag as fallback
     """
-    # Try og:title first (most reliable for NowGoal)
     og_match = re.search(r'<meta\s+property=["\']og:title["\']\s+content=["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
     if og_match:
         title_text = og_match.group(1)
         log_info(f"Found og:title: {title_text}")
         
-        # Try "VS" (uppercase - NowGoal standard)
         vs_match = re.search(r'(.+?)\s+VS\s+(.+?)(?:\s*-|\s*$)', title_text, flags=re.IGNORECASE)
         if vs_match:
             home = vs_match.group(1).strip()
@@ -264,13 +259,11 @@ def parse_teams_from_title(html: str) -> Tuple[str, str]:
             log_info(f"Parsed teams from og:title: {home} vs {away}")
             return (home, away)
     
-    # Try regular <title> tag
     title_match = re.search(r'<title[^>]*>([^<]+)</title>', html, flags=re.IGNORECASE)
     if title_match:
         title_text = title_match.group(1).strip()
         log_info(f"Found <title>: {title_text}")
         
-        # Try "VS" or "vs"
         vs_match = re.search(r'(.+?)\s+(?:VS|vs)\s+(.+?)(?:\s*-|\s*$)', title_text, flags=re.IGNORECASE)
         if vs_match:
             home = vs_match.group(1).strip()
@@ -278,7 +271,6 @@ def parse_teams_from_title(html: str) -> Tuple[str, str]:
             log_info(f"Parsed teams from <title>: {home} vs {away}")
             return (home, away)
     
-    # Try h1 tag as last resort
     h1_match = re.search(r'<h1[^>]*>([^<]+)</h1>', html, flags=re.IGNORECASE)
     if h1_match:
         h1_text = h1_match.group(1).strip()
@@ -291,7 +283,7 @@ def parse_teams_from_title(html: str) -> Tuple[str, str]:
             log_info(f"Parsed teams from <h1>: {home} vs {away}")
             return (home, away)
     
-    log_error("Could not parse team names from any source (og:title, title, h1)")
+    log_error("Could not parse team names from any source")
     return ("", "")
 
 def sort_matches_desc(matches: List[MatchRow]) -> List[MatchRow]:
@@ -1057,9 +1049,20 @@ def compute_lambdas(
     return lh, la, info
 
 # ============================================================================
-# COMPREHENSIVE REPORT
+# COMPREHENSIVE REPORT - FIXED WITH ALL STATISTICS
 # ============================================================================
 def format_comprehensive_report(data: Dict[str, Any]) -> str:
+    """
+    FIXED VERSION: Shows ALL statistics including:
+    - All score predictions
+    - All Over/Under lines
+    - BTTS detailed
+    - 1X2 detailed
+    - Corner predictions (FT + HT)
+    - Model agreement
+    - Lambda values
+    - Data sources
+    """
     t = data["teams"]
     blend = data["blended_probs"]
     top7 = data["poisson"]["top7_scores"]
@@ -1069,23 +1072,131 @@ def format_comprehensive_report(data: Dict[str, Any]) -> str:
     lines.append(f"{t['home']} vs {t['away']}")
     lines.append("=" * 60)
     
-    lines.append(f"SKORLAR")
+    # SKORLAR
+    lines.append(f"\n📊 SKORLAR")
     for i, (score, prob) in enumerate(top7[:5], 1):
-        lines.append(f"{i}. {score}: {prob*100:.1f}%")
+        bar = '█' * int(prob * 50)
+        lines.append(f"{i}. {score:6s} {prob*100:4.1f}% {bar}")
     
-    lines.append(f"\nTAHMIN")
+    # TAHMİN
+    lines.append(f"\n🎯 TAHMİN")
     lines.append(f"Ana Skor: {top7[0][0]}")
+    if len(top7) >= 3:
+        lines.append(f"Alternatif: {top7[1][0]}, {top7[2][0]}")
+    
     lines.append(f"Skor-2: {data.get('score_2', 'N/A')}")
     
+    # ÜST/ALT TAHMİNLERİ
+    lines.append(f"\n⚽ ÜST/ALT TAHMİNLERİ")
+    for line in ['0.5', '1.5', '2.5', '3.5']:
+        over_key = f"O{line}"
+        under_key = f"U{line}"
+        over_prob = blend.get(over_key, 0)
+        under_prob = blend.get(under_key, 0)
+        winner = "ÜST" if over_prob > under_prob else "ALT"
+        winner_prob = max(over_prob, under_prob)
+        lines.append(f"{line}: {winner} {winner_prob*100:.1f}% (Ü:{over_prob*100:.1f}% | A:{under_prob*100:.1f}%)")
+    
+    # BTTS
+    lines.append(f"\n🥅 KG VAR/YOK")
+    btts_prob = blend.get('BTTS', 0)
+    no_btts = 1.0 - btts_prob
+    btts_winner = "VAR" if btts_prob > no_btts else "YOK"
+    lines.append(f"Tahmin: {btts_winner} {max(btts_prob, no_btts)*100:.1f}%")
+    lines.append(f"KG Var: {btts_prob*100:.1f}% | KG Yok: {no_btts*100:.1f}%")
+    
+    # 1X2 OLASILIKLAR
+    lines.append(f"\n📈 1X2 OLASILIKLAR")
+    p1 = blend.get('1', 0)
+    px = blend.get('X', 0)
+    p2 = blend.get('2', 0)
+    lines.append(f"Ev Galip (1): {p1*100:.1f}%")
+    lines.append(f"Beraberlik (X): {px*100:.1f}%")
+    lines.append(f"Deplasman Galip (2): {p2*100:.1f}%")
+    
+    winner = max([("1", p1), ("X", px), ("2", p2)], key=lambda x: x[1])
+    winner_map = {"1": "Ev Sahibi Galip", "X": "Beraberlik", "2": "Deplasman Galip"}
+    lines.append(f"En Olası: {winner_map[winner[0]]} ({winner[1]*100:.1f}%)")
+    
+    # KORNER TAHMİNİ
     corners = data.get("corner_analysis", {})
     if corners and corners.get("total_corners", 0) > 0:
-        lines.append(f"\nKORNER")
-        lines.append(f"Toplam: {corners['total_corners']}")
-        lines.append(f"Ev: {corners['predicted_home_corners']} | Dep: {corners['predicted_away_corners']}")
+        lines.append(f"\n🚩 KORNER TAHMİNİ")
+        lines.append(f"Tahmini Toplam: {corners['total_corners']}")
+        lines.append(f"Ev: {corners['predicted_home_corners']} | Deplasman: {corners['predicted_away_corners']}")
+        lines.append(f"Güven: {corners['confidence']}")
         
+        preds = corners.get("market_probs", {})
+        lines.append(f"\nKorner Ü/A:")
+        for k in ['O9.5', 'O10.5', 'O11.5']:
+            if k in preds:
+                uk = k.replace('O', 'U')
+                lines.append(f"  {k}: {preds[k]*100:.1f}% | {uk}: {preds.get(uk, 0)*100:.1f}%")
+        
+        top_corners = corners.get("top_corner_scores", [])
+        if top_corners:
+            lines.append(f"\nEn Olası Korner Skorları:")
+            for i, (score, prob) in enumerate(top_corners[:3], 1):
+                lines.append(f"  {i}. {score}: {prob*100:.1f}%")
+        
+        # İLK YARI KORNER
         ht = corners.get("first_half", {})
         if ht.get("total_ht", 0) > 0:
-            lines.append(f"İlk Yarı: {ht['total_ht']} (Ev: {ht['predicted_home_ht']} | Dep: {ht['predicted_away_ht']})")
+            lines.append(f"\n🕐 İLK YARI KORNER")
+            lines.append(f"Toplam: {ht['total_ht']} (Ev: {ht['predicted_home_ht']} | Dep: {ht['predicted_away_ht']})")
+            lines.append(f"Güven: {ht.get('confidence_ht', 'N/A')}")
+            
+            ht_preds = ht.get("predictions", {})
+            if ht_preds:
+                lines.append(f"İY Korner Ü/A:")
+                for k in ['HT_O4.5', 'HT_O5.5']:
+                    if k in ht_preds:
+                        uk = k.replace('O', 'U')
+                        lines.append(f"  {k}: {ht_preds[k]*100:.1f}% | {uk}: {ht_preds.get(uk, 0)*100:.1f}%")
+    
+    # MODEL UYUMU
+    ma = data.get("model_agreement", {})
+    if ma:
+        lines.append(f"\n🔬 MODEL UYUMU")
+        lines.append(f"Uyum: {ma.get('label', 'N/A')} (Fark: {ma.get('diff', 0)*100:.2f}%)")
+    
+    # LAMBDA DEĞERLERİ
+    lambda_info = data.get("lambda", {})
+    if lambda_info:
+        lines.append(f"\n📐 LAMBDA DEĞERLERİ")
+        lines.append(f"Ev Sahibi (λ_h): {lambda_info.get('home', 0):.2f}")
+        lines.append(f"Deplasman (λ_a): {lambda_info.get('away', 0):.2f}")
+        lines.append(f"Toplam Gol Beklentisi: {lambda_info.get('total', 0):.2f}")
+        
+        weights = lambda_info.get("info", {}).get("weights_used", {})
+        if weights:
+            lines.append(f"\nAğırlıklar:")
+            for k, v in weights.items():
+                kname = {"standing": "Standing", "pss": "PSS", "h2h": "H2H"}.get(k, k)
+                lines.append(f"  {kname}: {v*100:.0f}%")
+    
+    # VERİ KAYNAKLARI
+    ds = data.get("datasources", {})
+    if ds:
+        lines.append(f"\n📂 VERİ KAYNAKLARI")
+        lines.append(f"Standing: {'✓' if ds.get('standings_used') else '✗'}")
+        lines.append(f"PSS Same League:")
+        lines.append(f"  Ev (Home): {ds.get('home_prev_matches', 0)} maç")
+        lines.append(f"  Deplasman (Away): {ds.get('away_prev_matches', 0)} maç")
+        lines.append(f"H2H: {ds.get('h2h_matches', 0)} maç {'(Same League)' if ds.get('h2h_sameleague_used') else '(All)'}")
+    
+    # VALUE BETTING
+    vb = data.get("value_bets", {})
+    if vb.get("used_odds"):
+        lines.append(f"\n💰 VALUE ANALİZİ (Bet365)")
+        has_value = False
+        for row in vb.get("table", []):
+            if row["value"] >= VALUE_MIN and row["prob"] >= PROB_MIN:
+                lines.append(f"{row['market']}: Oran {row['odds']:.2f} | Value {row['value']*100:.1f}% | Kelly {row['kelly']*100:.1f}%")
+                has_value = True
+        if not has_value:
+            lines.append("Değerli bahis bulunamadı")
+        lines.append(f"\nKarar: {vb.get('decision', 'N/A')}")
     
     lines.append("=" * 60)
     return "\n".join(lines)
@@ -1199,7 +1310,7 @@ def analyze_nowgoal(url: str, odds: Optional[Dict[str, float]] = None, mcruns: i
     return data
 
 # ============================================================================
-# FLASK API WITH ERROR LOGGING
+# FLASK API
 # ============================================================================
 app = Flask(__name__)
 
@@ -1208,7 +1319,7 @@ def root():
     return jsonify({
         "ok": True,
         "service": "nowgoal-analyzer-api",
-        "version": "5.1-fixed",
+        "version": "5.2-final-fixed",
         "status": "running"
     })
 
@@ -1377,7 +1488,7 @@ def handle_exception(e):
 
 if __name__ == "__main__":
     log_info("=" * 70)
-    log_info("NowGoal Analyzer v5.1 PRODUCTION - FIXED")
+    log_info("NowGoal Analyzer v5.2 PRODUCTION - COMPLETE")
     log_info("=" * 70)
     log_info(f"Python: {sys.version}")
     
