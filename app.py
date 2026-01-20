@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-NowGoal Match Analyzer - ULTIMATE EXACT VBA REPLICA
+NowGoal Match Analyzer - ULTIMATE VBA LOGIC REPLICA
 - BASE: Python Scraping Engine (v5.2) - Full Preservation
-- LOGIC: VBA PSS Model (%100 Port)
-- FIXED: Monte Carlo logic replaced with VBA 'Magic Dice' (PoissonRastgele)
-- FIXED: Market Probability Loops Truncated exactly like VBA
+- LOGIC: VBA 'Magic Dice' (PoissonRastgele) Logic Implemented
+- SIMULATION: Iterative loop (10,000 runs) exactly like VBA
 - OUTPUT: Exact "ResimGibi" VBA Format
 - STATUS: FULL CODE / NO CUTS
 """
@@ -18,6 +17,7 @@ import random
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from collections import Counter
+import numpy as np
 import requests
 from flask import Flask, request, jsonify
 
@@ -239,8 +239,6 @@ def parse_teams_from_title(html: str) -> Tuple[str, str]:
     og_match = re.search(r'<meta\s+property=["\']og:title["\']\s+content=["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
     if og_match:
         title_text = og_match.group(1)
-        log_info(f"Found og:title: {title_text}")
-        
         vs_match = re.search(r'(.+?)\s+VS\s+(.+?)(?:\s*-|\s*$)', title_text, flags=re.IGNORECASE)
         if vs_match:
             return (vs_match.group(1).strip(), vs_match.group(2).strip())
@@ -629,114 +627,112 @@ def poisson_pmf(lam: float, k: int) -> float:
     if lam <= 0: lam = 0.1
     return math.exp(-lam) * (lam ** k) / math.factorial(k)
 
-# --- VBA "SIHIRLI ZAR" (POISSON GENERATOR) ---
-def vba_poisson_rng(lam: float) -> int:
+# --- VBA 'MAGIC DICE' FUNCTION (POISSONRASTGELE) ---
+def vba_poisson_random(lam: float) -> int:
     """
     VBA kodundaki 'PoissonRastgele' fonksiyonunun Python karşılığı.
-    VBA'daki iteratif çarpım mantığını kullanır.
+    VBA'daki Rnd() yerine random.random() kullanılır.
     """
     if lam <= 0: lam = 0.1
     L = math.exp(-lam)
     p = 1.0
     k = 0
-    while p > L:
+    # Do...Loop equivalent
+    while True:
         k += 1
         p *= random.random()
+        if p <= L:
+            break
     return k - 1
 
+# --- 9.4 Monte Carlo Simulations (Goals) - ITERATIVE LOOP ---
 def monte_carlo_simulation_vba(lam_home: float, lam_away: float, num_sims: int = 10000) -> Dict[str, Any]:
     """
-    VBA: MonteCarloSimulasyonu (Re-implemented with VBA loop logic)
+    VBA: MonteCarloSimulasyonu (Exact Logic with Loop)
     """
-    gol_dagilim = Counter()
+    gol_dagilim = Counter() # 0 to 10+
     over25 = 0
     over35 = 0
     btts = 0
-    home_wins = 0
-    draws = 0
-    away_wins = 0
+    home_win = 0
+    draw = 0
+    away_win = 0
     score_counts = Counter()
     
     for _ in range(num_sims):
-        # VBA'daki PoissonRastgele fonksiyonunu kullan
-        hg = vba_poisson_rng(lam_home)
-        ag = vba_poisson_rng(lam_away)
+        ev_gol = vba_poisson_random(lam_home)
+        dep_gol = vba_poisson_random(lam_away)
         
-        total = hg + ag
+        toplam = ev_gol + dep_gol
         
-        # Dağılım (0-10 arası, VBA 10'da kesiyor ama listede 6+ var, biz full tutalım)
-        if total <= 10:
-            gol_dagilim[total] += 1
+        # VBA: If toplamGol <= 10 Then golDagilim(toplamGol) ...
+        # Biz burada Counter kullanıyoruz ama mantık aynı
+        if toplam <= 10:
+            gol_dagilim[toplam] += 1
+        else:
+            # VBA'da dizi 10 elemanlı olduğu için 10'a eklemiyor olabilir
+            # ama raporda 6+ gösteriliyor. Biz 11+ için de kaydedelim.
+            gol_dagilim[toplam] += 1
+            
+        if toplam > 2: over25 += 1
+        if toplam > 3: over35 += 1
+        if ev_gol >= 1 and dep_gol >= 1: btts += 1
         
-        # Marketler
-        if total > 2: over25 += 1
-        if total > 3: over35 += 1
-        if hg >= 1 and ag >= 1: btts += 1
+        if ev_gol > dep_gol: home_win += 1
+        elif ev_gol == dep_gol: draw += 1
+        else: away_win += 1
         
-        # 1X2
-        if hg > ag: home_wins += 1
-        elif hg == ag: draws += 1
-        else: away_wins += 1
-        
-        # Skor
-        score_counts[f"{hg}-{ag}"] += 1
+        score_key = f"{ev_gol}-{dep_gol}"
+        score_counts[score_key] += 1
         
     return {
         "dist_goals": gol_dagilim,
         "over25_pct": over25 / num_sims,
         "over35_pct": over35 / num_sims,
         "btts_pct": btts / num_sims,
-        "1_pct": home_wins / num_sims,
-        "X_pct": draws / num_sims,
-        "2_pct": away_wins / num_sims,
+        "1_pct": home_win / num_sims,
+        "X_pct": draw / num_sims,
+        "2_pct": away_win / num_sims,
         "top_scores": score_counts.most_common(10),
         "total_sims": num_sims
     }
 
+# --- 9.5 Monte Carlo Simulations (Corners) - ITERATIVE LOOP ---
 def monte_carlo_corners_vba(lam_home: float, lam_away: float, num_sims: int = 10000) -> Dict[str, Any]:
     """
-    VBA: MonteCarloKORNER_ResimGibi (Re-implemented with VBA loop logic)
+    VBA: MonteCarloKORNER_ResimGibi (Exact Logic with Loop)
     """
     dist_total = Counter()
-    over75 = 0
-    over85 = 0
-    over95 = 0
-    over105 = 0
-    over115 = 0
-    
-    home_more = 0
-    draw = 0
-    away_more = 0
-    
+    over75 = 0; over85 = 0; over95 = 0; over105 = 0; over115 = 0
+    home_more = 0; draw = 0; away_more = 0
     score_counts = Counter()
     
     for _ in range(num_sims):
-        # VBA'daki PoissonRastgele
-        hc = vba_poisson_rng(lam_home)
-        ac = vba_poisson_rng(lam_away)
+        ev_k = vba_poisson_random(lam_home)
+        dep_k = vba_poisson_random(lam_away)
+        top_k = ev_k + dep_k
         
-        tot = hc + ac
-        
-        # 1. Dağılım Kaydı (VBA: If topK <= 19 Then...)
-        if tot <= 19:
-            dist_total[tot] += 1
+        # 1. Dağılım
+        if top_k <= 19:
+            dist_total[top_k] += 1
         else:
             dist_total[20] += 1
             
-        # 2. Detaylı Market Sayımı (VBA Logic: If topK > 7 Then...)
-        if tot > 7: over75 += 1
-        if tot > 8: over85 += 1
-        if tot > 9: over95 += 1
-        if tot > 10: over105 += 1
-        if tot > 11: over115 += 1
+        # 2. Market
+        if top_k > 7: over75 += 1
+        if top_k > 8: over85 += 1
+        if top_k > 9: over95 += 1
+        if top_k > 10: over105 += 1
+        if top_k > 11: over115 += 1
         
-        # 3. Taraf Bahsi
-        if hc > ac: home_more += 1
-        elif hc == ac: draw += 1
+        # 3. Taraf
+        if ev_k > dep_k: home_more += 1
+        elif ev_k == dep_k: draw += 1
         else: away_more += 1
         
-        # 4. Skor Kaydı
-        score_counts[f"{hc}-{ac}"] += 1
+        # 4. Skor
+        score_key = f"{ev_k}-{dep_k}"
+        score_counts[score_key] += 1
         
     return {
         "dist_total": dist_total,
@@ -925,7 +921,8 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
         pct = cnt / mc['total_sims']
         bar = "-" * int(pct * 50)
         lines.append(f" {i} gol: %{pct*100:.1f} {bar}")
-    plus6 = sum(mc['dist_goals'][i] for i in mc['dist_goals'] if i >= 6)
+    # 6+ gol hesabı (dağılım dictionarysinde 6 ve üstü keylerin toplamı)
+    plus6 = sum(mc['dist_goals'][k] for k in mc['dist_goals'] if k >= 6)
     lines.append(f" 6+ gol: %{plus6/mc['total_sims']*100:.1f}\n")
     
     lines.append("Market Sonuclari:")
@@ -1083,8 +1080,6 @@ def analyze_nowgoal(url: str, odds: Optional[List[float]] = None) -> Dict[str, A
     raw_home_list, raw_away_list = extract_previous_from_page(html)
     
     # === FILTERING FIX (ORJINAL KOD MANTIGI) ===
-    # Ev Sahibi için sadece EVİNDE oynadığı maçlar
-    # Deplasman için sadece DEPLASMANDA oynadığı maçlar
     prev_home_list = filter_team_home_only(raw_home_list, home_team)[:RECENT_N]
     prev_away_list = filter_team_away_only(raw_away_list, away_team)[:RECENT_N]
     
@@ -1100,9 +1095,7 @@ def analyze_nowgoal(url: str, odds: Optional[List[float]] = None) -> Dict[str, A
     lam_away = calculate_weighted_pss_goals(prev_away_list, away_team, False)
     
     # B) Corner Lambda (Perplexity / Taze Ekmek)
-    # Evin Kazandığı / Yediği (Filtreli liste)
     h_won, h_conceded = calculate_weighted_pss_corners(prev_home_list, home_team, True)
-    # Deplasmanın Kazandığı / Yediği (Filtreli liste)
     a_won, a_conceded = calculate_weighted_pss_corners(prev_away_list, away_team, False)
     
     # Formül: (EvAtan + DepYiyen)/2
@@ -1116,7 +1109,6 @@ def analyze_nowgoal(url: str, odds: Optional[List[float]] = None) -> Dict[str, A
     h_dist = [poisson_pmf(lam_home, i) for i in range(6)]
     a_dist = [poisson_pmf(lam_away, i) for i in range(6)]
     
-    # Skor Matrisi
     scores = []
     for h in range(6):
         for a in range(6):
@@ -1140,7 +1132,6 @@ def analyze_nowgoal(url: str, odds: Optional[List[float]] = None) -> Dict[str, A
             
     # E) Market Olasılıkları (Korner) - TRUNCATED LOOPS (0-10) TO MATCH VBA TEXT
     # Bu döngü 0-10 arası sınırlı olduğu için 10 üstü ihtimalleri toplamaz.
-    # Metindeki %69.6 gibi "düşük" Üst oranlarını ancak böyle yakalarız.
     h_corn_dist_trunc = [poisson_pmf(lam_corn_h, i) for i in range(11)] # 0 to 10
     a_corn_dist_trunc = [poisson_pmf(lam_corn_a, i) for i in range(11)] # 0 to 10
     
@@ -1161,7 +1152,7 @@ def analyze_nowgoal(url: str, odds: Optional[List[float]] = None) -> Dict[str, A
     m_corn['away_o45'] = sum(a_corn_dist_trunc[5:])
     m_corn['away_o55'] = sum(a_corn_dist_trunc[6:])
     
-    # F) Monte Carlo Simulations (UNBOUNDED - Correctly shows higher probs)
+    # F) Monte Carlo Simulations (LOOP-BASED EXACT REPLICA)
     mc_goals = monte_carlo_simulation_vba(lam_home, lam_away, MC_RUNS_DEFAULT)
     mc_corners = monte_carlo_corners_vba(lam_corn_h, lam_corn_a, MC_RUNS_DEFAULT)
     
@@ -1207,7 +1198,7 @@ def root():
     return jsonify({
         "ok": True,
         "service": "nowgoal-analyzer-ultimate",
-        "version": "6.3-exact-replica",
+        "version": "6.4-exact-replica-loop",
         "status": "running"
     })
 
@@ -1281,7 +1272,7 @@ def analizet_route():
 
 if __name__ == "__main__":
     log_info("=" * 70)
-    log_info("NowGoal Analyzer ULTIMATE EXACT REPLICA VERSION - COMPLETE")
+    log_info("NowGoal Analyzer ULTIMATE EXACT REPLICA VERSION (LOOP) - COMPLETE")
     log_info("=" * 70)
     
     if len(sys.argv) > 1 and sys.argv[1] == "serve":
