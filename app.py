@@ -1067,75 +1067,90 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
 
 def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
     """
-    [GÜNCELLENDİ - GÖRSELE GÖRE] 
-    Tablo sırası: Asian Handicap -> 1X2 Odds -> Over/Under
-    Bu fonksiyon Bet365 Initial satırındaki ilk 3 veriyi (Asian) atlar,
-    ikinci 3'lü grubu (1X2) çeker.
+    [KESİN ÇÖZÜM - HÜCRE SAYMA YÖNTEMİ]
+    Bet365 > Initial satırını bulur.
+    Sonrasındaki <td> etiketlerini sırayla okur.
+    İlk 3 hücre (Asian Handicap) -> ATLA.
+    Sonraki 3 hücre (1X2) -> AL.
+    Regex hatasına düşmez, sırayla hücre sayar.
     """
     try:
         url = f"{base_url}/oddscomp/{match_id}"
         html = safe_get(url, referer=base_url)
         
-        # --- GÖRSELE ÖZEL REGEX MANTIĞI ---
-        # 1. "Bet365" kelimesini bul.
-        # 2. "Initial" kelimesine git.
-        # 3. Asya Handikap verileri (Genelde sayı, kesir veya tire içerir: 0.85, 0.5/1, 1.00) -> BUNLARI ATLA (3 adet)
-        # 4. 1X2 Oranları (Ondalıklı sayılar: 1.61, 3.60, 5.25) -> BUNLARI AL
+        # 1. Bet365 ve Initial kelimelerinin geçtiği yeri bul
+        # HTML içinde arama yaparken büyük/küçük harf duyarsız yapalım
+        content_lower = html.lower()
+        start_pos = content_lower.find("bet365")
         
-        # Regex Açıklaması:
-        # Bet365.*?Initial : Satır başlangıcı
-        # (?:.*?[\d\./\+\-]+){3} : Sayı, nokta, slash içeren 3 adet veri grubunu (Asian) oku ama kaydetme (ATLA).
-        # .*?(\d{1,3}\.\d{2}) : 1. Hedef (Ev Sahibi 1X2)
-        # .*?(\d{1,3}\.\d{2}) : 2. Hedef (Beraberlik 1X2)
-        # .*?(\d{1,3}\.\d{2}) : 3. Hedef (Deplasman 1X2)
-        
-        pattern = (
-            r'Bet365'                  # Şirket
-            r'.*?Initial'              # İlk satır
-            r'(?:.*?[\d\./\+\-]+){3}'  # İLK 3 SÜTUNU (Asian Home/Handicap/Away) GÖRMEZDEN GEL
-            r'.*?(\d{1,3}\.\d{2})'     # 4. Sütun: 1 (Ev) - YAKALA
-            r'.*?(\d{1,3}\.\d{2})'     # 5. Sütun: X (Beraberlik) - YAKALA
-            r'.*?(\d{1,3}\.\d{2})'     # 6. Sütun: 2 (Deplasman) - YAKALA
-        )
-        
-        matcher = re.search(pattern, html, re.DOTALL | re.IGNORECASE)
-        
-        if matcher:
-            o1 = float(matcher.group(1))
-            oX = float(matcher.group(2))
-            o2 = float(matcher.group(3))
+        if start_pos == -1:
+            log_error("Bet365 satırı bulunamadı.")
+            return [1.0, 1.0, 1.0]
             
-            # Sağlama: 1X2 oranları genellikle 1.05'ten büyük olur. 
-            # Asian oranları (0.85 vs) yanlışlıkla çekilirse bu kontrol yakalar.
-            if o1 > 1.0 and oX > 1.0 and o2 > 1.0:
-                log_info(f"Oranlar Bet365 Initial (1X2) olarak çekildi: {o1} - {oX} - {o2}")
-                return [o1, oX, o2]
+        # Bet365'ten sonra gelen "Initial" kelimesini bul
+        initial_pos = content_lower.find("initial", start_pos)
         
-        # Bet365 bulunamazsa "Average" (Ortalama) verisine bak (Yine aynı mantıkla 1x2 sırasını hedefler)
-        # Average satırında da yapı genelde aynıdır.
-        pattern_avg = (
-            r'(?:Average|Score)'
-            r'.*?Initial'
-            r'(?:.*?[\d\./\+\-]+){3}' # Asya'yı atla
-            r'.*?(\d{1,3}\.\d{2})'    # 1
-            r'.*?(\d{1,3}\.\d{2})'    # X
-            r'.*?(\d{1,3}\.\d{2})'    # 2
-        )
-        matcher_avg = re.search(pattern_avg, html, re.DOTALL | re.IGNORECASE)
+        if initial_pos == -1:
+            log_error("Bet365 içinde Initial satırı bulunamadı.")
+            return [1.0, 1.0, 1.0]
+            
+        # 2. "Initial" kelimesinden sonraki HTML parçasını al (yaklaşık 2000 karakter yeterli)
+        chunk = html[initial_pos : initial_pos + 2000]
         
-        if matcher_avg:
-            o1 = float(matcher_avg.group(1))
-            oX = float(matcher_avg.group(2))
-            o2 = float(matcher_avg.group(3))
-            if o1 > 1.0 and oX > 1.0 and o2 > 1.0:
-                log_info(f"Oranlar Ortalama Initial (1X2) olarak çekildi: {o1} - {oX} - {o2}")
-                return [o1, oX, o2]
+        # 3. HTML Parçasını hücrelere (td) böl
+        # Regex: <td...>(içerik)</td> yapısını yakalar
+        # Non-greedy (.*?) kullanarak hücre içeriklerini tek tek alırız.
+        cells = re.findall(r'<td[^>]*>(.*?)</td>', chunk, re.DOTALL | re.IGNORECASE)
+        
+        # Tablo Yapısı:
+        # Index 0: Asian Home   (Atla)
+        # Index 1: Asian Hdp    (Atla - Burası 0.5/1 gibi olabilir, regex'i bozan yer burasıydı)
+        # Index 2: Asian Away   (Atla)
+        # Index 3: 1X2 HOME     (AL) --> Hedef 1
+        # Index 4: 1X2 DRAW     (AL) --> Hedef 2
+        # Index 5: 1X2 AWAY     (AL) --> Hedef 3
+        
+        if len(cells) < 6:
+            log_error("Yeterli hücre verisi okunamadı.")
+            return [1.0, 1.0, 1.0]
+            
+        # 4. Verileri Temizle ve Çek
+        def clean_val(val):
+            # HTML taglerini temizle, boşlukları sil
+            v = re.sub(r'<.*?>', '', val).strip()
+            # Sadece sayı ve nokta kalsın
+            match = re.search(r'(\d+\.\d{2})', v)
+            return float(match.group(1)) if match else 1.0
 
-        log_error("Görseldeki yapıya uygun 1x2 oranları bulunamadı.")
+        o1 = clean_val(cells[3]) # Ev
+        oX = clean_val(cells[4]) # Beraberlik
+        o2 = clean_val(cells[5]) # Deplasman
+        
+        # Sağlama: Oranlar mantıklı mı?
+        if o1 > 1.0 and oX > 1.0 and o2 > 1.0:
+            log_info(f"Oranlar Başarıyla Çekildi (Hücre Yöntemi): {o1} - {oX} - {o2}")
+            return [o1, oX, o2]
+            
+        # Eğer Bet365 verisi bozuksa, Average (Ortalama) verisine de aynı yöntemle bakalım
+        # (Yedek Plan)
+        avg_pos = content_lower.find("average") 
+        if avg_pos != -1:
+             initial_avg = content_lower.find("initial", avg_pos)
+             if initial_avg != -1:
+                 chunk_avg = html[initial_avg : initial_avg + 2000]
+                 cells_avg = re.findall(r'<td[^>]*>(.*?)</td>', chunk_avg, re.DOTALL | re.IGNORECASE)
+                 if len(cells_avg) >= 6:
+                     o1 = clean_val(cells_avg[3])
+                     oX = clean_val(cells_avg[4])
+                     o2 = clean_val(cells_avg[5])
+                     if o1 > 1.0:
+                         log_info(f"Yedek: Ortalama Oranlar Çekildi: {o1} - {oX} - {o2}")
+                         return [o1, oX, o2]
+
         return [1.0, 1.0, 1.0]
 
     except Exception as e:
-        log_error(f"Oran çekme hatası: {e}")
+        log_error(f"Oran çekme hatası (Hücre Yöntemi): {e}")
         return [1.0, 1.0, 1.0]
 
 def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict[str, Any]:
