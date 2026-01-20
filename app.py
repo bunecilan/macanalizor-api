@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-NowGoal Match Analyzer - ULTIMATE EXACT MATCH VERSION
+NowGoal Match Analyzer - ULTIMATE EXACT VBA REPLICA
 - BASE: Python Scraping Engine (v5.2) - Full Preservation
-- LOGIC: VBA PSS Model (%100 Port with Exact Loop Constraints)
-- FIXED: Section D Corner Market Truncation (0-10 Loop) matched to VBA text output
-- FIXED: Monte Carlo logic aligned with VBA 'Magic Dice' approach
+- LOGIC: VBA PSS Model (%100 Port)
+- FIXED: Monte Carlo logic replaced with VBA 'Magic Dice' (PoissonRastgele)
+- FIXED: Market Probability Loops Truncated exactly like VBA
 - OUTPUT: Exact "ResimGibi" VBA Format
 - STATUS: FULL CODE / NO CUTS
 """
@@ -18,7 +18,6 @@ import random
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from collections import Counter
-import numpy as np
 import requests
 from flask import Flask, request, jsonify
 
@@ -237,9 +236,6 @@ def build_oddscomp_url(url: str) -> str:
     return f"{base}/oddscomp/{match_id}"
 
 def parse_teams_from_title(html: str) -> Tuple[str, str]:
-    """
-    FIXED VERSION: Supports og:title meta tag
-    """
     og_match = re.search(r'<meta\s+property=["\']og:title["\']\s+content=["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
     if og_match:
         title_text = og_match.group(1)
@@ -344,7 +340,6 @@ def parse_match_from_cells(cells: List[str]) -> Optional[MatchRow]:
             cornerhtaway=cornerhtaway,
         )
     
-    # Fallback parsing strategy
     score_idx = None
     scorem = None
     for i, c in enumerate(cells):
@@ -634,26 +629,60 @@ def poisson_pmf(lam: float, k: int) -> float:
     if lam <= 0: lam = 0.1
     return math.exp(-lam) * (lam ** k) / math.factorial(k)
 
+# --- VBA "SIHIRLI ZAR" (POISSON GENERATOR) ---
+def vba_poisson_rng(lam: float) -> int:
+    """
+    VBA kodundaki 'PoissonRastgele' fonksiyonunun Python karşılığı.
+    VBA'daki iteratif çarpım mantığını kullanır.
+    """
+    if lam <= 0: lam = 0.1
+    L = math.exp(-lam)
+    p = 1.0
+    k = 0
+    while p > L:
+        k += 1
+        p *= random.random()
+    return k - 1
+
 def monte_carlo_simulation_vba(lam_home: float, lam_away: float, num_sims: int = 10000) -> Dict[str, Any]:
-    # Numpy poisson produces integer results directly, matching the discrete nature of goals
-    home_goals = np.random.poisson(lam_home, num_sims)
-    away_goals = np.random.poisson(lam_away, num_sims)
+    """
+    VBA: MonteCarloSimulasyonu (Re-implemented with VBA loop logic)
+    """
+    gol_dagilim = Counter()
+    over25 = 0
+    over35 = 0
+    btts = 0
+    home_wins = 0
+    draws = 0
+    away_wins = 0
+    score_counts = Counter()
     
-    total_goals = home_goals + away_goals
-    
-    dist_goals = Counter(total_goals)
-    over25 = np.sum(total_goals > 2.5)
-    over35 = np.sum(total_goals > 3.5)
-    btts = np.sum((home_goals > 0) & (away_goals > 0))
-    home_wins = np.sum(home_goals > away_goals)
-    draws = np.sum(home_goals == away_goals)
-    away_wins = np.sum(home_goals < away_goals)
-    
-    scores = [f"{h}-{a}" for h, a in zip(home_goals, away_goals)]
-    score_counts = Counter(scores)
-    
+    for _ in range(num_sims):
+        # VBA'daki PoissonRastgele fonksiyonunu kullan
+        hg = vba_poisson_rng(lam_home)
+        ag = vba_poisson_rng(lam_away)
+        
+        total = hg + ag
+        
+        # Dağılım (0-10 arası, VBA 10'da kesiyor ama listede 6+ var, biz full tutalım)
+        if total <= 10:
+            gol_dagilim[total] += 1
+        
+        # Marketler
+        if total > 2: over25 += 1
+        if total > 3: over35 += 1
+        if hg >= 1 and ag >= 1: btts += 1
+        
+        # 1X2
+        if hg > ag: home_wins += 1
+        elif hg == ag: draws += 1
+        else: away_wins += 1
+        
+        # Skor
+        score_counts[f"{hg}-{ag}"] += 1
+        
     return {
-        "dist_goals": dist_goals,
+        "dist_goals": gol_dagilim,
         "over25_pct": over25 / num_sims,
         "over35_pct": over35 / num_sims,
         "btts_pct": btts / num_sims,
@@ -665,26 +694,50 @@ def monte_carlo_simulation_vba(lam_home: float, lam_away: float, num_sims: int =
     }
 
 def monte_carlo_corners_vba(lam_home: float, lam_away: float, num_sims: int = 10000) -> Dict[str, Any]:
-    # Using numpy poisson to simulate corner counts
-    home_corners = np.random.poisson(lam_home, num_sims)
-    away_corners = np.random.poisson(lam_away, num_sims)
-    total_corners = home_corners + away_corners
+    """
+    VBA: MonteCarloKORNER_ResimGibi (Re-implemented with VBA loop logic)
+    """
+    dist_total = Counter()
+    over75 = 0
+    over85 = 0
+    over95 = 0
+    over105 = 0
+    over115 = 0
     
-    dist_total = Counter(total_corners)
+    home_more = 0
+    draw = 0
+    away_more = 0
     
-    over75 = np.sum(total_corners > 7.5)
-    over85 = np.sum(total_corners > 8.5)
-    over95 = np.sum(total_corners > 9.5)
-    over105 = np.sum(total_corners > 10.5)
-    over115 = np.sum(total_corners > 11.5)
+    score_counts = Counter()
     
-    home_more = np.sum(home_corners > away_corners)
-    draw = np.sum(home_corners == away_corners)
-    away_more = np.sum(home_corners < away_corners)
-    
-    scores = [f"{h}-{a}" for h, a in zip(home_corners, away_corners)]
-    score_counts = Counter(scores)
-    
+    for _ in range(num_sims):
+        # VBA'daki PoissonRastgele
+        hc = vba_poisson_rng(lam_home)
+        ac = vba_poisson_rng(lam_away)
+        
+        tot = hc + ac
+        
+        # 1. Dağılım Kaydı (VBA: If topK <= 19 Then...)
+        if tot <= 19:
+            dist_total[tot] += 1
+        else:
+            dist_total[20] += 1
+            
+        # 2. Detaylı Market Sayımı (VBA Logic: If topK > 7 Then...)
+        if tot > 7: over75 += 1
+        if tot > 8: over85 += 1
+        if tot > 9: over95 += 1
+        if tot > 10: over105 += 1
+        if tot > 11: over115 += 1
+        
+        # 3. Taraf Bahsi
+        if hc > ac: home_more += 1
+        elif hc == ac: draw += 1
+        else: away_more += 1
+        
+        # 4. Skor Kaydı
+        score_counts[f"{hc}-{ac}"] += 1
+        
     return {
         "dist_total": dist_total,
         "over75": over75 / num_sims,
