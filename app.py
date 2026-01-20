@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-NowGoal Match Analyzer - ULTIMATE FULL VERSION
-- BASE: Python Scraping Engine (v5.2)
-- LOGIC: VBA PSS Model (%100 Port)
-- OUTPUT: VBA "ResimGibi" Format
-- STATUS: NO CUTS / FULL CODE
+NowGoal Match Analyzer - PRODUCTION v5.2 (PSS_ONLY VBA STYLE)
+- MODEL: %100 PSS (Standings/H2H display only)
+- Recency weighting: first 5 matches 1.20, older 0.80 (goals + corners)
+- HT corner support if present in corner cell like "8-2(3-1)"
+- Android-friendly response + comprehensive text report
 """
 
 import re
@@ -12,7 +12,6 @@ import math
 import time
 import traceback
 import sys
-import random
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from collections import Counter
@@ -20,12 +19,29 @@ import numpy as np
 import requests
 from flask import Flask, request, jsonify
 
-# ============================================================================
-# 1. CONFIGURATION & CONSTANTS
-# ============================================================================
-MC_RUNS_DEFAULT = 10000  # VBA Standardı: 10,000 simülasyon
+# =============================================================================
+# CONFIG
+# =============================================================================
+MODEL_MODE = "PSS_ONLY"   # "PSS_ONLY" (VBA style) or "BLENDED" (not used here)
+
+MC_RUNS_DEFAULT = 5000
 RECENT_N = 10
 H2H_N = 10
+
+# VBA style recency weights
+RECENT_WEIGHT_N = 5
+W_RECENT = 1.20
+W_OLD = 0.80
+
+# If you want to keep Poisson vs MC blend:
+BLEND_ALPHA = 0.50
+
+VALUE_MIN = 0.05
+PROB_MIN = 0.55
+KELLY_MIN = 0.02
+
+MAX_GOALS_FOR_MATRIX = 5
+MAX_CORNERS_FOR_MATRIX = 20
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -34,30 +50,28 @@ HEADERS = {
     "Connection": "keep-alive",
 }
 
-# ============================================================================
-# 2. LOGGING HELPERS
-# ============================================================================
+# =============================================================================
+# LOGGING
+# =============================================================================
 def log_error(msg: str, exc: Exception = None):
     print(f"[ERROR] {msg}", file=sys.stderr, flush=True)
     if exc:
-        print(f"[ERROR] {traceback.format_exc()}", file=sys.stderr, flush=True)
+        print(traceback.format_exc(), file=sys.stderr, flush=True)
 
 def log_info(msg: str):
     print(f"[INFO] {msg}", file=sys.stdout, flush=True)
 
-# ============================================================================
-# 3. REGEX PATTERNS (FULL LIST FROM ORIGINAL PYTHON CODE)
-# ============================================================================
-DATE_ANY_RE = re.compile(r'\d{1,2}-\d{1,2}-\d{4}|\d{4}-\d{2}-\d{2}')
-SCORE_RE = re.compile(r'(\d{1,2})-(\d{1,2})(?:\((\d{1,2})-(\d{1,2})\))?')
-CORNER_FT_RE = re.compile(r'(\d{1,2})-(\d{1,2})')
-CORNER_HT_RE = re.compile(r'\((\d{1,2})-(\d{1,2})\)')
-FLOAT_RE = re.compile(r'(\d+(?:\.\d+)?)')
-INT_RE = re.compile(r'(\d+)')
+# =============================================================================
+# REGEX
+# =============================================================================
+DATE_ANY_RE = re.compile(r"\d{1,2}-\d{1,2}-\d{4}|\d{4}-\d{2}-\d{2}")
+SCORE_RE = re.compile(r"(\d{1,2})-(\d{1,2})(?:\((\d{1,2})-(\d{1,2})\))?")
+CORNER_FT_RE = re.compile(r"(\d{1,2})-(\d{1,2})")
+CORNER_HT_RE = re.compile(r"\((\d{1,2})-(\d{1,2})\)")
 
-# ============================================================================
-# 4. DATA CLASSES
-# ============================================================================
+# =============================================================================
+# DATA
+# =============================================================================
 @dataclass
 class MatchRow:
     league: str
@@ -72,6 +86,20 @@ class MatchRow:
     corneraway: Optional[int] = None
     cornerhthome: Optional[int] = None
     cornerhtaway: Optional[int] = None
+
+@dataclass
+class SplitGFGA:
+    matches: int
+    gf: int
+    ga: int
+
+    @property
+    def gfpg(self) -> float:
+        return self.gf / self.matches if self.matches else 0.0
+
+    @property
+    def gapg(self) -> float:
+        return self.ga / self.matches if self.matches else 0.0
 
 @dataclass
 class StandRow:
@@ -89,27 +117,36 @@ class StandRow:
 @dataclass
 class TeamPrevStats:
     name: str
+
+    # weighted averages (VBA style)
     gftotal: float = 0.0
     gatotal: float = 0.0
     ntotal: int = 0
+
     gfhome: float = 0.0
     gahome: float = 0.0
     nhome: int = 0
+
     gfaway: float = 0.0
     gaaway: float = 0.0
     naway: int = 0
-    cleansheets: int = 0
-    scoredmatches: int = 0
+
     cornersfor: float = 0.0
     cornersagainst: float = 0.0
+    corners_n: int = 0
+
     cornersfor_ht: float = 0.0
     cornersagainst_ht: float = 0.0
+    corners_ht_n: int = 0
 
-# ============================================================================
-# 5. SCRAPING HELPER FUNCTIONS (FULL ORIGINAL SET)
-# ============================================================================
+    cleansheets: int = 0
+    scoredmatches: int = 0
+
+# =============================================================================
+# HELPERS
+# =============================================================================
 def norm_key(s: str) -> str:
-    return re.sub(r'[^a-z0-9]', '', (s or '').lower())
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
 
 def normalize_date(d: str) -> Optional[str]:
     if not d:
@@ -119,52 +156,51 @@ def normalize_date(d: str) -> Optional[str]:
     if not m:
         return None
     val = m.group(0)
-    if re.match(r'\d{4}-\d{2}-\d{2}', val):
-        yyyy, mm, dd = val.split('-')
+    if re.match(r"\d{4}-\d{2}-\d{2}", val):
+        yyyy, mm, dd = val.split("-")
         return f"{int(dd):02d}-{int(mm):02d}-{yyyy}"
-    if re.match(r'\d{1,2}-\d{1,2}-\d{4}', val):
-        dd, mm, yyyy = val.split('-')
+    if re.match(r"\d{1,2}-\d{1,2}-\d{4}", val):
+        dd, mm, yyyy = val.split("-")
         return f"{int(dd):02d}-{int(mm):02d}-{yyyy}"
     return None
 
 def parse_date_key(datestr: str) -> Tuple[int, int, int]:
-    if not datestr or not re.match(r'\d{2}-\d{2}-\d{4}', datestr):
+    if not datestr or not re.match(r"\d{2}-\d{2}-\d{4}", datestr):
         return (0, 0, 0)
-    dd, mm, yyyy = datestr.split('-')
+    dd, mm, yyyy = datestr.split("-")
     return (int(yyyy), int(mm), int(dd))
 
 def strip_tags_keep_text(s: str) -> str:
-    s = re.sub(r'<script.*?</script>', '', s, flags=re.IGNORECASE | re.DOTALL)
-    s = re.sub(r'<style.*?</style>', '', s, flags=re.IGNORECASE | re.DOTALL)
-    s = re.sub(r'<.*?>', '', s)
-    s = s.replace('&nbsp;', ' ')
-    s = s.replace('&amp;', '&')
-    s = re.sub(r'\s+', ' ', s)
+    s = re.sub(r"<script.*?</script>", "", s, flags=re.IGNORECASE | re.DOTALL)
+    s = re.sub(r"<style.*?</style>", "", s, flags=re.IGNORECASE | re.DOTALL)
+    s = re.sub(r"<.*?>", "", s)
+    s = s.replace("&nbsp;", " ").replace("&amp;", "&")
+    s = re.sub(r"\s+", " ", s)
     return s.strip()
 
 def extract_tables_html(page_source: str) -> List[str]:
-    return [m.group(0) for m in re.finditer(r'<table.*?</table>', page_source or '', flags=re.IGNORECASE | re.DOTALL)]
+    return [m.group(0) for m in re.finditer(r"<table.*?</table>", page_source or "", flags=re.IGNORECASE | re.DOTALL)]
 
 def extract_table_rows_from_html(table_html: str) -> List[List[str]]:
     rows: List[List[str]] = []
-    trs = re.findall(r'<tr.*?</tr>', table_html or '', flags=re.IGNORECASE | re.DOTALL)
+    trs = re.findall(r"<tr.*?</tr>", table_html or "", flags=re.IGNORECASE | re.DOTALL)
     for tr in trs:
-        cells = re.findall(r'<t[dh].*?</t[dh]>', tr, flags=re.IGNORECASE | re.DOTALL)
+        cells = re.findall(r"<t[dh].*?</t[dh]>", tr, flags=re.IGNORECASE | re.DOTALL)
         if not cells:
             continue
         cleaned = [strip_tags_keep_text(c) for c in cells]
         normalized = []
         for c in cleaned:
-            c = (c or '').strip()
-            if c in ('', '-'):
-                c = ''
+            c = (c or "").strip()
+            if c in ("", "-"):
+                c = ""
             normalized.append(c)
         if any(x for x in normalized):
             rows.append(normalized)
     return rows
 
 def section_tables_by_marker(page_source: str, marker: str, max_tables: int = 3) -> List[str]:
-    low = (page_source or '').lower()
+    low = (page_source or "").lower()
     pos = low.find(marker.lower())
     if pos == -1:
         return []
@@ -176,38 +212,38 @@ def safe_get(url: str, timeout: int = 20, retries: int = 2, referer: Optional[st
     last_err = None
     headers = dict(HEADERS)
     if referer:
-        headers['Referer'] = referer
+        headers["Referer"] = referer
     for attempt in range(retries + 1):
         try:
             log_info(f"Fetching {url} (attempt {attempt + 1})")
             r = requests.get(url, headers=headers, timeout=timeout)
             r.raise_for_status()
             r.encoding = r.apparent_encoding
-            log_info(f"Successfully fetched {url}")
+            log_info(f"Fetch OK: {url}")
             return r.text
         except requests.exceptions.Timeout as e:
             last_err = e
-            log_error(f"Timeout on attempt {attempt + 1}: {url}", e)
+            log_error(f"Timeout: {url}", e)
             if attempt < retries:
                 time.sleep(0.5)
         except Exception as e:
             last_err = e
-            log_error(f"Error on attempt {attempt + 1}: {url}", e)
+            log_error(f"Fetch error: {url}", e)
             if attempt < retries:
                 time.sleep(0.7)
     raise RuntimeError(f"Fetch failed after {retries + 1} attempts: {url} - {last_err}")
 
 def extract_match_id(url: str) -> str:
-    m = re.search(r'(?:h2h-|match/h2h-)(\d+)', url)
+    m = re.search(r"(?:h2h-|match/h2h-)(\d+)", url)
     if m:
         return m.group(1)
-    nums = re.findall(r'\d{6,}', url)
+    nums = re.findall(r"\d{6,}", url)
     if not nums:
         raise ValueError("Match ID not found")
     return nums[-1]
 
 def extract_base_domain(url: str) -> str:
-    m = re.match(r'(https?://[^/]+)', url.strip())
+    m = re.match(r"(https?://[^/]+)", url.strip())
     return m.group(1) if m else "https://live3.nowgoal26.com"
 
 def build_h2h_url(url: str) -> str:
@@ -216,44 +252,48 @@ def build_h2h_url(url: str) -> str:
     return f"{base}/match/h2h-{match_id}"
 
 def parse_teams_from_title(html: str) -> Tuple[str, str]:
-    """
-    FIXED VERSION: Supports og:title meta tag
-    """
-    og_match = re.search(r'<meta\s+property=["\']og:title["\']\s+content=["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
+    og_match = re.search(
+        r'<meta\s+property=["\']og:title["\']\s+content=["\']([^"\']+)["\']',
+        html,
+        flags=re.IGNORECASE
+    )
     if og_match:
-        title_text = og_match.group(1)
-        vs_match = re.search(r'(.+?)\s+VS\s+(.+?)(?:\s*-|\s*$)', title_text, flags=re.IGNORECASE)
+        title_text = og_match.group(1).strip()
+        log_info(f"og:title: {title_text}")
+        vs_match = re.search(r"(.+?)\s+VS\s+(.+?)(?:\s*-|\s*$)", title_text, flags=re.IGNORECASE)
         if vs_match:
-            return (vs_match.group(1).strip(), vs_match.group(2).strip())
-    
-    title_match = re.search(r'<title[^>]*>([^<]+)</title>', html, flags=re.IGNORECASE)
+            return vs_match.group(1).strip(), vs_match.group(2).strip()
+
+    title_match = re.search(r"<title[^>]*>([^<]+)</title>", html, flags=re.IGNORECASE)
     if title_match:
         title_text = title_match.group(1).strip()
-        vs_match = re.search(r'(.+?)\s+(?:VS|vs)\s+(.+?)(?:\s*-|\s*$)', title_text, flags=re.IGNORECASE)
+        log_info(f"title: {title_text}")
+        vs_match = re.search(r"(.+?)\s+(?:VS|vs)\s+(.+?)(?:\s*-|\s*$)", title_text, flags=re.IGNORECASE)
         if vs_match:
-            return (vs_match.group(1).strip(), vs_match.group(2).strip())
-    
-    h1_match = re.search(r'<h1[^>]*>([^<]+)</h1>', html, flags=re.IGNORECASE)
+            return vs_match.group(1).strip(), vs_match.group(2).strip()
+
+    h1_match = re.search(r"<h1[^>]*>([^<]+)</h1>", html, flags=re.IGNORECASE)
     if h1_match:
         h1_text = h1_match.group(1).strip()
-        vs_match = re.search(r'(.+?)\s+(?:vs|VS)\s+(.+?)(?:\s+Live|\s*$)', h1_text, flags=re.IGNORECASE)
+        vs_match = re.search(r"(.+?)\s+(?:vs|VS)\s+(.+?)(?:\s+Live|\s*$)", h1_text, flags=re.IGNORECASE)
         if vs_match:
-            return (vs_match.group(1).strip(), vs_match.group(2).strip())
-    
-    log_error("Could not parse team names from any source")
-    return ("Home", "Away")
+            return vs_match.group(1).strip(), vs_match.group(2).strip()
+
+    return "", ""
 
 def sort_matches_desc(matches: List[MatchRow]) -> List[MatchRow]:
-    has_real_date = any(parse_date_key(m.date) != (0, 0, 0) for m in matches)
+    # keep stable ordering when dates are missing
+    indexed = [(i, m) for i, m in enumerate(matches)]
+    has_real_date = any(parse_date_key(m.date) != (0, 0, 0) for _, m in indexed)
     if not has_real_date:
         return matches
-    return sorted(matches, key=lambda x: parse_date_key(x.date), reverse=True)
+    return [m for _, m in sorted(indexed, key=lambda im: (parse_date_key(im[1].date), -im[0]), reverse=True)]
 
 def dedupe_matches(matches: List[MatchRow]) -> List[MatchRow]:
     seen = set()
     out = []
     for m in matches:
-        key = (m.league, m.date, m.home, m.away, m.fthome, m.ftaway, m.cornerhome, m.corneraway)
+        key = (m.league, m.date, m.home, m.away, m.fthome, m.ftaway, m.cornerhome, m.corneraway, m.cornerhthome, m.cornerhtaway)
         if key in seen:
             continue
         seen.add(key)
@@ -265,49 +305,52 @@ def is_h2h_pair(m: MatchRow, hometeam: str, awayteam: str) -> bool:
     mh, ma = norm_key(m.home), norm_key(m.away)
     return (mh == hk and ma == ak) or (mh == ak and ma == hk)
 
+# =============================================================================
+# PARSERS
+# =============================================================================
 def parse_corner_cell(cell: str) -> Tuple[Optional[Tuple[int, int]], Optional[Tuple[int, int]]]:
     if not cell:
         return None, None
-    txt = (cell or '').strip()
-    if txt in ('', '-'):
+    txt = (cell or "").strip()
+    if txt in ("", "-"):
         return None, None
-    
+
     ftm = CORNER_FT_RE.search(txt)
     htm = CORNER_HT_RE.search(txt)
-    
+
     ft = (int(ftm.group(1)), int(ftm.group(2))) if ftm else None
     ht = (int(htm.group(1)), int(htm.group(2))) if htm else None
-    
     return ft, ht
 
 def parse_match_from_cells(cells: List[str]) -> Optional[MatchRow]:
     if not cells:
         return None
-    
+
     def get(i: int) -> str:
-        return (cells[i] or '').strip() if i < len(cells) else ''
-    
-    league = get(0) or ''
+        return (cells[i] or "").strip() if i < len(cells) else ""
+
+    # common NowGoal layout: league, date, home, score, away, corner
+    league = get(0)
     datecell = get(1)
     home = get(2)
     scorecell = get(3)
     away = get(4)
     cornercell = get(5)
-    
+
     scorem = SCORE_RE.search(scorecell) if scorecell else None
     if home and away and scorem:
         fth = int(scorem.group(1))
         fta = int(scorem.group(2))
         hth = int(scorem.group(3)) if scorem.group(3) else None
         hta = int(scorem.group(4)) if scorem.group(4) else None
-        dateval = normalize_date(datecell) or ''
-        
+        dateval = normalize_date(datecell) or ""
+
         ftcorner, htcorner = parse_corner_cell(cornercell)
         cornerhome, corneraway = ftcorner if ftcorner else (None, None)
         cornerhthome, cornerhtaway = htcorner if htcorner else (None, None)
-        
+
         return MatchRow(
-            league=league,
+            league=league or "",
             date=dateval,
             home=home,
             away=away,
@@ -320,48 +363,45 @@ def parse_match_from_cells(cells: List[str]) -> Optional[MatchRow]:
             cornerhthome=cornerhthome,
             cornerhtaway=cornerhtaway,
         )
-    
-    # Fallback parsing strategy if columns are shifted
+
+    # fallback: search any cell for score
     score_idx = None
     scorem = None
     for i, c in enumerate(cells):
-        c0 = (c or '').strip()
+        c0 = (c or "").strip()
         m = SCORE_RE.search(c0)
         if m:
             score_idx = i
             scorem = m
             break
-    
-    if not scorem or score_idx is None:
+    if scorem is None or score_idx is None:
         return None
-    
+
     fth = int(scorem.group(1))
     fta = int(scorem.group(2))
     hth = int(scorem.group(3)) if scorem.group(3) else None
     hta = int(scorem.group(4)) if scorem.group(4) else None
-    
-    home2 = None
-    away2 = None
+
+    home2, away2 = None, None
     for i in range(score_idx - 1, -1, -1):
-        if cells[i] or ''.strip():
-            home2 = (cells[i] or '').strip()
+        if (cells[i] or "").strip():
+            home2 = (cells[i] or "").strip()
             break
     for i in range(score_idx + 1, len(cells)):
-        if cells[i] or ''.strip():
-            away2 = (cells[i] or '').strip()
+        if (cells[i] or "").strip():
+            away2 = (cells[i] or "").strip()
             break
-    
     if not home2 or not away2:
         return None
-    
-    league2 = cells[0] or ''.strip() or ''
-    dateval2 = ''
+
+    league2 = (cells[0] or "").strip()
+    dateval2 = ""
     for c in cells:
         d = normalize_date(c)
         if d:
             dateval2 = d
             break
-    
+
     cornerhome, corneraway = None, None
     cornerhthome, cornerhtaway = None, None
     for i in range(score_idx + 1, min(score_idx + 10, len(cells))):
@@ -372,7 +412,7 @@ def parse_match_from_cells(cells: List[str]) -> Optional[MatchRow]:
             cornerhthome, cornerhtaway = htcorner
         if ftcorner or htcorner:
             break
-    
+
     return MatchRow(
         league=league2,
         date=dateval2,
@@ -397,32 +437,32 @@ def parse_matches_from_table_html(table_html: str) -> List[MatchRow]:
             out.append(m)
     return sort_matches_desc(dedupe_matches(out))
 
-# ============================================================================
-# 6. STANDINGS PARSE (VBA'da sadece göstermelikti ama yapıyı koruyoruz)
-# ============================================================================
+# =============================================================================
+# STANDINGS (DISPLAY ONLY)
+# =============================================================================
 def to_int(x: str) -> Optional[int]:
     try:
-        x = (x or '').strip()
-        if x in ('', '-'):
+        x = (x or "").strip()
+        if x in ("", "-"):
             return None
         return int(x)
     except Exception:
         return None
 
 def parse_standings_table_rows(rows: List[List[str]]) -> List[StandRow]:
-    wanted = ['Total', 'Home', 'Away', 'Last 6', 'Last6']
+    wanted = ["Total", "Home", "Away", "Last 6", "Last6"]
     out: List[StandRow] = []
     for cells in rows:
         if not cells:
             continue
-        head = (cells[0] or '').strip()
+        head = (cells[0] or "").strip()
         if head not in wanted:
             continue
-        label = 'Last 6' if head == 'Last6' else head
-        
+        label = "Last 6" if head == "Last6" else head
+
         def g(i):
-            return cells[i] if i < len(cells) else ''
-        
+            return cells[i] if i < len(cells) else ""
+
         r = StandRow(
             ft=label,
             matches=to_int(g(1)),
@@ -433,15 +473,15 @@ def parse_standings_table_rows(rows: List[List[str]]) -> List[StandRow]:
             conceded=to_int(g(6)),
             pts=to_int(g(7)),
             rank=to_int(g(8)),
-            rate=g(9).strip() if g(9) else None
+            rate=g(9).strip() if g(9) else None,
         )
         if r.matches is not None and not (1 <= r.matches <= 80):
             continue
         if any(x.ft == r.ft for x in out):
             continue
         out.append(r)
-    
-    order = {'Total': 0, 'Home': 1, 'Away': 2, 'Last 6': 3}
+
+    order = {"Total": 0, "Home": 1, "Away": 2, "Last 6": 3}
     out.sort(key=lambda x: order.get(x.ft, 99))
     return out
 
@@ -449,8 +489,8 @@ def extract_standings_for_team(page_source: str, teamname: str) -> List[StandRow
     team_key = norm_key(teamname)
     for tbl in extract_tables_html(page_source):
         text_low = strip_tags_keep_text(tbl).lower()
-        required_keywords = ['matches', 'win', 'draw', 'loss', 'scored', 'conceded']
-        if not all(k in text_low for k in required_keywords):
+        required = ["matches", "win", "draw", "loss", "scored", "conceded"]
+        if not all(k in text_low for k in required):
             continue
         if team_key and team_key not in norm_key(strip_tags_keep_text(tbl)):
             continue
@@ -460,18 +500,25 @@ def extract_standings_for_team(page_source: str, teamname: str) -> List[StandRow
             return parsed
     return []
 
-# ============================================================================
-# 7. EXTRACT MATCH DATA LOGIC
-# ============================================================================
-def extract_previous_from_page(page_source: str) -> Tuple[List[MatchRow], List[MatchRow]]:
-    markers = ['Previous Scores Statistics', 'Previous Scores', 'Recent Matches']
-    tabs = []
+def standings_to_splits(rows: List[StandRow]) -> Dict[str, Optional[SplitGFGA]]:
+    mp: Dict[str, Optional[SplitGFGA]] = {"Total": None, "Home": None, "Away": None, "Last 6": None}
+    for r in rows:
+        if r.matches and r.scored is not None and r.conceded is not None:
+            mp[r.ft] = SplitGFGA(r.matches, r.scored, r.conceded)
+    return mp
+
+# =============================================================================
+# PREVIOUS / H2H EXTRACTION
+# =============================================================================
+def extract_previous_from_page(page_source: str) -> Tuple[str, str]:
+    markers = ["Previous Scores Statistics", "Previous Scores", "Recent Matches"]
+    tabs: List[str] = []
     for marker in markers:
-        found_tabs = section_tables_by_marker(page_source, marker, max_tables=10)
-        if found_tabs:
-            tabs = found_tabs
+        found = section_tables_by_marker(page_source, marker, max_tables=10)
+        if found:
+            tabs = found
             break
-    
+
     if not tabs:
         all_tables = extract_tables_html(page_source)
         for t in all_tables:
@@ -480,26 +527,26 @@ def extract_previous_from_page(page_source: str) -> Tuple[List[MatchRow], List[M
                 tabs.append(t)
             if len(tabs) >= 4:
                 break
-    
+
     if not tabs:
-        return [], []
-    
-    match_tables: List[List[MatchRow]] = []
+        return "", ""
+
+    match_tables: List[str] = []
     for t in tabs:
         ms = parse_matches_from_table_html(t)
         if ms:
-            match_tables.append(ms)
+            match_tables.append(t)
         if len(match_tables) >= 2:
             break
-    
+
     if len(match_tables) == 0:
-        return [], []
+        return "", ""
     if len(match_tables) == 1:
-        return match_tables[0], []
+        return match_tables[0], ""
     return match_tables[0], match_tables[1]
 
 def extract_h2h_matches(page_source: str, hometeam: str, awayteam: str) -> List[MatchRow]:
-    markers = ['Head to Head Statistics', 'Head to Head', 'H2H Statistics', 'H2H', 'VS Statistics']
+    markers = ["Head to Head Statistics", "Head to Head", "H2H Statistics", "H2H", "VS Statistics"]
     for mk in markers:
         tabs = section_tables_by_marker(page_source, mk, max_tables=5)
         for t in tabs:
@@ -509,7 +556,7 @@ def extract_h2h_matches(page_source: str, hometeam: str, awayteam: str) -> List[
             pair_count = sum(1 for m in cand if is_h2h_pair(m, hometeam, awayteam))
             if pair_count >= 2:
                 return cand
-    
+
     best_pair = 0
     best_list: List[MatchRow] = []
     for tbl in extract_tables_html(page_source):
@@ -520,7 +567,6 @@ def extract_h2h_matches(page_source: str, hometeam: str, awayteam: str) -> List[
         if pair_count > best_pair:
             best_pair = pair_count
             best_list = cand
-    
     return best_list
 
 def filter_same_league_matches(matches: List[MatchRow], leaguename: str) -> List[MatchRow]:
@@ -542,702 +588,639 @@ def filter_team_away_only(matches: List[MatchRow], team: str) -> List[MatchRow]:
     tk = norm_key(team)
     return [m for m in matches if norm_key(m.away) == tk]
 
-# ============================================================================
-# 8. VBA LOGIC PORTED TO PYTHON (CORE CALCULATIONS)
-# ============================================================================
+# =============================================================================
+# VBA STYLE WEIGHTING
+# =============================================================================
+def weighted_mean(vals: List[float]) -> float:
+    if not vals:
+        return 0.0
+    wsum = 0.0
+    vsum = 0.0
+    for i, v in enumerate(vals, start=1):
+        w = W_RECENT if i <= RECENT_WEIGHT_N else W_OLD
+        vsum += float(v) * w
+        wsum += w
+    return vsum / wsum if wsum > 1e-9 else 0.0
 
-# --- 8.1 Ağırlıklı PSS xG Hesabı ---
-def calculate_weighted_pss_goals(matches: List[MatchRow], team_name: str, is_home_context: bool) -> float:
-    """
-    VBA: HesaplaPSSXG
-    Mantık: İlk 5 maç 1.2 ağırlık, sonrakiler 0.8 ağırlık.
-    """
-    total_goals = 0.0
-    total_weight = 0.0
-    count = 0
-    
-    tkey = norm_key(team_name)
-    
-    for m in matches:
-        # PSS listesinde takımın attığı golü bul
-        goals_scored = 0
-        # Basit eşleştirme: Listedeki maçlarda takımın attığı golü çek
+def build_prev_stats(team: str, matches: List[MatchRow]) -> TeamPrevStats:
+    tkey = norm_key(team)
+    st = TeamPrevStats(name=team)
+    if not matches:
+        return st
+
+    def gf_ga_corner(m: MatchRow) -> Tuple[int, int, Optional[int], Optional[int], Optional[int], Optional[int]]:
         if norm_key(m.home) == tkey:
-            goals_scored = m.fthome
-        elif norm_key(m.away) == tkey:
-            goals_scored = m.ftaway
-        else:
-            # Fallback (Eğer isim tam uymuyorsa context'e göre al)
-            if is_home_context:
-                if norm_key(m.home) == tkey: goals_scored = m.fthome
-                else: goals_scored = m.ftaway # Listedeki diğer takım olabilir mi? Genelde liste takıma ait.
-            else:
-                 if norm_key(m.home) == tkey: goals_scored = m.fthome
-                 else: goals_scored = m.ftaway
-        
-        count += 1
-        weight = 1.2 if count <= 5 else 0.8
-        
-        total_goals += goals_scored * weight
-        total_weight += weight
-        
-        if count >= 20: break 
-        
-    if total_weight == 0:
-        return 1.3 if is_home_context else 1.1 
-        
-    return total_goals / total_weight
+            return (m.fthome, m.ftaway, m.cornerhome, m.corneraway, m.cornerhthome, m.cornerhtaway)
+        return (m.ftaway, m.fthome, m.corneraway, m.cornerhome, m.cornerhtaway, m.cornerhthome)
 
-# --- 8.2 Ağırlıklı Korner Hesabı (Taze Ekmek) ---
-def calculate_weighted_pss_corners(matches: List[MatchRow], team_name: str) -> Tuple[float, float]:
-    """
-    VBA: HesaplaKornerPSS 
-    Döndürür: (OrtalamaKazandığı, OrtalamaYediği)
-    """
-    won_total = 0.0
-    conceded_total = 0.0
-    total_weight = 0.0
-    count = 0
-    tkey = norm_key(team_name)
+    gfs, gas = [], []
+    cf, ca = [], []
+    cf_ht, ca_ht = [], []
+    cleansheets = 0
+    scoredmatches = 0
 
     for m in matches:
-        if m.cornerhome is None or m.corneraway is None: continue
-        
-        won = 0
-        conceded = 0
-        
-        if norm_key(m.home) == tkey:
-            won = m.cornerhome
-            conceded = m.corneraway
-        elif norm_key(m.away) == tkey:
-            won = m.corneraway
-            conceded = m.cornerhome
+        gf, ga, cfor, cag, cfor_ht, cag_ht = gf_ga_corner(m)
+        gfs.append(gf)
+        gas.append(ga)
+
+        if ga == 0:
+            cleansheets += 1
+        if gf > 0:
+            scoredmatches += 1
+
+        if cfor is not None and cag is not None:
+            cf.append(cfor)
+            ca.append(cag)
+        if cfor_ht is not None and cag_ht is not None:
+            cf_ht.append(cfor_ht)
+            ca_ht.append(cag_ht)
+
+    st.ntotal = len(matches)
+    st.gftotal = weighted_mean([float(x) for x in gfs])
+    st.gatotal = weighted_mean([float(x) for x in gas])
+
+    st.cleansheets = cleansheets
+    st.scoredmatches = scoredmatches
+
+    st.corners_n = len(cf)
+    st.cornersfor = weighted_mean([float(x) for x in cf]) if cf else 0.0
+    st.cornersagainst = weighted_mean([float(x) for x in ca]) if ca else 0.0
+
+    st.corners_ht_n = len(cf_ht)
+    st.cornersfor_ht = weighted_mean([float(x) for x in cf_ht]) if cf_ht else 0.0
+    st.cornersagainst_ht = weighted_mean([float(x) for x in ca_ht]) if ca_ht else 0.0
+
+    home_ms = [m for m in matches if norm_key(m.home) == tkey]
+    away_ms = [m for m in matches if norm_key(m.away) == tkey]
+
+    st.nhome = len(home_ms)
+    if st.nhome:
+        st.gfhome = weighted_mean([float(m.fthome) for m in home_ms])
+        st.gahome = weighted_mean([float(m.ftaway) for m in home_ms])
+
+    st.naway = len(away_ms)
+    if st.naway:
+        st.gfaway = weighted_mean([float(m.ftaway) for m in away_ms])
+        st.gaaway = weighted_mean([float(m.fthome) for m in away_ms])
+
+    return st
+
+# =============================================================================
+# POISSON / MATRICES
+# =============================================================================
+def poisson_pmf(k: int, lam: float) -> float:
+    if lam <= 0:
+        return 1.0 if k == 0 else 0.0
+    if k > 170:
+        return 0.0
+    try:
+        return math.exp(-lam) * (lam ** k) / math.factorial(k)
+    except Exception:
+        return 0.0
+
+def build_score_matrix(lh: float, la: float, maxg: int = 5) -> Dict[Tuple[int, int], float]:
+    mat = {}
+    for h in range(maxg + 1):
+        ph = poisson_pmf(h, lh)
+        for a in range(maxg + 1):
+            mat[(h, a)] = ph * poisson_pmf(a, la)
+    return mat
+
+def market_probs_from_matrix(mat: Dict[Tuple[int, int], float]) -> Dict[str, float]:
+    p1 = sum(p for (h, a), p in mat.items() if h > a)
+    px = sum(p for (h, a), p in mat.items() if h == a)
+    p2 = sum(p for (h, a), p in mat.items() if h < a)
+    btts = sum(p for (h, a), p in mat.items() if h >= 1 and a >= 1)
+
+    out = {"1": p1, "X": px, "2": p2, "BTTS": btts}
+    for ln in [0.5, 1.5, 2.5, 3.5]:
+        need = int(math.floor(ln)) + 1
+        out[f"O{ln}"] = sum(p for (h, a), p in mat.items() if (h + a) >= need)
+        out[f"U{ln}"] = 1.0 - out[f"O{ln}"]
+    return out
+
+def top_scores_from_matrix(mat: Dict[Tuple[int, int], float], topn: int = 7) -> List[Tuple[str, float]]:
+    items = sorted(mat.items(), key=lambda x: x[1], reverse=True)[:topn]
+    return [(f"{h}-{a}", p) for (h, a), p in items]
+
+def monte_carlo(lh: float, la: float, n: int, seed: int = 42) -> Dict[str, Any]:
+    rng = np.random.default_rng(seed)
+    hg = rng.poisson(lh, size=n)
+    ag = rng.poisson(la, size=n)
+    total = hg + ag
+
+    def p(mask) -> float:
+        return float(np.mean(mask))
+
+    cnt = Counter(zip(hg.tolist(), ag.tolist()))
+    top10 = cnt.most_common(10)
+    top10_list = [f"{h}-{a}: {c / n * 100:.1f}%" for (h, a), c in top10]
+
+    dist_total = Counter(total.tolist())
+    total_bins: Dict[str, float] = {}
+    for k in range(0, 5):
+        total_bins[str(k)] = dist_total.get(k, 0) / n * 100.0
+    total_bins["5+"] = sum(v for kk, v in dist_total.items() if kk >= 5) / n * 100.0
+
+    return {
+        "p": {
+            "1": p(hg > ag),
+            "X": p(hg == ag),
+            "2": p(hg < ag),
+            "BTTS": p((hg >= 1) & (ag >= 1)),
+            "O2.5": p(total >= 3),
+            "U2.5": p(total <= 2),
+            "O3.5": p(total >= 4),
+            "U3.5": p(total <= 3),
+        },
+        "TOTAL_DIST": total_bins,
+        "TOP10": top10_list,
+    }
+
+def model_agreement(ppo: Dict[str, float], pmc: Dict[str, float]) -> Tuple[float, str]:
+    keys = ["1", "X", "2", "BTTS", "O2.5", "U2.5"]
+    diffs = [abs(ppo.get(k, 0) - pmc.get(k, 0)) for k in keys]
+    d = max(diffs) if diffs else 0.0
+    if d < 0.03:
+        return d, "Mükemmel"
+    if d < 0.06:
+        return d, "İyi"
+    if d < 0.10:
+        return d, "Orta"
+    return d, "Zayıf"
+
+def blend_probs(p1: Dict[str, float], p2: Dict[str, float], alpha: float) -> Dict[str, float]:
+    out = {}
+    for k in set(list(p1.keys()) + list(p2.keys())):
+        if k in p1 and k in p2:
+            out[k] = alpha * p1[k] + (1.0 - alpha) * p2[k]
         else:
-            # Fallback
-            won = m.cornerhome
-            conceded = m.corneraway
+            out[k] = p1.get(k, p2.get(k, 0.0))
+    return out
 
-        count += 1
-        weight = 1.2 if count <= 5 else 0.8
-        
-        won_total += won * weight
-        conceded_total += conceded * weight
-        total_weight += weight
-        
-        if count >= 20: break
+def clamp_lambda(lh: float, la: float) -> Tuple[float, float, List[str]]:
+    warn = []
+    def c(x: float, name: str) -> float:
+        if x < 0.15:
+            warn.append(f"{name} too low ({x:.2f}) → 0.15")
+            return 0.15
+        if x > 3.80:
+            warn.append(f"{name} too high ({x:.2f}) → 3.80")
+            return 3.80
+        return x
+    return c(lh, "home"), c(la, "away"), warn
 
-    if total_weight == 0:
-        return 5.0, 5.0 
-        
-    return (won_total / total_weight), (conceded_total / total_weight)
+# =============================================================================
+# VBA STYLE LAMBDAS (%100 PSS)
+# =============================================================================
+def compute_lambdas_pss_only(homeprev: TeamPrevStats, awayprev: TeamPrevStats) -> Tuple[float, float, Dict[str, Any]]:
+    info: Dict[str, Any] = {"mode": "PSS_ONLY", "weights": {"recent_n": RECENT_WEIGHT_N, "w_recent": W_RECENT, "w_old": W_OLD}, "warnings": []}
 
-# --- 8.3 Poisson Helper ---
-def poisson_pmf(lam: float, k: int) -> float:
-    if lam <= 0: lam = 0.1
-    return math.exp(-lam) * (lam ** k) / math.factorial(k)
+    # VBA logic: home lambda from HOME matches goals-for, away lambda from AWAY matches goals-for
+    lh = homeprev.gfhome if homeprev.nhome >= 3 else (homeprev.gftotal if homeprev.ntotal >= 3 else 1.30)
+    la = awayprev.gfaway if awayprev.naway >= 3 else (awayprev.gftotal if awayprev.ntotal >= 3 else 1.10)
 
-# --- 8.4 Monte Carlo Simulations (Goals) ---
-def monte_carlo_simulation_vba(lam_home: float, lam_away: float, num_sims: int = 10000) -> Dict[str, Any]:
-    """
-    VBA: MonteCarloSimulasyonu (Python Numpy ile optimize edildi)
-    """
-    home_goals = np.random.poisson(lam_home, num_sims)
-    away_goals = np.random.poisson(lam_away, num_sims)
-    
-    total_goals = home_goals + away_goals
-    
-    dist_goals = Counter(total_goals)
-    over25 = np.sum(total_goals > 2.5)
-    over35 = np.sum(total_goals > 3.5)
-    btts = np.sum((home_goals > 0) & (away_goals > 0))
-    home_wins = np.sum(home_goals > away_goals)
-    draws = np.sum(home_goals == away_goals)
-    away_wins = np.sum(home_goals < away_goals)
-    
-    scores = [f"{h}-{a}" for h, a in zip(home_goals, away_goals)]
-    score_counts = Counter(scores)
-    
+    lh, la, clamp_warn = clamp_lambda(lh, la)
+    if clamp_warn:
+        info["warnings"].extend(clamp_warn)
+
+    info["source"] = {
+        "home_lambda_from": f"gfhome(weighted) n={homeprev.nhome}" if homeprev.nhome >= 3 else f"fallback gftotal/default n={homeprev.ntotal}",
+        "away_lambda_from": f"gfaway(weighted) n={awayprev.naway}" if awayprev.naway >= 3 else f"fallback gftotal/default n={awayprev.ntotal}",
+    }
+    return lh, la, info
+
+# =============================================================================
+# CORNERS (VBA STYLE)
+# =============================================================================
+def build_corner_matrix(lh: float, la: float, maxc: int = 20) -> Dict[Tuple[int, int], float]:
+    mat = {}
+    for h in range(maxc + 1):
+        ph = poisson_pmf(h, lh)
+        for a in range(maxc + 1):
+            mat[(h, a)] = ph * poisson_pmf(a, la)
+    return mat
+
+def corner_market_probs(mat: Dict[Tuple[int, int], float]) -> Dict[str, float]:
+    total_dist = {}
+    for (h, a), p in mat.items():
+        total = h + a
+        total_dist[total] = total_dist.get(total, 0) + p
+
+    probs = {}
+    for line in [7.5, 8.5, 9.5, 10.5, 11.5, 12.5, 13.5]:
+        k = int(math.floor(line))
+        punder = sum(total_dist.get(i, 0) for i in range(0, k + 1))
+        pover = 1.0 - punder
+        probs[f"O{line}"] = float(max(0.0, min(1.0, pover)))
+        probs[f"U{line}"] = float(max(0.0, min(1.0, punder)))
+    return probs
+
+def most_likely_corner_score(mat: Dict[Tuple[int, int], float], topn: int = 5) -> List[Tuple[str, float]]:
+    items = sorted(mat.items(), key=lambda x: x[1], reverse=True)[:topn]
+    return [(f"{h}-{a}", p) for (h, a), p in items]
+
+def analyze_corners_pss_only(homeprev: TeamPrevStats, awayprev: TeamPrevStats, h2hmatches: List[MatchRow]) -> Dict[str, Any]:
+    # H2H averages (display only)
+    h2h_total = []
+    h2h_total_ht = []
+    for m in h2hmatches[:H2H_N]:
+        if m.cornerhome is not None and m.corneraway is not None:
+            h2h_total.append(m.cornerhome + m.corneraway)
+        if m.cornerhthome is not None and m.cornerhtaway is not None:
+            h2h_total_ht.append(m.cornerhthome + m.cornerhtaway)
+
+    h2h_total_avg = sum(h2h_total) / len(h2h_total) if h2h_total else 0.0
+    h2h_total_ht_avg = sum(h2h_total_ht) / len(h2h_total_ht) if h2h_total_ht else 0.0
+
+    # VBA Perplexity formula (PSS ONLY):
+    # home corners = (home_for + away_against)/2
+    # away corners = (away_for + home_against)/2
+    if homeprev.corners_n > 0 and awayprev.corners_n > 0:
+        pred_home = (homeprev.cornersfor + awayprev.cornersagainst) / 2.0
+        pred_away = (awayprev.cornersfor + homeprev.cornersagainst) / 2.0
+    else:
+        pred_home = homeprev.cornersfor or 4.5
+        pred_away = awayprev.cornersfor or 4.0
+
+    # HT corners (if available)
+    if homeprev.corners_ht_n > 0 and awayprev.corners_ht_n > 0:
+        pred_home_ht = (homeprev.cornersfor_ht + awayprev.cornersagainst_ht) / 2.0
+        pred_away_ht = (awayprev.cornersfor_ht + homeprev.cornersagainst_ht) / 2.0
+    else:
+        pred_home_ht = pred_home * 0.45
+        pred_away_ht = pred_away * 0.45
+
+    pred_home = max(0.01, float(pred_home))
+    pred_away = max(0.01, float(pred_away))
+    pred_home_ht = max(0.01, float(pred_home_ht))
+    pred_away_ht = max(0.01, float(pred_away_ht))
+
+    total_corners = pred_home + pred_away
+    total_ht = pred_home_ht + pred_away_ht
+
+    # FT markets
+    corner_mat = build_corner_matrix(pred_home, pred_away, maxc=MAX_CORNERS_FOR_MATRIX)
+    market_probs_ft = corner_market_probs(corner_mat)
+    top_corner_scores = most_likely_corner_score(corner_mat, topn=5)
+
+    # HT markets
+    corner_mat_ht = build_corner_matrix(pred_home_ht, pred_away_ht, maxc=15)
+    total_dist_ht = {}
+    for (h, a), p in corner_mat_ht.items():
+        total = h + a
+        total_dist_ht[total] = total_dist_ht.get(total, 0) + p
+
+    market_probs_ht = {}
+    for line in [3.5, 4.5, 5.5, 6.5]:
+        k = int(math.floor(line))
+        punder = sum(total_dist_ht.get(i, 0) for i in range(0, k + 1))
+        pover = 1.0 - punder
+        market_probs_ht[f"HT_O{line}"] = float(max(0.0, min(1.0, pover)))
+        market_probs_ht[f"HT_U{line}"] = float(max(0.0, min(1.0, punder)))
+
+    top_corner_scores_ht = most_likely_corner_score(corner_mat_ht, topn=3)
+
+    # Confidence (simple)
+    dp = min(homeprev.corners_n, RECENT_N) + min(awayprev.corners_n, RECENT_N)
+    dp_ht = min(homeprev.corners_ht_n, RECENT_N) + min(awayprev.corners_ht_n, RECENT_N)
+
+    conf = "Yüksek" if dp >= 12 else ("Orta" if dp >= 6 else "Düşük")
+    conf_ht = "Yüksek" if dp_ht >= 12 else ("Orta" if dp_ht >= 6 else "Düşük")
+
     return {
-        "dist_goals": dist_goals,
-        "over25_pct": over25 / num_sims,
-        "over35_pct": over35 / num_sims,
-        "btts_pct": btts / num_sims,
-        "1_pct": home_wins / num_sims,
-        "X_pct": draws / num_sims,
-        "2_pct": away_wins / num_sims,
-        "top_scores": score_counts.most_common(10),
-        "total_sims": num_sims
+        "mode": "PSS_ONLY",
+        "predicted_home_corners": round(pred_home, 1),
+        "predicted_away_corners": round(pred_away, 1),
+        "total_corners": round(total_corners, 1),
+        "market_probs": market_probs_ft,
+        "top_corner_scores": top_corner_scores,
+        "confidence": conf,
+        "first_half": {
+            "predicted_home_ht": round(pred_home_ht, 1),
+            "predicted_away_ht": round(pred_away_ht, 1),
+            "total_ht": round(total_ht, 1),
+            "predictions": market_probs_ht,
+            "top_scores_ht": top_corner_scores_ht,
+            "confidence_ht": conf_ht,
+            "h2h_ht_avg_display": round(h2h_total_ht_avg, 1),
+        },
+        "h2h_avg_display": round(h2h_total_avg, 1),
+        "h2h_data_count": len(h2h_total),
+        "pss_data_available": bool(homeprev.corners_n > 0 and awayprev.corners_n > 0),
     }
 
-# --- 8.5 Monte Carlo Simulations (Corners) ---
-def monte_carlo_corners_vba(lam_home: float, lam_away: float, num_sims: int = 10000) -> Dict[str, Any]:
-    """
-    VBA: MonteCarloKORNER_ResimGibi
-    """
-    home_corners = np.random.poisson(lam_home, num_sims)
-    away_corners = np.random.poisson(lam_away, num_sims)
-    total_corners = home_corners + away_corners
-    
-    dist_total = Counter(total_corners)
-    
-    over75 = np.sum(total_corners > 7.5)
-    over85 = np.sum(total_corners > 8.5)
-    over95 = np.sum(total_corners > 9.5)
-    over105 = np.sum(total_corners > 10.5)
-    over115 = np.sum(total_corners > 11.5)
-    
-    home_more = np.sum(home_corners > away_corners)
-    draw = np.sum(home_corners == away_corners)
-    away_more = np.sum(home_corners < away_corners)
-    
-    scores = [f"{h}-{a}" for h, a in zip(home_corners, away_corners)]
-    score_counts = Counter(scores)
-    
-    return {
-        "dist_total": dist_total,
-        "over75": over75 / num_sims,
-        "over85": over85 / num_sims,
-        "over95": over95 / num_sims,
-        "over105": over105 / num_sims,
-        "over115": over115 / num_sims,
-        "home_more": home_more / num_sims,
-        "draw": draw / num_sims,
-        "away_more": away_more / num_sims,
-        "top_scores": score_counts.most_common(5),
-        "total_sims": num_sims
-    }
+# =============================================================================
+# REPORT (VBA-LIKE)
+# =============================================================================
+def score_2_from_lambda(lh: float, la: float) -> str:
+    return f"{round(lh)}-{round(la)}"
 
-def get_confidence(prob: float) -> str:
-    if prob >= 0.70: return "YUKSEK"
-    if prob >= 0.50: return "ORTA"
-    return "DUSUK"
+def format_report_vba_style(data: Dict[str, Any]) -> str:
+    t = data["teams"]
+    ds = data["datasources"]
+    lam = data["lambda"]
+    top7 = data["poisson"]["top7_scores"]
+    blend = data["blended_probs"]
+    corners = data.get("corner_analysis", {})
+    ma = data.get("model_agreement", {})
 
-# ============================================================================
-# 9. REPORT GENERATOR (VBA "RESIM GIBI" FORMAT)
-# ============================================================================
-def generate_vba_report(data: Dict[str, Any]) -> str:
-    t = data['teams']
-    xg = data['xg']
-    corn = data['corners']
-    pois = data['poisson']
-    market = data['market_goals']
-    market_corn = data['market_corners']
-    mc = data['mc_goals']
-    mc_corn = data['mc_corners']
-    val = data['value']
-    
     lines = []
-    lines.append("="*55)
+    lines.append("=" * 55)
     lines.append("  FUTBOL MAC ANALIZI - %100 PSS MODEL")
-    lines.append("  (STANDINGS HIC KULLANILMAZ - SADECE PSS!)")
-    lines.append("="*55 + "\n")
-    
+    lines.append("  (STANDINGS & H2H SADECE GORUNUM - HESAPTA YOK)")
+    lines.append("=" * 55)
     lines.append(f"MAC: {t['home']} vs {t['away']}")
-    lines.append(f"ORANLAR: 1: {val['odds'][0]:.2f} | X: {val['odds'][1]:.2f} | 2: {val['odds'][2]:.2f}")
-    lines.append("="*55 + "\n")
-    
-    lines.append("="*55)
-    lines.append("0) VERI KAYNAK KONTROLU")
-    lines.append("="*55 + "\n")
-    
-    lines.append("STANDINGS VERILERI (SADECE GORUNUM - KULLANILMAYACAK):")
-    lines.append(f"  {t['home']}: {data['counts']['home_standings']} ev maci (SADECE GORUNTU)")
-    lines.append(f"  {t['away']}: {data['counts']['away_standings']} deplasman maci (SADECE GORUNTU)")
-    lines.append("  *** STANDINGS HESAPLAMALARDA KULLANILMAYACAK ***\n")
-    
-    lines.append("H2H VERILERI (SADECE GORUNUM - HESAPLAMADA KULLANILMAYACAK):")
-    h2h_cnt = data['counts']['h2h']
-    if h2h_cnt > 0:
-        lines.append(f"  TOPLAM {h2h_cnt} MAC BULUNDU (SADECE GORUNTU)")
-        for i, m in enumerate(data['h2h_sample'][:5], 1):
-             lines.append(f"    {i}) {m.home} {m.fthome}-{m.ftaway} {m.away}")
-        if h2h_cnt > 5: lines.append(f"    ... ve {h2h_cnt-5} mac daha")
-    else:
-        lines.append("  H2H verisi bulunamadi")
-    lines.append("  *** H2H VERILERI HESAPLAMALARDA KULLANILMAYACAK ***\n")
-    
-    lines.append("EV TAKIMI PSS (%100 ANA VERİ - Hesaplama Kaynagi):")
-    if data['counts']['pss_home'] > 0:
-        lines.append(f"  TOPLAM {data['counts']['pss_home']} MAC BULUNDU")
-        lines.append("  Tum Maclar:")
-        for i, m in enumerate(data['pss_home_sample'], 1):
-            c_txt = f" | Korner: {m.cornerhome}-{m.corneraway}" if m.cornerhome is not None else ""
-            lines.append(f"    {i}) {m.home} {m.fthome}-{m.ftaway} {m.away}{c_txt}")
-    else:
-        lines.append("  KRITIK HATA: Ev takimi PSS verisi bulunamadi!")
-    lines.append("\n")
-    
-    lines.append("DEPLASMAN TAKIMI PSS (%100 ANA VERİ - Hesaplama Kaynagi):")
-    if data['counts']['pss_away'] > 0:
-        lines.append(f"  TOPLAM {data['counts']['pss_away']} MAC BULUNDU")
-        lines.append("  Tum Maclar:")
-        for i, m in enumerate(data['pss_away_sample'], 1):
-            c_txt = f" | Korner: {m.cornerhome}-{m.corneraway}" if m.cornerhome is not None else ""
-            lines.append(f"    {i}) {m.home} {m.fthome}-{m.ftaway} {m.away}{c_txt}")
-    else:
-        lines.append("  KRITIK HATA: Deplasman PSS verisi bulunamadi!")
-    lines.append("\n")
-    
-    if data['counts']['pss_home'] == 0 or data['counts']['pss_away'] == 0:
-        lines.append("="*55)
-        lines.append("ANALIZ DURDURULDU: EKSIK PSS VERISI")
-        lines.append("="*55)
-        return "\n".join(lines)
+    lines.append(f"LIG: {data.get('league','')}")
+    lines.append("-" * 55)
 
-    lines.append("="*55)
+    lines.append("0) VERI KAYNAK KONTROLU")
+    lines.append(f"  Standings: {'VAR (gosterim)' if ds.get('standings_available') else 'YOK'}")
+    lines.append(f"  H2H: {ds.get('h2h_matches',0)} mac (gosterim)")
+    lines.append("  PSS (Same League):")
+    lines.append(f"    HOME rol: {ds.get('home_prev_matches',0)} mac (ilk 5=1.20, diger=0.80)")
+    lines.append(f"    AWAY rol: {ds.get('away_prev_matches',0)} mac (ilk 5=1.20, diger=0.80)")
+    lines.append("-" * 55)
+
     lines.append("A) BEKLENEN GOLLER (xG) - %100 PSS")
-    lines.append("="*55 + "\n")
-    
-    lines.append("PSS TABANLI xG (Tek Kaynak - %100 PSS):")
-    lines.append(f"   {t['home']} xG: {xg['home']:.2f} gol (Son {data['counts']['pss_home']} mac direkt ortalaması)")
-    lines.append(f"   {t['away']} xG: {xg['away']:.2f} gol (Son {data['counts']['pss_away']} mac direkt ortalaması)")
-    lines.append(f"   TOPLAM xG = {(xg['home'] + xg['away']):.2f} gol\n")
-    
-    lines.append("HESAPLAMA MANTIĞI:")
-    lines.append("   1) PSS verilerinden DIREKT gol ortalamasi")
-    lines.append("   2) Standings HİÇ kullanilmadi")
-    lines.append("   3) H2H HİÇ kullanilmadi")
-    lines.append("   4) Sadece SON FORM (PSS) baz alindi")
-    lines.append("   5) %100 Temiz - Mukerrerlik YOK\n")
-    
-    lines.append("BEKLENEN KORNERLER (Perplexity AI Yontemi - %100 PSS):")
-    lines.append(f"   {t['home']} Korner: {corn['home']:.2f}")
-    lines.append(f"   {t['away']} Korner: {corn['away']:.2f}")
-    lines.append(f"   TOPLAM Korner = {(corn['home'] + corn['away']):.2f}\n")
-    
-    lines.append("="*55)
-    lines.append("B) POISSON OLASILILIKLARI")
-    lines.append("="*55 + "\n")
-    
-    def print_p(team, probs):
-        lines.append(f"{team} Gol Olasılıkları:")
-        lines.append(f"   P(0 gol) = {probs[0]*100:.1f}%")
-        lines.append(f"   P(1 gol) = {probs[1]*100:.1f}%")
-        lines.append(f"   P(2 gol) = {probs[2]*100:.1f}%")
-        p3p = 1.0 - sum(probs[:3])
-        lines.append(f"   P(3+ gol) = {p3p*100:.1f}%\n")
-    
-    print_p(t['home'], pois['home_dist'])
-    print_p(t['away'], pois['away_dist'])
-    
-    p00 = pois['home_dist'][0] * pois['away_dist'][0]
-    lines.append("OZEL: 0-0 SKOR OLASILIĞI:")
-    lines.append(f"   P(0-0) = {p00*100:.1f}%")
-    lines.append("   NOT: Dusuk olasilik ama her zaman mumkundur!\n")
-    
-    lines.append("En Olası 7 Skor:")
-    for i, (score, prob) in enumerate(pois['top_scores'], 1):
-        lines.append(f"   {i}) {score} - %{prob*100:.1f}")
-    lines.append("")
-    
-    lines.append("="*55)
-    lines.append("C) MARKET OLASILILIKLARI (GOL)")
-    lines.append("="*55 + "\n")
-    
-    m = market
-    lines.append("Toplam Gol:")
-    lines.append(f"   Ust 0.5: %{m['o05']*100:.1f} | Alt 0.5: %{(1-m['o05'])*100:.1f}")
-    lines.append(f"   Ust 1.5: %{m['o15']*100:.1f} | Alt 1.5: %{(1-m['o15'])*100:.1f}")
-    lines.append(f"   Ust 2.5: %{m['o25']*100:.1f} | Alt 2.5: %{(1-m['o25'])*100:.1f}")
-    lines.append(f"   Ust 3.5: %{m['o35']*100:.1f} | Alt 3.5: %{(1-m['o35'])*100:.1f}\n")
-    
-    lines.append("BTTS (Karsilıklı Gol):")
-    lines.append(f"   Var: %{m['btts']*100:.1f} | Yok: %{(1-m['btts'])*100:.1f}\n")
-    
-    lines.append("1X2 Olasılıkları:")
-    lines.append(f"   Ev (1): %{m['1']*100:.1f}")
-    lines.append(f"   Beraberlik (X): %{m['X']*100:.1f}")
-    lines.append(f"   Deplasman (2): %{m['2']*100:.1f}\n")
-    
-    lines.append("="*55)
-    lines.append("D) MARKET OLASILILIKLARI (KORNER)")
-    lines.append("="*55 + "\n")
-    
-    mcorn = market_corn
-    lines.append("Toplam Korner:")
-    for k in [8.5, 9.5, 10.5, 11.5]:
-        key = f"o{str(k).replace('.','')}"
-        prob = mcorn[key]
-        lines.append(f"   Ust {k}: %{prob*100:.1f} | Alt {k}: %{(1-prob)*100:.1f}")
-    lines.append("")
-    
-    lines.append(f"{t['home']} Korner:")
-    lines.append(f"   Ust 4.5: %{mcorn['home_o45']*100:.1f} | Alt 4.5: %{(1-mcorn['home_o45'])*100:.1f}")
-    lines.append(f"   Ust 5.5: %{mcorn['home_o55']*100:.1f} | Alt 5.5: %{(1-mcorn['home_o55'])*100:.1f}\n")
-    
-    lines.append(f"{t['away']} Korner:")
-    lines.append(f"   Ust 4.5: %{mcorn['away_o45']*100:.1f} | Alt 4.5: %{(1-mcorn['away_o45'])*100:.1f}")
-    lines.append(f"   Ust 5.5: %{mcorn['away_o55']*100:.1f} | Alt 5.5: %{(1-mcorn['away_o55'])*100:.1f}\n")
-    
-    lines.append("="*55)
-    lines.append(f"E) MONTE CARLO SIMULASYONU ({mc['total_sims']:,} KOSU)")
-    lines.append("="*55 + "\n")
-    
-    lines.append(f"Monte Carlo Sonuclari ({mc['total_sims']:,} simulasyon):\n")
-    lines.append("Toplam Gol Dagilimi:")
-    for i in range(6):
-        cnt = mc['dist_goals'][i]
-        pct = cnt / mc['total_sims']
-        bar = "-" * int(pct * 50)
-        lines.append(f" {i} gol: %{pct*100:.1f} {bar}")
-    plus6 = sum(mc['dist_goals'][i] for i in mc['dist_goals'] if i >= 6)
-    lines.append(f" 6+ gol: %{plus6/mc['total_sims']*100:.1f}\n")
-    
-    lines.append("Market Sonuclari:")
-    lines.append(f" Ust 2.5: %{mc['over25_pct']*100:.1f}")
-    lines.append(f" Ust 3.5: %{mc['over35_pct']*100:.1f}")
-    lines.append(f" BTTS: %{mc['btts_pct']*100:.1f}")
-    lines.append(f" Ev (1): %{mc['1_pct']*100:.1f}")
-    lines.append(f" Beraberlik (X): %{mc['X_pct']*100:.1f}")
-    lines.append(f" Deplasman (2): %{mc['2_pct']*100:.1f}\n")
-    
-    lines.append("En Sik Gorulen 10 Skor:")
-    for i, (sc, cnt) in enumerate(mc['top_scores'], 1):
-        lines.append(f" {i}) {sc} - %{cnt/mc['total_sims']*100:.1f}")
-    lines.append("")
-    
-    lines.append("="*55)
-    lines.append(f"E-1) MONTE CARLO KORNER SIMULASYONU ({mc_corn['total_sims']:,} KOSU)")
-    lines.append("="*55 + "\n")
-    
-    lines.append("Toplam Korner Dagilimi:")
-    for k in range(6, 16):
-        cnt = mc_corn['dist_total'][k]
-        pct = cnt / mc_corn['total_sims']
-        bar = "-" * int(pct * 50)
-        lines.append(f" {k:02d} Korner: %{pct*100:.1f} {bar}")
-    lines.append("")
-    
-    lines.append("Korner Alt/Ust Olasiliklari:")
-    for k in [7, 8, 9, 10, 11]:
-        pct = mc_corn[f'over{k}5']
-        lines.append(f" {k}.5 Ust: %{pct*100:.1f} | Alt: %{(1-pct)*100:.1f}")
-    lines.append("")
-    
-    lines.append("Korner Mac Sonucu:")
-    lines.append(f" Ev Sahibi: %{mc_corn['home_more']*100:.1f}")
-    lines.append(f" Beraberlik: %{mc_corn['draw']*100:.1f}")
-    lines.append(f" Deplasman: %{mc_corn['away_more']*100:.1f}\n")
-    
-    lines.append("En Sik Gorulen 5 Korner Skoru:")
-    for i, (sc, cnt) in enumerate(mc_corn['top_scores'], 1):
-        lines.append(f" {i}) {sc} - %{cnt/mc_corn['total_sims']*100:.1f}")
-    lines.append("")
-    
-    lines.append("="*55)
-    lines.append("F) VALUE BET VE KELLY ANALIZI")
-    lines.append("="*55 + "\n")
-    
-    # Kelly & Value
-    def calc_kelly(odds, prob):
-        if odds <= 1: return 0.0
-        k = ((odds - 1) * prob - (1 - prob)) / (odds - 1)
-        return max(0.0, k * 0.25)
-    
-    def check_val(odds, prob):
-        val = (odds * prob) - 1
-        return val, "TICK DEGER VAR" if val >= 0.05 else "CROSS"
-    
-    probs_1x2 = [market['1'], market['X'], market['2']]
-    labels_1x2 = ["Ev (1)", "Beraberlik (X)", "Deplasman (2)"]
-    
-    lines.append("1X2 Marketleri:")
-    has_value = False
-    best_value = -1.0
-    
-    for i in range(3):
-        o = val['odds'][i]
-        p = probs_1x2[i]
-        v_score, v_txt = check_val(o, p)
-        if v_score >= 0.05: has_value = True
-        best_value = max(best_value, v_score)
-        
-        lines.append(f"   {labels_1x2[i]}: Oran {o:.2f} | Olasilik %{p*100:.1f} | Value: {v_score*100:.1f}% {v_txt}")
-        kelly = calc_kelly(o, p)
-        if kelly > 0:
-            lines.append(f"      Kelly: %{kelly*100:.1f} (maks %2-5 onerilir)")
-    lines.append("")
-    
-    lines.append("="*55)
-    lines.append("G) NET SONUC VE ONERILER")
-    lines.append("="*55 + "\n")
-    
-    total_xg = xg['home'] + xg['away']
-    tempo = "ORTA (Dengeli mac)"
-    if total_xg < 2.3: tempo = "DUSUK (Savunmaci, kapali mac)"
-    elif total_xg > 3.2: tempo = "YUKSEK (Hucum odakli, acik mac)"
-    
-    lines.append("1) Beklenen Goller:")
-    lines.append(f"   Lambda_home = {xg['home']:.2f} gol")
-    lines.append(f"   Lambda_away = {xg['away']:.2f} gol")
-    lines.append(f"   xG_toplam = {total_xg:.2f} gol\n")
-    
-    lines.append(f"2) Mac Temposu: {tempo}\n")
-    
-    lines.append("3) NET SKOR TAHMINI:")
-    for i in range(3):
-        sc, pr = pois['top_scores'][i]
-        lines.append(f"   {i+1}. Tahmin: {sc} (%{pr*100:.1f})")
-    lines.append("")
-    
-    ou_conf = get_confidence(market['o25'] if market['o25'] > 0.5 else 1-market['o25'])
-    ou_sel = "2.5 UST" if market['o25'] > 0.5 else "2.5 ALT"
-    ou_pct = market['o25'] if market['o25'] > 0.5 else 1-market['o25']
-    lines.append(f"4) NET ALT/UST: {ou_sel} (%{ou_pct*100:.1f}) - Guven: {ou_conf}\n")
-    
-    btts_conf = get_confidence(market['btts'] if market['btts'] > 0.5 else 1-market['btts'])
-    btts_sel = "KG VAR" if market['btts'] > 0.5 else "KG YOK"
-    btts_pct = market['btts'] if market['btts'] > 0.5 else 1-market['btts']
-    lines.append(f"5) NET BTTS: {btts_sel} (%{btts_pct*100:.1f}) - Guven: {btts_conf}\n")
-    
-    lines.append("6) En Iyi 3 Bahis Adayi:")
-    if has_value:
-        lines.append("   (Yukaridaki Value bolumune bakiniz)")
-    else:
-        lines.append("   Value Bahis Bulunamadi")
-    lines.append("")
-    
-    decision = "TICK BAHIS OYNANABILIR" if has_value and max(probs_1x2) >= 0.5 else "CROSS BU MACA BAHIS OYNAMA"
-    lines.append(f"7) SON KARAR: {decision}")
-    if has_value:
-        lines.append(f"   Gerekce: Value bet bulundu (+{best_value*100:.1f}%), model uyumu iyi")
-    else:
-        lines.append("   Gerekce: Yeterli value bulunamadi, oranlar modele gore dusuk, bekleme tavsiye edilir")
-    
-    lines.append("\n" + "="*55)
-    lines.append("ONEMLI HATIRLATMA!")
-    lines.append("="*55)
-    lines.append("Bu model %100 PSS (Son Mac) bazlidir.")
-    lines.append("Standings ve H2H HIC KULLANILMAMIŞTIR.")
-    lines.append("Sadece en guncel form baz alinmistir.")
-    lines.append("Tahminler ORTALAMA beklentidir (100 mac uzerinden).")
-    lines.append("Tek bir mac 0-0, 1-0 veya 5-4 bitebilir - bu normaldir!")
-    lines.append("Model uzun vadede (50+ mac) degerlendirilmelidir.")
-    lines.append("="*55)
+    lines.append(f"  lambda_home = {lam['home']:.2f}")
+    lines.append(f"  lambda_away = {lam['away']:.2f}")
+    lines.append(f"  TOPLAM xG   = {lam['total']:.2f}")
+    if lam.get("info", {}).get("warnings"):
+        lines.append("  UYARI:")
+        for w in lam["info"]["warnings"]:
+            lines.append(f"    - {w}")
+    lines.append("-" * 55)
+
+    lines.append("B) EN OLASI SKORLAR (Poisson Matrix)")
+    for i, (s, p) in enumerate(top7[:7], 1):
+        lines.append(f"  {i}) {s}  %{p*100:.1f}")
+    lines.append(f"  Skor-2: {data.get('score_2','N/A')}")
+    lines.append("-" * 55)
+
+    lines.append("C) MARKET OLASILIKLARI (Blend: Poisson + MC)")
+    lines.append(f"  1: %{blend.get('1',0)*100:.1f} | X: %{blend.get('X',0)*100:.1f} | 2: %{blend.get('2',0)*100:.1f}")
+    lines.append(f"  KG VAR: %{blend.get('BTTS',0)*100:.1f} | KG YOK: %{(1.0-blend.get('BTTS',0))*100:.1f}")
+    for ln in ["0.5","1.5","2.5","3.5"]:
+        lines.append(f"  U{ln}: %{blend.get('U'+ln,0)*100:.1f} | O{ln}: %{blend.get('O'+ln,0)*100:.1f}")
+    if ma:
+        lines.append(f"  Model Uyumu: {ma.get('label','N/A')} (max fark %{ma.get('diff',0)*100:.2f})")
+    lines.append("-" * 55)
+
+    if corners and corners.get("total_corners", 0) > 0:
+        lines.append("D) KORNER (PSS ONLY + Poisson)")
+        lines.append(f"  FT Toplam: {corners['total_corners']}  (Ev {corners['predicted_home_corners']} | Dep {corners['predicted_away_corners']})  Guven: {corners.get('confidence','')}")
+        mp = corners.get("market_probs", {})
+        for k in ["O9.5","O10.5","O11.5"]:
+            if k in mp:
+                lines.append(f"  {k}: %{mp[k]*100:.1f} | {k.replace('O','U')}: %{mp.get(k.replace('O','U'),0)*100:.1f}")
+        tc = corners.get("top_corner_scores", [])
+        if tc:
+            lines.append("  En Olası Korner Skorları:")
+            for i, (s, p) in enumerate(tc[:3], 1):
+                lines.append(f"    {i}) {s}  %{p*100:.1f}")
+
+        ht = corners.get("first_half", {})
+        if ht.get("total_ht", 0) > 0:
+            lines.append("  ILK YARI (HT) KORNER:")
+            lines.append(f"    Toplam: {ht['total_ht']} (Ev {ht['predicted_home_ht']} | Dep {ht['predicted_away_ht']}) Guven: {ht.get('confidence_ht','')}")
+            htp = ht.get("predictions", {})
+            for k in ["HT_O4.5","HT_O5.5"]:
+                if k in htp:
+                    lines.append(f"    {k}: %{htp[k]*100:.1f} | {k.replace('O','U')}: %{htp.get(k.replace('O','U'),0)*100:.1f}")
+        lines.append("-" * 55)
+
     lines.append("ANALIZ TAMAMLANDI")
-    lines.append("="*55)
-    
+    lines.append("=" * 55)
     return "\n".join(lines)
 
-# ============================================================================
-# 10. MAIN ANALYSIS ORCHESTRATOR
-# ============================================================================
-def analyze_nowgoal(url: str, odds: Optional[List[float]] = None) -> Dict[str, Any]:
-    log_info(f"Starting PSS analysis for: {url}")
-    
-    # 1. SCRAPING
+# =============================================================================
+# MAIN
+# =============================================================================
+def analyze_nowgoal(url: str, mcruns: int = MC_RUNS_DEFAULT) -> Dict[str, Any]:
+    log_info(f"Starting analysis: {url}")
+
     h2h_url = build_h2h_url(url)
     html = safe_get(h2h_url, referer=extract_base_domain(url))
-    
+
     home_team, away_team = parse_teams_from_title(html)
-    
-    # H2H (Sadece göstermek için)
-    h2h_matches = extract_h2h_matches(html, home_team, away_team)
-    
-    # PSS Verileri (Analysis Core)
-    prev_home_list, prev_away_list = extract_previous_from_page(html)
-    
-    # Standings Count (Sadece göstermek için)
-    st_count_h = 0 
-    st_count_a = 0
-    if "Standings" in html: st_count_h = 10; st_count_a = 10 
-    
-    # 2. HESAPLAMALAR (VBA MANTIGI)
-    
-    # A) xG Lambda (Weighted PSS)
-    lam_home = calculate_weighted_pss_goals(prev_home_list, home_team, True)
-    lam_away = calculate_weighted_pss_goals(prev_away_list, away_team, False)
-    
-    # B) Corner Lambda (Perplexity / Taze Ekmek)
-    # Evin Kazandığı / Yediği
-    h_won, h_conceded = calculate_weighted_pss_corners(prev_home_list, home_team)
-    # Deplasmanın Kazandığı / Yediği
-    a_won, a_conceded = calculate_weighted_pss_corners(prev_away_list, away_team)
-    
-    # Formül: (EvAtan + DepYiyen)/2
-    lam_corn_h = (h_won + a_conceded) / 2.0
-    lam_corn_a = (a_won + h_conceded) / 2.0
-    
-    if lam_corn_h <= 0: lam_corn_h = 4.0
-    if lam_corn_a <= 0: lam_corn_a = 3.5
-    
-    # C) Poisson Olasılıkları
-    h_dist = [poisson_pmf(lam_home, i) for i in range(6)]
-    a_dist = [poisson_pmf(lam_away, i) for i in range(6)]
-    
-    # Skor Matrisi
-    scores = []
-    for h in range(6):
-        for a in range(6):
-            scores.append((f"{h}-{a}", h_dist[h] * a_dist[a]))
-    scores.sort(key=lambda x: x[1], reverse=True)
-    
-    # D) Market Olasılıkları (Gol)
-    m_goals = {'o05': 0, 'o15': 0, 'o25': 0, 'o35': 0, 'btts': 0, '1': 0, 'X': 0, '2': 0}
-    for h in range(6):
-        for a in range(6):
-            prob = h_dist[h] * a_dist[a]
-            total = h + a
-            if total > 0: m_goals['o05'] += prob
-            if total > 1: m_goals['o15'] += prob
-            if total > 2: m_goals['o25'] += prob
-            if total > 3: m_goals['o35'] += prob
-            if h > 0 and a > 0: m_goals['btts'] += prob
-            if h > a: m_goals['1'] += prob
-            elif h == a: m_goals['X'] += prob
-            else: m_goals['2'] += prob
-            
-    # E) Market Olasılıkları (Korner) - Poisson Bazlı
-    h_corn_dist = [poisson_pmf(lam_corn_h, i) for i in range(15)]
-    a_corn_dist = [poisson_pmf(lam_corn_a, i) for i in range(15)]
-    
-    m_corn = {'o85': 0, 'o95': 0, 'o105': 0, 'o115': 0, 
-              'home_o45': 0, 'home_o55': 0, 'away_o45': 0, 'away_o55': 0}
-              
-    for h in range(15):
-        for a in range(15):
-            prob = h_corn_dist[h] * a_corn_dist[a]
-            tot = h + a
-            if tot > 8: m_corn['o85'] += prob
-            if tot > 9: m_corn['o95'] += prob
-            if tot > 10: m_corn['o105'] += prob
-            if tot > 11: m_corn['o115'] += prob
-            
-    m_corn['home_o45'] = sum(h_corn_dist[5:])
-    m_corn['home_o55'] = sum(h_corn_dist[6:])
-    m_corn['away_o45'] = sum(a_corn_dist[5:])
-    m_corn['away_o55'] = sum(a_corn_dist[6:])
-    
-    # F) Monte Carlo Simulations
-    mc_goals = monte_carlo_simulation_vba(lam_home, lam_away, MC_RUNS_DEFAULT)
-    mc_corners = monte_carlo_corners_vba(lam_corn_h, lam_corn_a, MC_RUNS_DEFAULT)
-    
-    # Data Paketi Hazırla
-    if not odds or len(odds) < 3: odds = [1.0, 1.0, 1.0] # Default odds
-    
-    full_data = {
-        'teams': {'home': home_team, 'away': away_team},
-        'counts': {
-            'home_standings': st_count_h,
-            'away_standings': st_count_a,
-            'h2h': len(h2h_matches),
-            'pss_home': len(prev_home_list),
-            'pss_away': len(prev_away_list)
+    if not home_team or not away_team:
+        raise RuntimeError("Team parse failed (og:title/title/h1)")
+
+    log_info(f"Teams: {home_team} vs {away_team}")
+
+    league_match = re.search(r'<span[^>]*class="?sclassLink"?[^>]*>([^<]+)</span>', html)
+    league_name = strip_tags_keep_text(league_match.group(1)) if league_match else ""
+
+    # Standings (display only)
+    st_home_rows = extract_standings_for_team(html, home_team)
+    st_away_rows = extract_standings_for_team(html, away_team)
+    _ = standings_to_splits(st_home_rows)
+    _ = standings_to_splits(st_away_rows)
+
+    # Previous tables
+    prev_home_tab, prev_away_tab = extract_previous_from_page(html)
+    prev_home_raw = parse_matches_from_table_html(prev_home_tab) if prev_home_tab else []
+    prev_away_raw = parse_matches_from_table_html(prev_away_tab) if prev_away_tab else []
+
+    # H2H (display only)
+    h2h_all = extract_h2h_matches(html, home_team, away_team)
+    h2h_pair = [m for m in h2h_all if is_h2h_pair(m, home_team, away_team)]
+    h2h_pair = sort_matches_desc(dedupe_matches(h2h_pair))
+    h2h_used = h2h_pair[:H2H_N]
+
+    # Same league filter for PSS (like you do in Excel)
+    if league_name:
+        prev_home_raw = filter_same_league_matches(prev_home_raw, league_name)
+        prev_away_raw = filter_same_league_matches(prev_away_raw, league_name)
+
+    # VBA style role filters
+    prev_home_sel = filter_team_home_only(prev_home_raw, home_team)[:RECENT_N]
+    prev_away_sel = filter_team_away_only(prev_away_raw, away_team)[:RECENT_N]
+
+    home_prev_stats = build_prev_stats(home_team, prev_home_sel)
+    away_prev_stats = build_prev_stats(away_team, prev_away_sel)
+
+    # Lambdas (PSS only)
+    lam_home, lam_away, lambda_info = compute_lambdas_pss_only(home_prev_stats, away_prev_stats)
+    score_2 = score_2_from_lambda(lam_home, lam_away)
+
+    # Poisson
+    score_mat = build_score_matrix(lam_home, lam_away, maxg=MAX_GOALS_FOR_MATRIX)
+    poisson_market = market_probs_from_matrix(score_mat)
+    top7 = top_scores_from_matrix(score_mat, topn=7)
+
+    # Monte Carlo
+    mc = monte_carlo(lam_home, lam_away, n=mcruns, seed=42)
+    diff, diff_label = model_agreement(poisson_market, mc["p"])
+    blended = blend_probs(poisson_market, mc["p"], alpha=BLEND_ALPHA)
+
+    # Corners (PSS only, HT supported)
+    corner_analysis = analyze_corners_pss_only(home_prev_stats, away_prev_stats, h2h_used)
+
+    value_block = {"used_odds": False, "decision": "Oran gerekli", "table": []}
+
+    data = {
+        "url": h2h_url,
+        "teams": {"home": home_team, "away": away_team},
+        "league": league_name,
+        "lambda": {
+            "home": lam_home,
+            "away": lam_away,
+            "total": lam_home + lam_away,
+            "info": lambda_info,
         },
-        'h2h_sample': h2h_matches,
-        'pss_home_sample': prev_home_list,
-        'pss_away_sample': prev_away_list,
-        'xg': {'home': lam_home, 'away': lam_away},
-        'corners': {'home': lam_corn_h, 'away': lam_corn_a},
-        'poisson': {'home_dist': h_dist, 'away_dist': a_dist, 'top_scores': scores[:7]},
-        'market_goals': m_goals,
-        'market_corners': m_corn,
-        'mc_goals': mc_goals,
-        'mc_corners': mc_corners,
-        'value': {'odds': odds}
-    }
-    
-    # Raporu Oluştur
-    report_text = generate_vba_report(full_data)
-    
-    return {
-        "ok": True,
-        "report": report_text,
-        "raw_data": full_data
+        "score_2": score_2,
+        "poisson": {"market_probs": poisson_market, "top7_scores": top7},
+        "mc": mc,
+        "model_agreement": {"diff": diff, "label": diff_label},
+        "blended_probs": blended,
+        "corner_analysis": corner_analysis,
+        "value_bets": value_block,
+        "datasources": {
+            "standings_available": bool(st_home_rows and st_away_rows),
+            "h2h_matches": len(h2h_used),
+            "home_prev_matches": len(prev_home_sel),
+            "away_prev_matches": len(prev_away_sel),
+            "pss_sameleague_used": bool(league_name),
+        },
     }
 
-# ============================================================================
-# 11. FLASK API
-# ============================================================================
+    data["report_comprehensive"] = format_report_vba_style(data)
+    log_info("Analysis complete")
+    return data
+
+# =============================================================================
+# FLASK
+# =============================================================================
 app = Flask(__name__)
 
 @app.route("/")
 def root():
-    return jsonify({
-        "ok": True,
-        "service": "nowgoal-analyzer-full",
-        "version": "6.0-ultimate",
-        "status": "running"
-    })
+    return jsonify({"ok": True, "service": "nowgoal-analyzer-api", "version": "5.2-pss-only", "status": "running"})
 
 @app.route("/health")
 def health():
     return jsonify({"ok": True, "status": "healthy", "timestamp": time.time()})
+
+@app.route("/test")
+def test():
+    try:
+        import numpy as _np
+        import requests as _req
+        return jsonify({"ok": True, "numpy_version": _np.__version__, "requests_version": _req.__version__, "test": "Libraries OK"})
+    except Exception as e:
+        log_error("Test failed", e)
+        return jsonify({"ok": False, "error": str(e), "traceback": traceback.format_exc()}), 500
 
 @app.route("/analizet", methods=["POST"])
 @app.route("/analiz_et", methods=["POST"])
 def analizet_route():
     request_start = time.time()
     log_info("=== REQUEST STARTED: /analiz_et ===")
-    
+
     try:
-        try:
-            payload = request.get_json(silent=True) or {}
-            log_info(f"Payload: {payload}")
-        except Exception as e:
-            log_error("JSON parse failed", e)
-            return jsonify({"ok": False, "error": f"JSON hatası: {e}"}), 400
-        
-        url = (payload.get("url") or '').strip()
-        # Oranlar opsiyonel, yoksa default
-        odds = payload.get("odds", [2.50, 3.20, 2.50])
-        
+        payload = request.get_json(silent=True) or {}
+        url = (payload.get("url") or "").strip()
         if not url:
-            log_error("URL is empty")
             return jsonify({"ok": False, "error": "URL boş"}), 400
-        
-        if not re.match(r'https?://', url):
-            log_error(f"Invalid URL: {url}")
+        if not re.match(r"https?://", url):
             return jsonify({"ok": False, "error": "Geçersiz URL"}), 400
-        
-        log_info(f"Analyzing: {url}")
-        
+
         try:
-            result = analyze_nowgoal(url, odds)
-            elapsed = time.time() - request_start
-            log_info(f"Analysis OK in {elapsed:.2f}s")
-            
-            # JSON response formatı
-            # Mobil uygulamada gösterim için basitleştirilmiş veriler + full rapor
-            data = result['raw_data']
-            top_skor = data['poisson']['top_scores'][0]
-            m = data['market_goals']
-            corn = data['corners']
-            
-            response = {
-                "ok": True,
-                "skor": f"{top_skor[0]}: {top_skor[1]*100:.1f}%",
-                "alt_ust": f"2.5 {'ÜST' if m['o25'] > 0.5 else 'ALT'}: {max(m['o25'], 1-m['o25'])*100:.1f}%",
-                "btts": f"{'VAR' if m['btts'] > 0.5 else 'YOK'}: {max(m['btts'], 1-m['btts'])*100:.1f}%",
-                "korner": {
-                    "toplam": f"{corn['home'] + corn['away']:.1f}",
-                    "ev": f"{corn['home']:.1f}",
-                    "deplasman": f"{corn['away']:.1f}"
-                },
-                "detay": result['report'],
-                "sure": f"{elapsed:.2f}s"
-            }
-            
-            return jsonify(response)
-            
+            data = analyze_nowgoal(url, mcruns=MC_RUNS_DEFAULT)
         except requests.exceptions.Timeout as e:
             log_error("Timeout", e)
             return jsonify({"ok": False, "error": "Zaman aşımı", "detail": str(e)}), 504
+        except requests.exceptions.RequestException as e:
+            log_error("Request failed", e)
+            return jsonify({"ok": False, "error": "Bağlantı hatası", "detail": str(e)}), 502
         except Exception as e:
             log_error("Analysis failed", e)
             return jsonify({"ok": False, "error": f"Analiz hatası: {str(e)}", "traceback": traceback.format_exc()}), 500
-            
+
+        top_skor = data["poisson"]["top7_scores"][0]
+        blend = data["blended_probs"]
+        corners = data["corner_analysis"]
+        top_corner = corners["top_corner_scores"][0] if corners.get("top_corner_scores") else ("N/A", 0.0)
+
+        response = {
+            "ok": True,
+            "model": "PSS_ONLY (VBA style)",
+            "skor": f"{top_skor[0]}: {top_skor[1]*100:.1f}%",
+            "skor_2": data["score_2"],
+            "alt_ust": f"2.5 {'ÜST' if blend.get('O2.5', 0) > 0.5 else 'ALT'}: {max(blend.get('O2.5', 0), blend.get('U2.5', 0))*100:.1f}%",
+            "btts": f"{'VAR' if blend.get('BTTS', 0) > 0.5 else 'YOK'}: {blend.get('BTTS', 0)*100:.1f}%",
+            "korner": {
+                "toplam": corners.get("total_corners", 0),
+                "ev": corners.get("predicted_home_corners", 0),
+                "deplasman": corners.get("predicted_away_corners", 0),
+                "en_olasi": f"{top_corner[0]}: {top_corner[1]*100:.1f}%",
+                "ilk_yari": corners.get("first_half", {}).get("total_ht", 0),
+                "ilk_yari_ev": corners.get("first_half", {}).get("predicted_home_ht", 0),
+                "ilk_yari_dep": corners.get("first_half", {}).get("predicted_away_ht", 0),
+                "over_9_5": f"{corners.get('market_probs', {}).get('O9.5', 0)*100:.1f}%",
+                "over_10_5": f"{corners.get('market_probs', {}).get('O10.5', 0)*100:.1f}%",
+            },
+            "karar": data["value_bets"].get("decision", ""),
+            "guven": corners.get("confidence", ""),
+            "detay": data["report_comprehensive"],
+            "sure": f"{time.time() - request_start:.2f}s",
+        }
+
+        log_info(f"=== REQUEST COMPLETED in {time.time() - request_start:.2f}s ===")
+        return jsonify(response)
+
     except Exception as e:
         log_error("Unhandled exception", e)
-        return jsonify({"ok": False, "error": f"Beklenmeyen hata: {str(e)}"}), 500
+        return jsonify({"ok": False, "error": f"Beklenmeyen hata: {str(e)}", "traceback": traceback.format_exc()}), 500
+
+@app.route("/analyze", methods=["POST"])
+def analyze_route():
+    try:
+        payload = request.get_json(silent=True) or {}
+        url = (payload.get("url") or "").strip()
+        if not url:
+            return jsonify({"ok": False, "error": "url required"}), 400
+        data = analyze_nowgoal(url, mcruns=MC_RUNS_DEFAULT)
+        return jsonify({"ok": True, "data": data})
+    except Exception as e:
+        log_error("Analyze route failed", e)
+        return jsonify({"ok": False, "error": str(e), "traceback": traceback.format_exc()}), 500
+
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({"ok": False, "error": "Endpoint bulunamadı", "endpoints": ["/", "/health", "/test", "/analiz_et", "/analyze"]}), 404
+
+@app.errorhandler(500)
+def internal_error(e):
+    log_error("500 error", e)
+    return jsonify({"ok": False, "error": "Sunucu hatası"}), 500
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    log_error("Unhandled exception", e)
+    return jsonify({"ok": False, "error": str(e), "traceback": traceback.format_exc()}), 500
 
 if __name__ == "__main__":
     log_info("=" * 70)
-    log_info("NowGoal Analyzer ULTIMATE FULL VERSION - COMPLETE")
+    log_info("NowGoal Analyzer v5.2 - PSS_ONLY (VBA Style)")
     log_info("=" * 70)
-    
+    log_info(f"Python: {sys.version}")
+    try:
+        import numpy
+        log_info(f"NumPy: {numpy.__version__}")
+    except ImportError:
+        log_error("NumPy NOT INSTALLED!")
+    try:
+        import requests as req
+        log_info(f"Requests: {req.__version__}")
+    except ImportError:
+        log_error("Requests NOT INSTALLED!")
+
     if len(sys.argv) > 1 and sys.argv[1] == "serve":
-        log_info("Starting Flask server on 0.0.0.0:5000...")
+        log_info("Starting Flask server on 0.0.0.0:5000 ...")
         app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
     else:
         print("Usage: python app.py serve")
