@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-NowGoal Match Analyzer - ULTIMATE EXACT MATCH VERSION
-- BASE: Python Scraping Engine (v5.2)
-- LOGIC: VBA PSS Model (%100 Port)
-- FIXED: Market Probability Loops (Truncated to match VBA logic exactly)
+NowGoal Match Analyzer - ULTIMATE EXACT REPLICA VERSION
+- BASE: Python Scraping Engine (v5.2) - Full Preservation
+- LOGIC: VBA PSS Model (%100 Port with Exact Loop Constraints)
+- FIXED: Section D Corner Market Truncation (0-10 Loop) matched to VBA
+- OUTPUT: Exact "ResimGibi" VBA Format
 - STATUS: FULL CODE / NO CUTS
 """
 
@@ -235,6 +236,9 @@ def build_oddscomp_url(url: str) -> str:
     return f"{base}/oddscomp/{match_id}"
 
 def parse_teams_from_title(html: str) -> Tuple[str, str]:
+    """
+    FIXED VERSION: Supports og:title meta tag
+    """
     og_match = re.search(r'<meta\s+property=["\']og:title["\']\s+content=["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
     if og_match:
         title_text = og_match.group(1)
@@ -337,6 +341,7 @@ def parse_match_from_cells(cells: List[str]) -> Optional[MatchRow]:
             cornerhtaway=cornerhtaway,
         )
     
+    # Fallback parsing strategy
     score_idx = None
     scorem = None
     for i, c in enumerate(cells):
@@ -1002,7 +1007,7 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 # ============================================================================
-# 11. MAIN ANALYSIS ORCHESTRATOR (UPDATED TO MATCH VBA LOOPS)
+# 11. MAIN ANALYSIS ORCHESTRATOR
 # ============================================================================
 def analyze_nowgoal(url: str, odds: Optional[List[float]] = None) -> Dict[str, Any]:
     log_info(f"Starting PSS analysis for: {url}")
@@ -1019,7 +1024,9 @@ def analyze_nowgoal(url: str, odds: Optional[List[float]] = None) -> Dict[str, A
     # PSS Verileri (RAW ÇEKİM)
     raw_home_list, raw_away_list = extract_previous_from_page(html)
     
-    # FILTERING FIX (ORJINAL KOD MANTIGI)
+    # === FILTERING FIX (ORJINAL KOD MANTIGI) ===
+    # Ev Sahibi için sadece EVİNDE oynadığı maçlar
+    # Deplasman için sadece DEPLASMANDA oynadığı maçlar
     prev_home_list = filter_team_home_only(raw_home_list, home_team)[:RECENT_N]
     prev_away_list = filter_team_away_only(raw_away_list, away_team)[:RECENT_N]
     
@@ -1035,9 +1042,12 @@ def analyze_nowgoal(url: str, odds: Optional[List[float]] = None) -> Dict[str, A
     lam_away = calculate_weighted_pss_goals(prev_away_list, away_team, False)
     
     # B) Corner Lambda (Perplexity / Taze Ekmek)
+    # Evin Kazandığı / Yediği (Filtreli liste)
     h_won, h_conceded = calculate_weighted_pss_corners(prev_home_list, home_team, True)
+    # Deplasmanın Kazandığı / Yediği (Filtreli liste)
     a_won, a_conceded = calculate_weighted_pss_corners(prev_away_list, away_team, False)
     
+    # Formül: (EvAtan + DepYiyen)/2
     lam_corn_h = (h_won + a_conceded) / 2.0
     lam_corn_a = (a_won + h_conceded) / 2.0
     
@@ -1048,6 +1058,7 @@ def analyze_nowgoal(url: str, odds: Optional[List[float]] = None) -> Dict[str, A
     h_dist = [poisson_pmf(lam_home, i) for i in range(6)]
     a_dist = [poisson_pmf(lam_away, i) for i in range(6)]
     
+    # Skor Matrisi
     scores = []
     for h in range(6):
         for a in range(6):
@@ -1069,32 +1080,30 @@ def analyze_nowgoal(url: str, odds: Optional[List[float]] = None) -> Dict[str, A
             elif h == a: m_goals['X'] += prob
             else: m_goals['2'] += prob
             
-    # E) Market Olasılıkları (Korner) - Poisson Bazlı
-    # DIKKAT: VBA Kodu Korner Market hesaplarken döngüyü 0 to 10 olarak sınırlıyor!
-    # Bu yüzden oranlar Monte Carlo'dan düşük çıkıyor. Metin formatı ile eşleşmesi için
-    # döngüyü burada da 11 (0-10) ile sınırlıyoruz.
-    h_corn_dist = [poisson_pmf(lam_corn_h, i) for i in range(15)]
-    a_corn_dist = [poisson_pmf(lam_corn_a, i) for i in range(15)]
+    # E) Market Olasılıkları (Korner) - TRUNCATED LOOPS (0-10) TO MATCH VBA
+    # Bu döngü 0-10 arası sınırlı olduğu için 10 üstü ihtimalleri toplamaz.
+    # Bu, VBA'daki mantığın birebir kopyasıdır.
+    h_corn_dist_trunc = [poisson_pmf(lam_corn_h, i) for i in range(11)] # 0 to 10
+    a_corn_dist_trunc = [poisson_pmf(lam_corn_a, i) for i in range(11)] # 0 to 10
     
     m_corn = {'o85': 0, 'o95': 0, 'o105': 0, 'o115': 0, 
               'home_o45': 0, 'home_o55': 0, 'away_o45': 0, 'away_o55': 0}
               
-    # VBA Logic: For i = 0 To 10, For j = 0 To 10
     for h in range(11): 
         for a in range(11):
-            prob = h_corn_dist[h] * a_corn_dist[a]
+            prob = h_corn_dist_trunc[h] * a_corn_dist_trunc[a]
             tot = h + a
             if tot > 8: m_corn['o85'] += prob
             if tot > 9: m_corn['o95'] += prob
             if tot > 10: m_corn['o105'] += prob
             if tot > 11: m_corn['o115'] += prob
             
-    m_corn['home_o45'] = sum(h_corn_dist[5:])
-    m_corn['home_o55'] = sum(h_corn_dist[6:])
-    m_corn['away_o45'] = sum(a_corn_dist[5:])
-    m_corn['away_o55'] = sum(a_corn_dist[6:])
+    m_corn['home_o45'] = sum(h_corn_dist_trunc[5:]) # 5,6,7,8,9,10
+    m_corn['home_o55'] = sum(h_corn_dist_trunc[6:]) # 6,7,8,9,10
+    m_corn['away_o45'] = sum(a_corn_dist_trunc[5:])
+    m_corn['away_o55'] = sum(a_corn_dist_trunc[6:])
     
-    # F) Monte Carlo Simulations
+    # F) Monte Carlo Simulations (UNBOUNDED - Correctly shows higher probs)
     mc_goals = monte_carlo_simulation_vba(lam_home, lam_away, MC_RUNS_DEFAULT)
     mc_corners = monte_carlo_corners_vba(lam_corn_h, lam_corn_a, MC_RUNS_DEFAULT)
     
@@ -1140,7 +1149,7 @@ def root():
     return jsonify({
         "ok": True,
         "service": "nowgoal-analyzer-ultimate",
-        "version": "6.2-exact-match",
+        "version": "6.3-exact-replica",
         "status": "running"
     })
 
@@ -1214,7 +1223,7 @@ def analizet_route():
 
 if __name__ == "__main__":
     log_info("=" * 70)
-    log_info("NowGoal Analyzer ULTIMATE EXACT MATCH VERSION - COMPLETE")
+    log_info("NowGoal Analyzer ULTIMATE EXACT REPLICA VERSION - COMPLETE")
     log_info("=" * 70)
     
     if len(sys.argv) > 1 and sys.argv[1] == "serve":
