@@ -1064,48 +1064,131 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
 # ============================================================================
 # 11. MAIN ANALYSIS ORCHESTRATOR
 # ============================================================================
-def analyze_nowgoal(url: str, odds: Optional[List[float]] = None) -> Dict[str, Any]:
+
+def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
+    """
+    [GÜNCELLENDİ - GÖRSELE GÖRE] 
+    Tablo sırası: Asian Handicap -> 1X2 Odds -> Over/Under
+    Bu fonksiyon Bet365 Initial satırındaki ilk 3 veriyi (Asian) atlar,
+    ikinci 3'lü grubu (1X2) çeker.
+    """
+    try:
+        url = f"{base_url}/oddscomp/{match_id}"
+        html = safe_get(url, referer=base_url)
+        
+        # --- GÖRSELE ÖZEL REGEX MANTIĞI ---
+        # 1. "Bet365" kelimesini bul.
+        # 2. "Initial" kelimesine git.
+        # 3. Asya Handikap verileri (Genelde sayı, kesir veya tire içerir: 0.85, 0.5/1, 1.00) -> BUNLARI ATLA (3 adet)
+        # 4. 1X2 Oranları (Ondalıklı sayılar: 1.61, 3.60, 5.25) -> BUNLARI AL
+        
+        # Regex Açıklaması:
+        # Bet365.*?Initial : Satır başlangıcı
+        # (?:.*?[\d\./\+\-]+){3} : Sayı, nokta, slash içeren 3 adet veri grubunu (Asian) oku ama kaydetme (ATLA).
+        # .*?(\d{1,3}\.\d{2}) : 1. Hedef (Ev Sahibi 1X2)
+        # .*?(\d{1,3}\.\d{2}) : 2. Hedef (Beraberlik 1X2)
+        # .*?(\d{1,3}\.\d{2}) : 3. Hedef (Deplasman 1X2)
+        
+        pattern = (
+            r'Bet365'                  # Şirket
+            r'.*?Initial'              # İlk satır
+            r'(?:.*?[\d\./\+\-]+){3}'  # İLK 3 SÜTUNU (Asian Home/Handicap/Away) GÖRMEZDEN GEL
+            r'.*?(\d{1,3}\.\d{2})'     # 4. Sütun: 1 (Ev) - YAKALA
+            r'.*?(\d{1,3}\.\d{2})'     # 5. Sütun: X (Beraberlik) - YAKALA
+            r'.*?(\d{1,3}\.\d{2})'     # 6. Sütun: 2 (Deplasman) - YAKALA
+        )
+        
+        matcher = re.search(pattern, html, re.DOTALL | re.IGNORECASE)
+        
+        if matcher:
+            o1 = float(matcher.group(1))
+            oX = float(matcher.group(2))
+            o2 = float(matcher.group(3))
+            
+            # Sağlama: 1X2 oranları genellikle 1.05'ten büyük olur. 
+            # Asian oranları (0.85 vs) yanlışlıkla çekilirse bu kontrol yakalar.
+            if o1 > 1.0 and oX > 1.0 and o2 > 1.0:
+                log_info(f"Oranlar Bet365 Initial (1X2) olarak çekildi: {o1} - {oX} - {o2}")
+                return [o1, oX, o2]
+        
+        # Bet365 bulunamazsa "Average" (Ortalama) verisine bak (Yine aynı mantıkla 1x2 sırasını hedefler)
+        # Average satırında da yapı genelde aynıdır.
+        pattern_avg = (
+            r'(?:Average|Score)'
+            r'.*?Initial'
+            r'(?:.*?[\d\./\+\-]+){3}' # Asya'yı atla
+            r'.*?(\d{1,3}\.\d{2})'    # 1
+            r'.*?(\d{1,3}\.\d{2})'    # X
+            r'.*?(\d{1,3}\.\d{2})'    # 2
+        )
+        matcher_avg = re.search(pattern_avg, html, re.DOTALL | re.IGNORECASE)
+        
+        if matcher_avg:
+            o1 = float(matcher_avg.group(1))
+            oX = float(matcher_avg.group(2))
+            o2 = float(matcher_avg.group(3))
+            if o1 > 1.0 and oX > 1.0 and o2 > 1.0:
+                log_info(f"Oranlar Ortalama Initial (1X2) olarak çekildi: {o1} - {oX} - {o2}")
+                return [o1, oX, o2]
+
+        log_error("Görseldeki yapıya uygun 1x2 oranları bulunamadı.")
+        return [1.0, 1.0, 1.0]
+
+    except Exception as e:
+        log_error(f"Oran çekme hatası: {e}")
+        return [1.0, 1.0, 1.0]
+
+def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict[str, Any]:
     log_info(f"Starting PSS analysis for: {url}")
     
+    match_id = extract_match_id(url)
+    base_domain = extract_base_domain(url)
+
     # 1. SCRAPING
     h2h_url = build_h2h_url(url)
     html = safe_get(h2h_url, referer=extract_base_domain(url))
     
     home_team, away_team = parse_teams_from_title(html)
     
-    # H2H (Sadece göstermek için)
+    # H2H ve İstatistikler
     h2h_matches = extract_h2h_matches(html, home_team, away_team)
-    
-    # PSS Verileri (RAW ÇEKİM)
     raw_home_list, raw_away_list = extract_previous_from_page(html)
     
-    # === FILTERING FIX (ORJINAL KOD MANTIGI) ===
+    # Filtering
     prev_home_list = filter_team_home_only(raw_home_list, home_team)[:RECENT_N]
     prev_away_list = filter_team_away_only(raw_away_list, away_team)[:RECENT_N]
     
-    # Standings Count (Sadece göstermek için)
     st_count_h = 0 
     st_count_a = 0
     if "Standings" in html: st_count_h = 10; st_count_a = 10 
     
-    # 2. HESAPLAMALAR (VBA MANTIGI)
+    # === [GÜNCELLENDİ] ORAN ÇEKME ===
+    # Görseldeki tablo yapısına (Bet365 -> Initial -> Skip Asian -> Get 1x2) göre çeker
+    scraped_odds = fetch_real_odds(match_id, base_domain)
     
-    # A) xG Lambda (Weighted PSS)
+    if scraped_odds and scraped_odds != [1.0, 1.0, 1.0]:
+        odds = scraped_odds
+    elif manual_odds and len(manual_odds) >= 3:
+        odds = manual_odds
+        log_info(f"Siteden çekilemedi, manuel oran: {odds}")
+    else:
+        odds = [1.0, 1.0, 1.0]
+        log_info("Oran bulunamadı, varsayılan [1.0, 1.0, 1.0]")
+
+    # 2. HESAPLAMALAR
     lam_home = calculate_weighted_pss_goals(prev_home_list, home_team, True)
     lam_away = calculate_weighted_pss_goals(prev_away_list, away_team, False)
     
-    # B) Corner Lambda (Perplexity / Taze Ekmek)
     h_won, h_conceded = calculate_weighted_pss_corners(prev_home_list, home_team, True)
     a_won, a_conceded = calculate_weighted_pss_corners(prev_away_list, away_team, False)
     
-    # Formül: (EvAtan + DepYiyen)/2
     lam_corn_h = (h_won + a_conceded) / 2.0
     lam_corn_a = (a_won + h_conceded) / 2.0
     
     if lam_corn_h <= 0: lam_corn_h = 4.0
     if lam_corn_a <= 0: lam_corn_a = 3.5
     
-    # C) Poisson Olasılıkları
+    # Poisson
     h_dist = [poisson_pmf(lam_home, i) for i in range(6)]
     a_dist = [poisson_pmf(lam_away, i) for i in range(6)]
     
@@ -1115,7 +1198,7 @@ def analyze_nowgoal(url: str, odds: Optional[List[float]] = None) -> Dict[str, A
             scores.append((f"{h}-{a}", h_dist[h] * a_dist[a]))
     scores.sort(key=lambda x: x[1], reverse=True)
     
-    # D) Market Olasılıkları (Gol) - VBA Loop 0-5
+    # Market Goals
     m_goals = {'o05': 0, 'o15': 0, 'o25': 0, 'o35': 0, 'btts': 0, '1': 0, 'X': 0, '2': 0}
     for h in range(6):
         for a in range(6):
@@ -1130,10 +1213,9 @@ def analyze_nowgoal(url: str, odds: Optional[List[float]] = None) -> Dict[str, A
             elif h == a: m_goals['X'] += prob
             else: m_goals['2'] += prob
             
-    # E) Market Olasılıkları (Korner) - TRUNCATED LOOPS (0-10) TO MATCH VBA TEXT
-    # Bu döngü 0-10 arası sınırlı olduğu için 10 üstü ihtimalleri toplamaz.
-    h_corn_dist_trunc = [poisson_pmf(lam_corn_h, i) for i in range(11)] # 0 to 10
-    a_corn_dist_trunc = [poisson_pmf(lam_corn_a, i) for i in range(11)] # 0 to 10
+    # Market Corners
+    h_corn_dist_trunc = [poisson_pmf(lam_corn_h, i) for i in range(11)]
+    a_corn_dist_trunc = [poisson_pmf(lam_corn_a, i) for i in range(11)]
     
     m_corn = {'o85': 0, 'o95': 0, 'o105': 0, 'o115': 0, 
               'home_o45': 0, 'home_o55': 0, 'away_o45': 0, 'away_o55': 0}
@@ -1147,16 +1229,14 @@ def analyze_nowgoal(url: str, odds: Optional[List[float]] = None) -> Dict[str, A
             if tot > 10: m_corn['o105'] += prob
             if tot > 11: m_corn['o115'] += prob
             
-    m_corn['home_o45'] = sum(h_corn_dist_trunc[5:]) # 5,6,7,8,9,10
-    m_corn['home_o55'] = sum(h_corn_dist_trunc[6:]) # 6,7,8,9,10
+    m_corn['home_o45'] = sum(h_corn_dist_trunc[5:])
+    m_corn['home_o55'] = sum(h_corn_dist_trunc[6:])
     m_corn['away_o45'] = sum(a_corn_dist_trunc[5:])
     m_corn['away_o55'] = sum(a_corn_dist_trunc[6:])
     
-    # F) Monte Carlo Simulations (LOOP-BASED EXACT REPLICA)
+    # Simulations
     mc_goals = monte_carlo_simulation_vba(lam_home, lam_away, MC_RUNS_DEFAULT)
     mc_corners = monte_carlo_corners_vba(lam_corn_h, lam_corn_a, MC_RUNS_DEFAULT)
-    
-    if not odds or len(odds) < 3: odds = [1.0, 1.0, 1.0]
     
     full_data = {
         'teams': {'home': home_team, 'away': away_team},
