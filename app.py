@@ -17,7 +17,6 @@ import random
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from collections import Counter
-import numpy as np
 import requests
 from flask import Flask, request, jsonify
 
@@ -1067,90 +1066,65 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
 
 def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
     """
-    [KESİN ÇÖZÜM - HÜCRE SAYMA YÖNTEMİ]
-    Bet365 > Initial satırını bulur.
-    Sonrasındaki <td> etiketlerini sırayla okur.
-    İlk 3 hücre (Asian Handicap) -> ATLA.
-    Sonraki 3 hücre (1X2) -> AL.
-    Regex hatasına düşmez, sırayla hücre sayar.
+    [TAG-AGNOSTIC TEXT STREAM YÖNTEMİ]
+    HTML etiket yapısına (td, span, div) bağımlı olmadan çalışır.
+    1. 'Bet365' kelimesini bulur.
+    2. Sonrasındaki 500 karakterlik ham metni alır.
+    3. Tüm HTML etiketlerini regex ile temizler (<...> -> '').
+    4. Kalan temiz metindeki tüm ondalıklı sayıları (Float) sırayla diziye atar.
+    5. Asian Handicap her zaman önce gelir (3 sayı).
+    6. 1x2 Oranları sonra gelir (3 sayı).
+    7. Dizinin 3, 4 ve 5. indekslerini alır (0-tabanlı).
     """
     try:
         url = f"{base_url}/oddscomp/{match_id}"
         html = safe_get(url, referer=base_url)
         
-        # 1. Bet365 ve Initial kelimelerinin geçtiği yeri bul
-        # HTML içinde arama yaparken büyük/küçük harf duyarsız yapalım
-        content_lower = html.lower()
-        start_pos = content_lower.find("bet365")
-        
-        if start_pos == -1:
-            log_error("Bet365 satırı bulunamadı.")
-            return [1.0, 1.0, 1.0]
-            
-        # Bet365'ten sonra gelen "Initial" kelimesini bul
-        initial_pos = content_lower.find("initial", start_pos)
-        
-        if initial_pos == -1:
-            log_error("Bet365 içinde Initial satırı bulunamadı.")
-            return [1.0, 1.0, 1.0]
-            
-        # 2. "Initial" kelimesinden sonraki HTML parçasını al (yaklaşık 2000 karakter yeterli)
-        chunk = html[initial_pos : initial_pos + 2000]
-        
-        # 3. HTML Parçasını hücrelere (td) böl
-        # Regex: <td...>(içerik)</td> yapısını yakalar
-        # Non-greedy (.*?) kullanarak hücre içeriklerini tek tek alırız.
-        cells = re.findall(r'<td[^>]*>(.*?)</td>', chunk, re.DOTALL | re.IGNORECASE)
-        
-        # Tablo Yapısı:
-        # Index 0: Asian Home   (Atla)
-        # Index 1: Asian Hdp    (Atla - Burası 0.5/1 gibi olabilir, regex'i bozan yer burasıydı)
-        # Index 2: Asian Away   (Atla)
-        # Index 3: 1X2 HOME     (AL) --> Hedef 1
-        # Index 4: 1X2 DRAW     (AL) --> Hedef 2
-        # Index 5: 1X2 AWAY     (AL) --> Hedef 3
-        
-        if len(cells) < 6:
-            log_error("Yeterli hücre verisi okunamadı.")
-            return [1.0, 1.0, 1.0]
-            
-        # 4. Verileri Temizle ve Çek
-        def clean_val(val):
-            # HTML taglerini temizle, boşlukları sil
-            v = re.sub(r'<.*?>', '', val).strip()
-            # Sadece sayı ve nokta kalsın
-            match = re.search(r'(\d+\.\d{2})', v)
-            return float(match.group(1)) if match else 1.0
+        # HTML'i küçük harfe çevirmeden önce Bet365'i orijinal case ile arayalım, 
+        # bulamazsak lower ile deneriz.
+        match_start = html.find("Bet365")
+        if match_start == -1:
+             # Eğer Bet365 yoksa, Average ara
+             match_start = html.find("Average")
+             if match_start == -1:
+                 log_error("Bet365 veya Average verisi bulunamadı.")
+                 return [1.0, 1.0, 1.0]
 
-        o1 = clean_val(cells[3]) # Ev
-        oX = clean_val(cells[4]) # Beraberlik
-        o2 = clean_val(cells[5]) # Deplasman
-        
-        # Sağlama: Oranlar mantıklı mı?
-        if o1 > 1.0 and oX > 1.0 and o2 > 1.0:
-            log_info(f"Oranlar Başarıyla Çekildi (Hücre Yöntemi): {o1} - {oX} - {o2}")
-            return [o1, oX, o2]
-            
-        # Eğer Bet365 verisi bozuksa, Average (Ortalama) verisine de aynı yöntemle bakalım
-        # (Yedek Plan)
-        avg_pos = content_lower.find("average") 
-        if avg_pos != -1:
-             initial_avg = content_lower.find("initial", avg_pos)
-             if initial_avg != -1:
-                 chunk_avg = html[initial_avg : initial_avg + 2000]
-                 cells_avg = re.findall(r'<td[^>]*>(.*?)</td>', chunk_avg, re.DOTALL | re.IGNORECASE)
-                 if len(cells_avg) >= 6:
-                     o1 = clean_val(cells_avg[3])
-                     oX = clean_val(cells_avg[4])
-                     o2 = clean_val(cells_avg[5])
-                     if o1 > 1.0:
-                         log_info(f"Yedek: Ortalama Oranlar Çekildi: {o1} - {oX} - {o2}")
-                         return [o1, oX, o2]
+        # Bet365'ten sonraki 1500 karakteri al (Yeterince uzun bir pencere)
+        # Bu kısım Asian + 1x2 + O/U tüm sayıları içerir.
+        chunk = html[match_start : match_start + 1500]
 
+        # 1. Adım: Tüm HTML etiketlerini temizle (<td class=...> vb. hepsi gider)
+        # Sadece saf metin ve sayılar kalır.
+        clean_text = re.sub(r'<[^>]+>', ' ', chunk)
+        
+        # 2. Adım: Ardışık boşlukları teke indir
+        clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+        
+        # 3. Adım: Metindeki TÜM ondalıklı sayıları bul (örn: 1.50, 0.95, 3.40)
+        # Dikkat: Regex güncellendi. Artık 0.5 veya 1 gibi sayıları da yakalar.
+        floats = [float(x) for x in re.findall(r'(\d+(?:\.\d+)?)', clean_text)]
+        
+        # 4. Adım: Akıllı Tarama (Pencere Yöntemi)
+        # Asya handikap oranları genellikle 1.0'ın altındadır (0.85, 0.90 vb.) 
+        # veya tam sayı handikaplardır (0, 1, 2).
+        # Ancak 1X2 oranları (Decimal) istisnasız HER ZAMAN 1.0'dan büyüktür.
+        # İlk 3'lü sayı grubunu buluyoruz ki HEPSİ 1.05'ten büyük olsun.
+        
+        for i in range(len(floats) - 2):
+            a, b, c = floats[i], floats[i+1], floats[i+2]
+            
+            # Üçü de 1.05'ten büyükse bu kesinlikle 1X2 bloğudur.
+            # (Asya oranlarında en az biri genelde 0.xx olur)
+            if a > 1.05 and b > 1.05 and c > 1.05:
+                log_info(f"Oranlar Text Stream (Akıllı Tarama) ile çekildi: {a} - {b} - {c}")
+                return [a, b, c]
+
+        log_error(f"Uygun 1x2 oran bloğu bulunamadı. Bulunan sayılar: {floats[:10]}...")
         return [1.0, 1.0, 1.0]
 
     except Exception as e:
-        log_error(f"Oran çekme hatası (Hücre Yöntemi): {e}")
+        log_error(f"Oran çekme hatası (Text Stream): {e}")
         return [1.0, 1.0, 1.0]
 
 def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict[str, Any]:
