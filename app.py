@@ -22,9 +22,9 @@ import requests
 from flask import Flask, request, jsonify
 
 # ============================================================================
-# REQUESTS-HTML IMPORTS - JavaScript Rendering için (Chrome gerektirmez!)
+# PLAYWRIGHT IMPORTS - JavaScript Rendering için
 # ============================================================================
-from requests_html import HTMLSession
+import asyncio
 
 # ============================================================================
 # 1. CONFIGURATION & CONSTANTS
@@ -758,8 +758,6 @@ def get_confidence(prob: float) -> str:
 # ============================================================================
 # 10. PLAYWRIHT BROWSER AUTOMATION - YENİ EKLENEN BÖLÜM
 # ============================================================================
-
-import asyncio
 
 def fetch_real_odds_with_playwright(match_id: str, base_url: str) -> List[float]:
     """
