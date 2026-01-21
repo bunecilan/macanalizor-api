@@ -1066,11 +1066,10 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
 
 def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
     """
-    [YENİ ÇÖZÜM - DOĞRUDAN 1X2 TABLOSUNU HEDEFLE]
-    1) Önce "1X2 Odds" başlığını bul
-    2) Sonra "Bet365" satırını bul
-    3) Sonra "Initial" kelimesini bul
-    4) Initial'dan sonraki ilk 3 <td> etiketini al (Home, Draw, Away)
+    [DOĞRU ÇÖZÜM - TABLO YAPISI ANLAŞILDI]
+    Tablo yapısı: [Company] [Asian 3 sütun] [1X2 3 sütun] [O/U 3 sütun]
+    Bet365 satırında Initial ve Live olmak üzere 2 alt satır var
+    Initial satırından 1X2 sütunlarını (4,5,6. indeksler) alacağız
     """
     try:
         url = f"{base_url}/oddscomp/{match_id}"
@@ -1087,71 +1086,90 @@ def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
         
         log_info("✓ 1X2 Odds başlığı bulundu")
         
-        # ADIM 2: 1X2 Odds'dan sonra "Bet365" kelimesini bul
-        pos_bet365 = html_lower.find("bet365", pos_1x2)
+        # ADIM 2: 1X2 Odds'dan sonraki HTML parçasını al
+        chunk_after_1x2 = html[pos_1x2 : pos_1x2 + 15000]
         
-        if pos_bet365 == -1:
+        # ADIM 3: Tüm <tr> satırlarını bul
+        tr_list = re.findall(r'<tr[^>]*>(.*?)</tr>', chunk_after_1x2, re.DOTALL | re.IGNORECASE)
+        
+        log_info(f"✓ {len(tr_list)} adet tablo satırı bulundu")
+        
+        # ADIM 4: "Bet365" içeren satırı bul
+        bet365_tr = None
+        for tr_html in tr_list:
+            if "bet365" in tr_html.lower():
+                bet365_tr = tr_html
+                log_info("✓ Bet365 satırı bulundu")
+                break
+        
+        if not bet365_tr:
             log_error("Bet365 satırı bulunamadı")
             return [1.0, 1.0, 1.0]
-            
-        log_info("✓ Bet365 satırı bulundu")
         
-        # ADIM 3: Bet365'den sonra "Initial" kelimesini bul
-        pos_initial = html_lower.find("initial", pos_bet365)
+        # ADIM 5: Bet365 satırından sonraki satırları kontrol et (Initial ve Live alt satırları)
+        bet365_index = tr_list.index(bet365_tr)
         
-        if pos_initial == -1:
-            log_error("Initial kelimesi bulunamadı")
-            return [1.0, 1.0, 1.0]
-            
-        log_info("✓ Initial kelimesi bulundu")
+        # Bet365'den sonraki 5 satırı incele (Initial burada olmalı)
+        initial_tr = None
+        for i in range(bet365_index + 1, min(bet365_index + 6, len(tr_list))):
+            if "initial" in tr_list[i].lower():
+                initial_tr = tr_list[i]
+                log_info(f"✓ Initial satırı bulundu (Bet365'den {i - bet365_index} satır sonra)")
+                break
         
-        # ADIM 4: Initial'dan sonraki 1000 karakterlik HTML parçasını al
-        chunk = html[pos_initial : pos_initial + 1000]
-        
-        # ADIM 5: Bu parçadaki tüm <td> etiketlerini bul
-        # Regex açıklaması:
-        # <td[^>]*>  -> <td ile başla, > görene kadar devam et
-        # (.*?)      -> içeriği al (non-greedy)
-        # </td>      -> kapanış etiketi
-        cells = re.findall(r'<td[^>]*>(.*?)</td>', chunk, re.DOTALL | re.IGNORECASE)
-        
-        log_info(f"✓ {len(cells)} adet hücre bulundu")
-        
-        # ADIM 6: İlk 3 hücreyi kontrol et (bunlar bizim 1X2 oranlarımız olmalı)
-        if len(cells) < 3:
-            log_error(f"Yeterli hücre yok. Bulunan: {len(cells)}")
+        if not initial_tr:
+            log_error("Initial satırı bulunamadı")
             return [1.0, 1.0, 1.0]
         
-        # ADIM 7: Her hücreyi temizle ve sayıya çevir
-        def temizle_ve_al(hucre_html):
-            """
-            HTML etiketlerini temizler ve içindeki sayıyı bulur.
-            Örnek: "<span>2.15</span>" -> 2.15
-            """
-            # HTML taglerini temizle
-            temiz = re.sub(r'<.*?>', '', hucre_html).strip()
-            
-            # İçinde sayı var mı bak (örn: 2.15, 3.50)
-            # \d+ -> bir veya daha fazla rakam
-            # \.  -> nokta
-            # \d{2} -> tam 2 rakam
-            eslesme = re.search(r'(\d+\.\d{2})', temiz)
-            
+        # ADIM 6: Initial satırındaki tüm <td> hücrelerini al
+        cells = re.findall(r'<td[^>]*>(.*?)</td>', initial_tr, re.DOTALL | re.IGNORECASE)
+        
+        log_info(f"✓ Initial satırında {len(cells)} adet hücre bulundu")
+        
+        # ADIM 7: Hücreleri temizleyip yazdır (debug için)
+        cleaned_cells = []
+        for i, cell in enumerate(cells):
+            text = re.sub(r'<.*?>', '', cell).strip()
+            cleaned_cells.append(text)
+            log_info(f"   Hücre {i}: '{text}'")
+        
+        # ADIM 8: Tablo yapısına göre indeksleri belirle
+        # Yapı: [Initial] [Asian Home] [Asian Hdp] [Asian Away] [1X2 Home] [1X2 Draw] [1X2 Away] [Over] [Goals] [Under]
+        # veya: [Asian Home] [Asian Hdp] [Asian Away] [1X2 Home] [1X2 Draw] [1X2 Away] [Over] [Goals] [Under]
+        
+        # "Initial" kelimesini içeren hücreyi bul ve atla
+        start_index = 0
+        for i, text in enumerate(cleaned_cells):
+            if "initial" in text.lower():
+                start_index = i + 1
+                log_info(f"✓ 'Initial' kelimesi {i}. hücrede, veri {start_index}. hücreden başlıyor")
+                break
+        
+        # Asian Handicap 3 sütun (0,1,2) - atla
+        # 1X2 Odds 3 sütun (3,4,5) - AL
+        odds_start = start_index + 3  # Asian'ı atla, 1X2'ye geç
+        
+        if odds_start + 2 >= len(cleaned_cells):
+            log_error(f"Yeterli hücre yok. Toplam: {len(cleaned_cells)}, İhtiyaç: {odds_start + 3}")
+            return [1.0, 1.0, 1.0]
+        
+        # ADIM 9: 1X2 oranlarını çek (3 sütun: Home, Draw, Away)
+        def temizle_ve_al(text):
+            """String içindeki sayıyı bul ve float'a çevir"""
+            eslesme = re.search(r'(\d+\.\d{2})', text)
             if eslesme:
                 return float(eslesme.group(1))
             else:
-                log_error(f"Hücrede sayı bulunamadı: {temiz}")
+                log_error(f"Sayı bulunamadı: '{text}'")
                 return 1.0
         
-        # ADIM 8: 3 oranı çek
-        oran_home = temizle_ve_al(cells[0])  # İlk hücre = Home
-        oran_draw = temizle_ve_al(cells[1])  # İkinci hücre = Draw
-        oran_away = temizle_ve_al(cells[2])  # Üçüncü hücre = Away
+        oran_home = temizle_ve_al(cleaned_cells[odds_start])      # 1X2 Home
+        oran_draw = temizle_ve_al(cleaned_cells[odds_start + 1])  # 1X2 Draw
+        oran_away = temizle_ve_al(cleaned_cells[odds_start + 2])  # 1X2 Away
         
         log_info(f"✓ Çekilen oranlar: Home={oran_home}, Draw={oran_draw}, Away={oran_away}")
         
-        # ADIM 9: Oranlar mantıklı mı kontrol et
-        # Mantıklı oran: 1.0'dan büyük olmalı
+        # ADIM 10: Oranlar mantıklı mı kontrol et
         if oran_home > 1.0 and oran_draw > 1.0 and oran_away > 1.0:
             log_info("✓✓✓ BAŞARILI! Oranlar doğru çekildi!")
             return [oran_home, oran_draw, oran_away]
@@ -1166,36 +1184,12 @@ def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
         return [1.0, 1.0, 1.0]
 ```
 
-## Yapmanız Gerekenler:
+## Mantık:
 
-1. **Kodunuzun 547-630 satırları arasını silin** (eski `fetch_real_odds` fonksiyonu)
-2. **Yukarıdaki yeni fonksiyonu yapıştırın**
-3. **Başka hiçbir yeri değiştirmeyin**
-
-## Nasıl Çalışır?
-
-Bu yeni fonksiyon şu adımları takip eder:
-
-1. ✅ Sayfayı açar
-2. ✅ "1X2 Odds" başlığını bulur (resimde kırmızı kutu)
-3. ✅ Bet365 satırını bulur (resimde sol kırmızı kutu)
-4. ✅ Initial kelimesini bulur (resimde üst kırmızı kutu)
-5. ✅ Initial'dan sonraki ilk 3 hücreyi okur:
-   - İlk hücre: **2.15** (Home)
-   - İkinci hücre: **3.50** (Draw)
-   - Üçüncü hücre: **2.85** (Away)
-
-## Test Etme:
-
-Kod çalıştığında şu mesajları göreceksiniz:
+Verdiğiniz dizilime göre:
 ```
-[INFO] Oran sayfası açılıyor: https://...
-[INFO] ✓ 1X2 Odds başlığı bulundu
-[INFO] ✓ Bet365 satırı bulundu
-[INFO] ✓ Initial kelimesi bulundu
-[INFO] ✓ 3 adet hücre bulundu
-[INFO] ✓ Çekilen oranlar: Home=2.15, Draw=3.50, Away=2.85
-[INFO] ✓✓✓ BAŞARILI! Oranlar doğru çekildi!
+[Initial] [1.00] [0/0.5] [0.85] [2.15] [3.50] [2.85] [0.93] [2.5/3] [0.93]
+   0        1       2       3       4      5      6      7      8      9
 
 def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict[str, Any]:
     log_info(f"Starting PSS analysis for: {url}")
