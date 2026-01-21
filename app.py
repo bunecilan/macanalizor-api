@@ -1066,96 +1066,66 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
 
 def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
     """
-    [KESİN ÇÖZÜM: JAVASCRIPT TEMİZLİĞİ VE AKILLI TARAMA]
-    HTML'i parse etmeden önce <script> taglerini tamamen siler.
-    Böylece Bet365 kelimesinin veya sayıların JS kodlarında geçen
-    kısımlarını (örn: "365" sayısı) yanlışlıkla almaz.
-    Sadece ekranda görünen temiz sayıları tarar.
+    [ULTIMATE FIX: RAW DATA MINING]
+    HTML tablosunu değil, doğrudan sayfa kaynağındaki JavaScript veri dizilerini tarar.
+    Requests ile çekilen ham metinde 'Bet365' verisi virgüllerle ayrılmış liste halindedir.
+    Örn: "Bet365", 0.90, 0.5, 0.90, 1.50, 3.50, 4.50 ...
+    Bu fonksiyon bu diziyi bulup 1x2 oranlarını (1.05 üstü olan ardışık 3 sayı) çeker.
     """
     try:
         url = f"{base_url}/oddscomp/{match_id}"
-        html = safe_get(url, referer=base_url)
+        # Tarayıcı taklidi yapan güçlü headerlar
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": f"{base_url}/match/h2h-{match_id}",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+        }
         
-        # 1. ADIM: JAVASCRIPT TEMİZLİĞİ (KRİTİK)
-        # HTML içindeki tüm <script>...</script> bloklarını siler.
-        # Bu sayede JS kodlarındaki "Bet365" veya rastgele sayılar elenir.
-        html_no_script = re.sub(r'<script.*?>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
+        log_info(f"Fetching Raw Data: {url}")
+        r = requests.get(url, headers=headers, timeout=15)
+        r.raise_for_status()
+        html = r.text
+        
+        # 1. Bet365'in geçtiği yeri bul
+        # (Büyük küçük harf duyarlılığını kaldırmak için lower yapmıyoruz, orijinal veri lazım)
+        start_idx = html.find("Bet365")
+        if start_idx == -1:
+            log_error("Ham veride 'Bet365' bulunamadı.")
+            return [1.0, 1.0, 1.0]
 
-        # 2. ADIM: Bet365'i Bul
-        match_start = html_no_script.find("Bet365")
-        if match_start == -1:
-             # Eğer Bet365 yoksa, Average ara
-             match_start = html_no_script.find("Average")
-             if match_start == -1:
-                 log_error("Bet365 veya Average verisi bulunamadı.")
-                 return [1.0, 1.0, 1.0]
-
-        # Bet365'ten sonraki 1500 karakteri al
-        chunk = html_no_script[match_start : match_start + 1500]
-
-        # 3. ADIM: HTML Taglerini Temizle
-        clean_text = re.sub(r'<[^>]+>', ' ', chunk)
-        clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+        # 2. Bet365'ten sonraki 200 karakterlik ham veri bloğunu al
+        # Bu blok şuna benzer: |Bet365|0.85|0.5|1.00|1.61|3.60|5.25|...
+        chunk = html[start_idx : start_idx + 200]
         
-        # 4. ADIM: Tüm Sayıları Çıkar
-        # Regex hem tamsayıları (1) hem ondalıklı sayıları (1.50) yakalar.
-        floats = [float(x) for x in re.findall(r'(\d+(?:\.\d+)?)', clean_text)]
+        # 3. Bu bloktaki TÜM ondalıklı sayıları (float) sırasıyla çıkar
+        # Regex: Tamsayı veya ondalıklı sayıları yakalar (örn: 1, 0.5, 1.50)
+        floats = [float(x) for x in re.findall(r'(\d+(?:\.\d+)?)', chunk)]
         
-        # 5. ADIM: 1x2 Oranlarını Bul (Akıllı Filtre)
-        # Asya handikap oranları genellikle 1.0'ın altındadır (0.85, 0.90) 
-        # 1X2 oranları ise İSTİSNASIZ her zaman 1.0'dan büyüktür.
-        # Yan yana gelen ve hepsi 1.05'ten büyük olan İLK 3'lü grup bizim hedefimizdir.
+        # 4. Mantıksal Filtreleme (Asian vs 1x2)
+        # Elimizde şöyle bir liste olacak: [365.0, 0.85, 0.5, 1.00, 1.61, 3.60, 5.25, ...]
+        # Listenin başındaki 365.0'ı atabiliriz (Bet365 isminden geliyor)
         
+        candidates = []
         for i in range(len(floats) - 2):
             a, b, c = floats[i], floats[i+1], floats[i+2]
             
+            # Bet365 isminden gelen 365 sayısını atla
+            if a > 100: continue 
+            
+            # 1X2 KURALI: Üç oran da 1.05'ten büyük olmalı (Maç sonucu oranları 1.0 olamaz)
+            # Asian handikap oranları genellikle 0.xx veya 1.00 olur.
+            # 1X2 ise (örn: 1.61, 3.60, 5.25) hepsi 1.05 üzerindedir.
             if a > 1.05 and b > 1.05 and c > 1.05:
-                log_info(f"Oranlar Başarıyla Çekildi: {a} - {b} - {c}")
+                # Bulduğumuz ilk geçerli 3'lü grup bizim oranlarımızdır.
+                log_info(f"HAM VERİDEN ORAN ÇEKİLDİ: {a} - {b} - {c}")
                 return [a, b, c]
 
-        log_error(f"Uygun 1x2 oran bloğu bulunamadı. Bulunan temiz sayılar: {floats[:15]}...")
+        log_error(f"Ham veride uygun 1x2 deseni bulunamadı. Bulunan sayılar: {floats}")
         return [1.0, 1.0, 1.0]
 
     except Exception as e:
-        log_error(f"Oran çekme hatası: {e}")
+        log_error(f"Oran çekme hatası (Raw Data): {e}")
         return [1.0, 1.0, 1.0]
-
-def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict[str, Any]:
-    log_info(f"Starting PSS analysis for: {url}")
-    
-    match_id = extract_match_id(url)
-    base_domain = extract_base_domain(url)
-
-    # 1. SCRAPING
-    h2h_url = build_h2h_url(url)
-    html = safe_get(h2h_url, referer=extract_base_domain(url))
-    
-    home_team, away_team = parse_teams_from_title(html)
-    
-    # H2H ve İstatistikler
-    h2h_matches = extract_h2h_matches(html, home_team, away_team)
-    raw_home_list, raw_away_list = extract_previous_from_page(html)
-    
-    # Filtering
-    prev_home_list = filter_team_home_only(raw_home_list, home_team)[:RECENT_N]
-    prev_away_list = filter_team_away_only(raw_away_list, away_team)[:RECENT_N]
-    
-    st_count_h = 0 
-    st_count_a = 0
-    if "Standings" in html: st_count_h = 10; st_count_a = 10 
-    
-    # === [GÜNCELLENDİ] ORAN ÇEKME ===
-    # Görseldeki tablo yapısına (Bet365 -> Initial -> Skip Asian -> Get 1x2) göre çeker
-    scraped_odds = fetch_real_odds(match_id, base_domain)
-    
-    if scraped_odds and scraped_odds != [1.0, 1.0, 1.0]:
-        odds = scraped_odds
-    elif manual_odds and len(manual_odds) >= 3:
-        odds = manual_odds
-        log_info(f"Siteden çekilemedi, manuel oran: {odds}")
-    else:
-        odds = [1.0, 1.0, 1.0]
-        log_info("Oran bulunamadı, varsayılan [1.0, 1.0, 1.0]")
 
     # 2. HESAPLAMALAR
     lam_home = calculate_weighted_pss_goals(prev_home_list, home_team, True)
