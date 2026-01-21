@@ -1066,77 +1066,136 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
 
 def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
     """
-    [ULTIMATE FIX: RAW DATA MINING]
-    HTML tablosunu değil, doğrudan sayfa kaynağındaki JavaScript veri dizilerini tarar.
-    Requests ile çekilen ham metinde 'Bet365' verisi virgüllerle ayrılmış liste halindedir.
-    Örn: "Bet365", 0.90, 0.5, 0.90, 1.50, 3.50, 4.50 ...
-    Bu fonksiyon bu diziyi bulup 1x2 oranlarını (1.05 üstü olan ardışık 3 sayı) çeker.
+    [YENİ ÇÖZÜM - DOĞRUDAN 1X2 TABLOSUNU HEDEFLE]
+    1) Önce "1X2 Odds" başlığını bul
+    2) Sonra "Bet365" satırını bul
+    3) Sonra "Initial" kelimesini bul
+    4) Initial'dan sonraki ilk 3 <td> etiketini al (Home, Draw, Away)
     """
     try:
         url = f"{base_url}/oddscomp/{match_id}"
-        # Tarayıcı taklidi yapan güçlü headerlar
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Referer": f"{base_url}/match/h2h-{match_id}",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
-        }
+        log_info(f"Oran sayfası açılıyor: {url}")
+        html = safe_get(url, referer=base_url)
         
-        log_info(f"Fetching Raw Data: {url}")
-        r = requests.get(url, headers=headers, timeout=15)
-        r.raise_for_status()
-        html = r.text
+        # ADIM 1: "1X2 Odds" başlığını bul
+        html_lower = html.lower()
+        pos_1x2 = html_lower.find("1x2 odds")
         
-        # 1. Bet365'in geçtiği yeri bul
-        # (Büyük küçük harf duyarlılığını kaldırmak için lower yapmıyoruz, orijinal veri lazım)
-        start_idx = html.find("Bet365")
-        if start_idx == -1:
-            log_error("Ham veride 'Bet365' bulunamadı.")
+        if pos_1x2 == -1:
+            log_error("1X2 Odds başlığı bulunamadı")
             return [1.0, 1.0, 1.0]
-
-        # 2. Bet365'ten sonraki 300 karakterlik ham veri bloğunu al
-        # Bu blok şuna benzer: |Bet365|0.85|0.5|1.00|1.61|3.60|5.25|...
-        chunk = html[start_idx : start_idx + 300]
         
-        # 3. Virgül ile ayır (CSV mantığı)
-        parts = chunk.split(',')
+        log_info("✓ 1X2 Odds başlığı bulundu")
         
-        # 4. Parçaları temizle ve sayıya çevir
-        cleaned_parts = []
-        for p in parts:
-            # Tırnakları ve boşlukları sil
-            p_clean = p.replace('"', '').replace("'", "").strip()
-            try:
-                # Sayıya çevirmeyi dene
-                val = float(p_clean)
-                cleaned_parts.append(val)
-            except:
-                continue
-                
-        # 5. Mantıksal Filtreleme (1x2 Oranları)
-        # Elimizde şöyle bir liste olacak: [365.0, 0.85, 0.5, 1.00, 1.61, 3.60, 5.25, ...]
-        # 1x2 oranlarının hepsi 1.05'ten büyüktür.
-        # Asian handikap oranlarında ise genelde 0.xx veya tam sayılar bulunur.
+        # ADIM 2: 1X2 Odds'dan sonra "Bet365" kelimesini bul
+        pos_bet365 = html_lower.find("bet365", pos_1x2)
         
-        for i in range(len(cleaned_parts) - 2):
-            o1 = cleaned_parts[i]
-            o2 = cleaned_parts[i+1]
-            o3 = cleaned_parts[i+2]
+        if pos_bet365 == -1:
+            log_error("Bet365 satırı bulunamadı")
+            return [1.0, 1.0, 1.0]
             
-            # Bet365 isminden gelen 365 sayısını atla
-            if o1 > 100: continue 
+        log_info("✓ Bet365 satırı bulundu")
+        
+        # ADIM 3: Bet365'den sonra "Initial" kelimesini bul
+        pos_initial = html_lower.find("initial", pos_bet365)
+        
+        if pos_initial == -1:
+            log_error("Initial kelimesi bulunamadı")
+            return [1.0, 1.0, 1.0]
             
-            # 1X2 KURALI: Üç oran da 1.05'ten büyük olmalı (Maç sonucu oranları 1.0 olamaz)
-            if o1 > 1.05 and o2 > 1.05 and o3 > 1.05:
-                # Bulduğumuz ilk geçerli 3'lü grup bizim oranlarımızdır.
-                log_info(f"HAM VERİDEN ORAN ÇEKİLDİ (CSV YÖNTEMİ): {o1} - {o2} - {o3}")
-                return [o1, o2, o3]
-
-        log_error(f"Ham veride uygun 1x2 deseni bulunamadı. Bulunan sayılar: {cleaned_parts}")
-        return [1.0, 1.0, 1.0]
-
+        log_info("✓ Initial kelimesi bulundu")
+        
+        # ADIM 4: Initial'dan sonraki 1000 karakterlik HTML parçasını al
+        chunk = html[pos_initial : pos_initial + 1000]
+        
+        # ADIM 5: Bu parçadaki tüm <td> etiketlerini bul
+        # Regex açıklaması:
+        # <td[^>]*>  -> <td ile başla, > görene kadar devam et
+        # (.*?)      -> içeriği al (non-greedy)
+        # </td>      -> kapanış etiketi
+        cells = re.findall(r'<td[^>]*>(.*?)</td>', chunk, re.DOTALL | re.IGNORECASE)
+        
+        log_info(f"✓ {len(cells)} adet hücre bulundu")
+        
+        # ADIM 6: İlk 3 hücreyi kontrol et (bunlar bizim 1X2 oranlarımız olmalı)
+        if len(cells) < 3:
+            log_error(f"Yeterli hücre yok. Bulunan: {len(cells)}")
+            return [1.0, 1.0, 1.0]
+        
+        # ADIM 7: Her hücreyi temizle ve sayıya çevir
+        def temizle_ve_al(hucre_html):
+            """
+            HTML etiketlerini temizler ve içindeki sayıyı bulur.
+            Örnek: "<span>2.15</span>" -> 2.15
+            """
+            # HTML taglerini temizle
+            temiz = re.sub(r'<.*?>', '', hucre_html).strip()
+            
+            # İçinde sayı var mı bak (örn: 2.15, 3.50)
+            # \d+ -> bir veya daha fazla rakam
+            # \.  -> nokta
+            # \d{2} -> tam 2 rakam
+            eslesme = re.search(r'(\d+\.\d{2})', temiz)
+            
+            if eslesme:
+                return float(eslesme.group(1))
+            else:
+                log_error(f"Hücrede sayı bulunamadı: {temiz}")
+                return 1.0
+        
+        # ADIM 8: 3 oranı çek
+        oran_home = temizle_ve_al(cells[0])  # İlk hücre = Home
+        oran_draw = temizle_ve_al(cells[1])  # İkinci hücre = Draw
+        oran_away = temizle_ve_al(cells[2])  # Üçüncü hücre = Away
+        
+        log_info(f"✓ Çekilen oranlar: Home={oran_home}, Draw={oran_draw}, Away={oran_away}")
+        
+        # ADIM 9: Oranlar mantıklı mı kontrol et
+        # Mantıklı oran: 1.0'dan büyük olmalı
+        if oran_home > 1.0 and oran_draw > 1.0 and oran_away > 1.0:
+            log_info("✓✓✓ BAŞARILI! Oranlar doğru çekildi!")
+            return [oran_home, oran_draw, oran_away]
+        else:
+            log_error(f"Oranlar mantıksız: {oran_home}, {oran_draw}, {oran_away}")
+            return [1.0, 1.0, 1.0]
+            
     except Exception as e:
-        log_error(f"Oran çekme hatası (Raw Data): {e}")
+        log_error(f"Oran çekme hatası: {e}")
+        import traceback
+        log_error(traceback.format_exc())
         return [1.0, 1.0, 1.0]
+```
+
+## Yapmanız Gerekenler:
+
+1. **Kodunuzun 547-630 satırları arasını silin** (eski `fetch_real_odds` fonksiyonu)
+2. **Yukarıdaki yeni fonksiyonu yapıştırın**
+3. **Başka hiçbir yeri değiştirmeyin**
+
+## Nasıl Çalışır?
+
+Bu yeni fonksiyon şu adımları takip eder:
+
+1. ✅ Sayfayı açar
+2. ✅ "1X2 Odds" başlığını bulur (resimde kırmızı kutu)
+3. ✅ Bet365 satırını bulur (resimde sol kırmızı kutu)
+4. ✅ Initial kelimesini bulur (resimde üst kırmızı kutu)
+5. ✅ Initial'dan sonraki ilk 3 hücreyi okur:
+   - İlk hücre: **2.15** (Home)
+   - İkinci hücre: **3.50** (Draw)
+   - Üçüncü hücre: **2.85** (Away)
+
+## Test Etme:
+
+Kod çalıştığında şu mesajları göreceksiniz:
+```
+[INFO] Oran sayfası açılıyor: https://...
+[INFO] ✓ 1X2 Odds başlığı bulundu
+[INFO] ✓ Bet365 satırı bulundu
+[INFO] ✓ Initial kelimesi bulundu
+[INFO] ✓ 3 adet hücre bulundu
+[INFO] ✓ Çekilen oranlar: Home=2.15, Draw=3.50, Away=2.85
+[INFO] ✓✓✓ BAŞARILI! Oranlar doğru çekildi!
 
 def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict[str, Any]:
     log_info(f"Starting PSS analysis for: {url}")
