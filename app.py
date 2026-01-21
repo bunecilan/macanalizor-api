@@ -756,20 +756,16 @@ def get_confidence(prob: float) -> str:
     return "DUSUK"
 
 # ============================================================================
-# 10. REQUESTS-HTML BROWSER AUTOMATION - YENİ EKLENEN BÖLÜM
+# 10. PLAYWRIHT BROWSER AUTOMATION - YENİ EKLENEN BÖLÜM
 # ============================================================================
 
 import asyncio
-import nest_asyncio
 
-# Python 3.13 uyumu için nest_asyncio uygula
-nest_asyncio.apply()
-
-def fetch_real_odds_with_pyppeteer(match_id: str, base_url: str) -> List[float]:
+def fetch_real_odds_with_playwright(match_id: str, base_url: str) -> List[float]:
     """
-    [YENİ ÇÖZÜM - Pyppeteer ile JavaScript Rendering - Python 3.13 Uyumlu]
+    [YENİ ÇÖZÜM - Playwright ile JavaScript Rendering - Python 3.13 + Gunicorn Uyumlu]
 
-    Bu fonksiyon pyppeteer kullanarak:
+    Bu fonksiyon playwright kullanarak:
     1) Tarayıcı açar
     2) Sayfaya gider
     3) JavaScript'in yüklenmesini bekler
@@ -779,114 +775,121 @@ def fetch_real_odds_with_pyppeteer(match_id: str, base_url: str) -> List[float]:
     Draw: 3.50
     Away: 2.85
 
-    NOT: Chrome gerektirmez, Render sunucusunda çalışır!
+    NOT: Chrome/Chromium gerektirir, Render sunucusunda çalışır!
     """
 
     log_info("=" * 60)
-    log_info("PYPPETEER JAVA SCRIPT RENDERING BAŞLADI")
+    log_info("PLAYWRIGHT JAVA SCRIPT RENDERING BAŞLADI")
     log_info("=" * 60)
 
     async def scrape_odds():
-        from pyppeteer import launch
+        from playwright.async_api import async_playwright
 
-        # ADIM 1: Tarayıcıyı başlat
-        log_info("ADIM 1: Tarayıcı başlatılıyor...")
-        browser = await launch(
-            headless=True,
-            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-        )
+        # ADIM 1: Playwright başlat
+        log_info("ADIM 1: Playwright başlatılıyor...")
+        async with async_playwright() as p:
+            # ADIM 2: Chromium başlat (gunicorn uyumlu)
+            log_info("ADIM 2: Chromium başlatılıyor...")
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu',
+                    '--disable-software-rasterizer',
+                    '--disable-accelerated-2d-canvas',
+                    '--no-zygote',
+                ]
+            )
 
-        try:
-            # ADIM 2: Yeni sayfa aç
-            log_info("ADIM 2: Yeni sayfa açılıyor...")
-            page = await browser.newPage()
+            try:
+                # ADIM 3: Yeni sayfa aç
+                log_info("ADIM 3: Yeni sayfa açılıyor...")
+                page = await browser.new_page()
 
-            # ADIM 3: URL'ye git
-            url = f"{base_url}/oddscomp/{match_id}"
-            log_info(f"ADIM 3: URL'ye gidiliyor: {url}")
-            await page.goto(url, waitUntil='networkidle2', timeout=30000)
+                # ADIM 4: URL'ye git
+                url = f"{base_url}/oddscomp/{match_id}"
+                log_info(f"ADIM 4: URL'ye gidiliyor: {url}")
+                await page.goto(url, wait_until='networkidle', timeout=30000)
 
-            log_info("ADIM 4: Sayfa yüklendi")
+                log_info("ADIM 5: Sayfa yüklendi")
 
-            # ADIM 4: JavaScript'in çalışması için bekle
-            log_info("ADIM 5: JavaScript bekleniyor (5 saniye)...")
-            await page.waitForSelector('table', timeout=10000)
-            await asyncio.sleep(5)
+                # ADIM 5: JavaScript'in çalışması için bekle
+                log_info("ADIM 6: JavaScript bekleniyor (5 saniye)...")
+                await page.wait_for_selector('table', timeout=10000)
+                await asyncio.sleep(5)
 
-            log_info("ADIM 6: JavaScript render edildi")
+                log_info("ADIM 7: JavaScript render edildi")
 
-            # ADIM 5: Tablodan Bet365 oranlarını çek
-            log_info("ADIM 7: Tablolar aranıyor...")
+                # ADIM 6: Tablodan Bet365 oranlarını çek
+                log_info("ADIM 8: Tablolar aranıyor...")
 
-            # Tablodaki tüm satırları al
-            rows = await page.querySelectorAllEval('table tr', 'trs => trs.map(tr => tr.innerText)')
+                # Tablodaki tüm satırları al
+                rows = await page.locator('table tr').all_inner_texts()
 
-            log_info(f"ADIM 8: {len(rows)} adet satır bulundu")
+                log_info(f"ADIM 9: {len(rows)} adet satır bulundu")
 
-            bet365_odds = None
+                bet365_odds = None
 
-            for row_index, row_text in enumerate(rows):
-                row_lower = row_text.lower()
+                for row_index, row_text in enumerate(rows):
+                    row_lower = row_text.lower()
 
-                # Bet365 ve Initial satırını bul
-                if 'bet365' in row_lower and 'initial' in row_lower:
-                    log_info(f"ADIM 9: Bet365 Initial satırı bulundu! (Satır {row_index + 1})")
-                    log_info(f"Satır içeriği: {row_text[:200]}...")
+                    # Bet365 ve Initial satırını bul
+                    if 'bet365' in row_lower and 'initial' in row_lower:
+                        log_info(f"ADIM 10: Bet365 Initial satırı bulundu! (Satır {row_index + 1})")
+                        log_info(f"Satır içeriği: {row_text[:200]}...")
 
-                    # Satırdaki sayıları bul (oranlar)
-                    import re
-                    found_odds = re.findall(r'(\d+\.\d{2})', row_text)
+                        # Satırdaki sayıları bul (oranlar)
+                        import re
+                        found_odds = re.findall(r'(\d+\.\d{2})', row_text)
 
-                    log_info(f"ADIM 10: Bulunan sayılar: {found_odds}")
+                        log_info(f"ADIM 11: Bulunan sayılar: {found_odds}")
 
-                    if len(found_odds) >= 3:
-                        # İlk 3 sayıyı al (Home, Draw, Away)
-                        bet365_odds = [float(found_odds[0]), float(found_odds[1]), float(found_odds[2])]
-                        log_info(f"ADIM 11: Bet365 oranları çekildi: {bet365_odds}")
-                        break
+                        if len(found_odds) >= 3:
+                            # İlk 3 sayıyı al (Home, Draw, Away)
+                            bet365_odds = [float(found_odds[0]), float(found_odds[1]), float(found_odds[2])]
+                            log_info(f"ADIM 12: Bet365 oranları çekildi: {bet365_odds}")
+                            break
 
-            # ADIM 6: Sonuçları kontrol et
-            if bet365_odds and all(o > 1.0 for o in bet365_odds):
-                log_info("=" * 60)
-                log_info("✓✓✓ BAŞARILI! Bet365 Initial oranları çekildi!")
-                log_info(f"  Home (1): {bet365_odds[0]}")
-                log_info(f"  Draw (X): {bet365_odds[1]}")
-                log_info(f"  Away (2): {bet365_odds[2]}")
-                log_info("=" * 60)
-                return bet365_odds
-            else:
-                log_error("Bet365 oranları bulunamadı veya geçersiz")
+                # ADIM 7: Sonuçları kontrol et
+                if bet365_odds and all(o > 1.0 for o in bet365_odds):
+                    log_info("=" * 60)
+                    log_info("✓✓✓ BAŞARILI! Bet365 Initial oranları çekildi!")
+                    log_info(f"  Home (1): {bet365_odds[0]}")
+                    log_info(f"  Draw (X): {bet365_odds[1]}")
+                    log_info(f"  Away (2): {bet365_odds[2]}")
+                    log_info("=" * 60)
+                    return bet365_odds
+                else:
+                    log_error("Bet365 oranları bulunamadı veya geçersiz")
+                    return [1.0, 1.0, 1.0]
+
+            except Exception as e:
+                log_error(f"playwright hatası: {e}")
                 return [1.0, 1.0, 1.0]
 
-        except Exception as e:
-            log_error(f"pyppeteer hatası: {e}")
-            return [1.0, 1.0, 1.0]
-
-        finally:
-            # ADIM 7: Tarayıcıyı kapat
-            log_info("ADIM 12: Tarayıcı kapatılıyor...")
-            await browser.close()
-            log_info("Tarayıcı kapatıldı")
+            finally:
+                # ADIM 8: Tarayıcıyı kapat
+                log_info("ADIM 13: Tarayıcı kapatılıyor...")
+                await browser.close()
+                log_info("Tarayıcı kapatıldı")
 
     # Asyncio ile çalıştır
     try:
-        result = asyncio.get_event_loop().run_until_complete(scrape_odds())
+        result = asyncio.run(scrape_odds())
         return result
-    except RuntimeError:
-        # Yeni event loop oluştur
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        result = loop.run_until_complete(scrape_odds())
-        loop.close()
-        return result
+    except RuntimeError as e:
+        log_error(f"Asyncio hatası: {e}")
+        return [1.0, 1.0, 1.0]
 
-def fetch_real_odds_with_requests_html(match_id: str, base_url: str) -> List[float]:
+def fetch_real_odds_with_pyppeteer(match_id: str, base_url: str) -> List[float]:
     """
-    [GÜNCELLENDİ - Pyppeteer Versiyonu - Python 3.13 Uyumlu]
+    [GÜNCELLENDİ - Playwright Versiyonu - Python 3.13 + Gunicorn Uyumlu]
 
-    Ana fonksiyon: pyppeteer kullanarak Bet365 Initial 1X2 oranlarını çeker.
+    Ana fonksiyon: playwright kullanarak Bet365 Initial 1X2 oranlarını çeker.
 
-    Önce pyppeteer ile dener, başarısız olursa varsayılan değerleri döndürür.
+    Önce playwright ile dener, başarısız olursa varsayılan değerleri döndürür.
 
     Döndürülen değerler:
     - Başarılı: [Home_oranı, Draw_oranı, Away_oranı]
@@ -899,17 +902,17 @@ def fetch_real_odds_with_requests_html(match_id: str, base_url: str) -> List[flo
     log_info(f"Base URL: {base_url}")
     log_info("=" * 60)
 
-    # Pyppeteer ile oranları çek
-    odds = fetch_real_odds_with_pyppeteer(match_id, base_url)
+    # Playwright ile oranları çek
+    odds = fetch_real_odds_with_playwright(match_id, base_url)
 
     # Sonuç döndür
     return odds
 
-def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
+def fetch_real_odds_with_requests_html(match_id: str, base_url: str) -> List[float]:
     """
-    [GÜNCELLENDİ - Pyppeteer VERSİYONU]
+    [GÜNCELLENDİ - Playwright Versiyonu - Python 3.13 Uyumlu]
 
-    Wrapper fonksiyon - pyppeteer kullanarak Bet365 Initial 1X2 oranlarını çeker.
+    Wrapper fonksiyon - playwright kullanarak Bet365 Initial 1X2 oranlarını çeker.
     """
 
     log_info("=" * 60)
@@ -918,8 +921,27 @@ def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
     log_info(f"Base URL: {base_url}")
     log_info("=" * 60)
 
-    # Pyppeteer ile oranları çek
-    odds = fetch_real_odds_with_pyppeteer(match_id, base_url)
+    # Playwright ile oranları çek
+    odds = fetch_real_odds_with_playwright(match_id, base_url)
+
+    # Sonuç döndür
+    return odds
+
+def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
+    """
+    [GÜNCELLENDİ - Playwright VERSİYONU]
+
+    Wrapper fonksiyon - playwright kullanarak Bet365 Initial 1X2 oranlarını çeker.
+    """
+
+    log_info("=" * 60)
+    log_info("fetch_real_odds fonksiyonu çağrıldı")
+    log_info(f"Match ID: {match_id}")
+    log_info(f"Base URL: {base_url}")
+    log_info("=" * 60)
+
+    # Playwright ile oranları çek
+    odds = fetch_real_odds_with_playwright(match_id, base_url)
 
     # Sonuç döndür
     return odds
