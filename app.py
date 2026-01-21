@@ -1093,33 +1093,45 @@ def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
             log_error("Ham veride 'Bet365' bulunamadı.")
             return [1.0, 1.0, 1.0]
 
-        # 2. Bet365'ten sonraki 200 karakterlik ham veri bloğunu al
+        # 2. Bet365'ten sonraki 300 karakterlik ham veri bloğunu al
         # Bu blok şuna benzer: |Bet365|0.85|0.5|1.00|1.61|3.60|5.25|...
-        chunk = html[start_idx : start_idx + 200]
+        chunk = html[start_idx : start_idx + 300]
         
-        # 3. Bu bloktaki TÜM ondalıklı sayıları (float) sırasıyla çıkar
-        # Regex: Tamsayı veya ondalıklı sayıları yakalar (örn: 1, 0.5, 1.50)
-        floats = [float(x) for x in re.findall(r'(\d+(?:\.\d+)?)', chunk)]
+        # 3. Virgül ile ayır (CSV mantığı)
+        parts = chunk.split(',')
         
-        # 4. Mantıksal Filtreleme (Asian vs 1x2)
+        # 4. Parçaları temizle ve sayıya çevir
+        cleaned_parts = []
+        for p in parts:
+            # Tırnakları ve boşlukları sil
+            p_clean = p.replace('"', '').replace("'", "").strip()
+            try:
+                # Sayıya çevirmeyi dene
+                val = float(p_clean)
+                cleaned_parts.append(val)
+            except:
+                continue
+                
+        # 5. Mantıksal Filtreleme (1x2 Oranları)
         # Elimizde şöyle bir liste olacak: [365.0, 0.85, 0.5, 1.00, 1.61, 3.60, 5.25, ...]
-        # Listenin başındaki 365.0'ı atabiliriz (Bet365 isminden geliyor)
+        # 1x2 oranlarının hepsi 1.05'ten büyüktür.
+        # Asian handikap oranlarında ise genelde 0.xx veya tam sayılar bulunur.
         
-        for i in range(len(floats) - 2):
-            a, b, c = floats[i], floats[i+1], floats[i+2]
+        for i in range(len(cleaned_parts) - 2):
+            o1 = cleaned_parts[i]
+            o2 = cleaned_parts[i+1]
+            o3 = cleaned_parts[i+2]
             
             # Bet365 isminden gelen 365 sayısını atla
-            if a > 100: continue 
+            if o1 > 100: continue 
             
             # 1X2 KURALI: Üç oran da 1.05'ten büyük olmalı (Maç sonucu oranları 1.0 olamaz)
-            # Asian handikap oranları genellikle 0.xx veya 1.00 olur.
-            # 1X2 ise (örn: 1.61, 3.60, 5.25) hepsi 1.05 üzerindedir.
-            if a > 1.05 and b > 1.05 and c > 1.05:
+            if o1 > 1.05 and o2 > 1.05 and o3 > 1.05:
                 # Bulduğumuz ilk geçerli 3'lü grup bizim oranlarımızdır.
-                log_info(f"HAM VERİDEN ORAN ÇEKİLDİ: {a} - {b} - {c}")
-                return [a, b, c]
+                log_info(f"HAM VERİDEN ORAN ÇEKİLDİ (CSV YÖNTEMİ): {o1} - {o2} - {o3}")
+                return [o1, o2, o3]
 
-        log_error(f"Ham veride uygun 1x2 deseni bulunamadı. Bulunan sayılar: {floats}")
+        log_error(f"Ham veride uygun 1x2 deseni bulunamadı. Bulunan sayılar: {cleaned_parts}")
         return [1.0, 1.0, 1.0]
 
     except Exception as e:
@@ -1302,7 +1314,6 @@ def analizet_route():
         log_info(f"Analyzing: {url}")
         
         try:
-            # Fonksiyon global scope'ta olduğu için NameError vermeyecek.
             result = analyze_nowgoal(url, odds)
             elapsed = time.time() - request_start
             log_info(f"Analysis OK in {elapsed:.2f}s")
