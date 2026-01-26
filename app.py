@@ -25,7 +25,7 @@ from flask import Flask, request, jsonify
 # 1. CONFIGURATION & CONSTANTS
 # ============================================================================
 MC_RUNS_DEFAULT = 10000
-RECENT_N = 10  # PSS analizinde dikkate alınacak maksimum maç sayısı
+RECENT_N = 10  # PSS analizinde dikkate alinacak maksimum mac sayisi
 H2H_N = 10     # H2H için çekilecek maç sayısı
 
 HEADERS = {
@@ -1067,90 +1067,251 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
 
 def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
     """
-    [KESİN ÇÖZÜM - HÜCRE SAYMA YÖNTEMİ]
-    Bet365 > Initial satırını bulur.
-    Sonrasındaki <td> etiketlerini sırayla okur.
-    İlk 3 hücre (Asian Handicap) -> ATLA.
-    Sonraki 3 hücre (1X2) -> AL.
-    Regex hatasına düşmez, sırayla hücre sayar.
+    [KESİN ÇÖZÜM - BET365 INITIAL 1X2]
+    NowGoal / NowGoal26 / Win007 ailesinde 1X2 oranlar çoğu zaman HTML içinde değil,
+    harici bir JS data dosyasından (game=Array(...)) yüklenir.
+
+    Bu fonksiyon:
+    1) Önce 1x2 JS data kaynaklarını dener (Bet365 satırını bulur -> Initial 1X2 alır)
+    2) Olmazsa eski HTML "hücre sayma" yöntemine düşer (sende çalışıyorsa yine çalışır)
+
+    NOT: Asya oranlarını ALMAZ. Sadece BET365 -> Initial -> 1X2 (Home/Draw/Away) döndürür.
     """
     try:
+        # --------------------------------------------------------------------
+        # 0) 1X2 DATA (JS) YÖNTEMİ - EN SAĞLAM
+        # --------------------------------------------------------------------
+        def _host_from_base(url: str) -> str:
+            try:
+                h = re.sub(r'^https?://', '', (url or '').strip(), flags=re.IGNORECASE)
+                h = h.split('/')[0].strip()
+                return h
+            except Exception:
+                return ""
+
+        def _root_host_from_live(host: str) -> str:
+            # live4.nowgoal26.com -> nowgoal26.com
+            h = (host or '').strip()
+            h = re.sub(r'^www\.', '', h, flags=re.IGNORECASE)
+            h = re.sub(r'^live\d+\.', '', h, flags=re.IGNORECASE)
+            return h
+
+        def _to_float(val: str) -> Optional[float]:
+            try:
+                v = (val or '').strip()
+                if not v:
+                    return None
+                v = re.sub(r'<.*?>', '', v)
+                v = v.replace('&nbsp;', ' ').strip()
+                v = v.replace(',', '.')
+                m = re.search(r'-?\d+(?:\.\d+)?', v)
+                if not m:
+                    return None
+                return float(m.group(0))
+            except Exception:
+                return None
+
+        def _parse_bet365_initial_from_1x2_js(js_text: str) -> Optional[List[float]]:
+            """
+            JS içinde tipik olarak:
+              game=Array("...|Bet 365|2.20|3.10|3.25|...", "....");
+            veya
+              var game=Array(("..."),("..."));
+            gibi data bulunur.
+
+            Bet365 satırını bulur, Initial 1X2 olarak [home, draw, away] döndürür.
+            """
+            if not js_text:
+                return None
+
+            # game=Array( ... ) bloğunu yakala
+            m = re.search(r'\bgame\s*=\s*Array\s*\((.*?)\)\s*;?', js_text, flags=re.IGNORECASE | re.DOTALL)
+            if not m:
+                m = re.search(r'\bvar\s+game\s*=\s*Array\s*\((.*?)\)\s*;?', js_text, flags=re.IGNORECASE | re.DOTALL)
+            if not m:
+                return None
+
+            inside = m.group(1)
+
+            # Array içindeki tüm quoted satırları çek
+            rows = re.findall(r'"([^"]*)"', inside, flags=re.DOTALL)
+            if not rows:
+                rows = re.findall(r"'([^']*)'", inside, flags=re.DOTALL)
+            if not rows:
+                return None
+
+            # Bet365 satırını ara
+            for row in rows:
+                parts = row.split('|')
+                if not parts:
+                    continue
+
+                joined_low = " ".join(parts).lower()
+                if ('bet365' not in joined_low) and ('bet 365' not in joined_low):
+                    continue
+
+                # %99: [.., .., CompanyName, Home, Draw, Away, ...]
+                if len(parts) >= 6:
+                    o1 = _to_float(parts[3])
+                    oX = _to_float(parts[4])
+                    o2 = _to_float(parts[5])
+                    if o1 is not None and oX is not None and o2 is not None and o1 > 0 and oX > 0 and o2 > 0:
+                        return [o1, oX, o2]
+
+                # Fallback: Bet365 kelimesinden sonraki ilk 3 float
+                idx_book = None
+                for i, p in enumerate(parts):
+                    pl = (p or '').lower()
+                    if 'bet365' in pl or 'bet 365' in pl:
+                        idx_book = i
+                        break
+
+                if idx_book is None:
+                    idx_book = 2
+
+                floats_after = []
+                for p in parts[idx_book + 1:]:
+                    f = _to_float(p)
+                    if f is not None:
+                        floats_after.append(f)
+                    if len(floats_after) >= 3:
+                        break
+
+                if len(floats_after) >= 3 and all(x > 0 for x in floats_after[:3]):
+                    return floats_after[:3]
+
+            return None
+
+        base_host = _host_from_base(base_url)
+        root_host = _root_host_from_live(base_host)
+
+        # Aday JS data URL listesi (farklı mirror/domain ihtimallerine karşı)
+        js_candidates = []
+        if root_host:
+            js_candidates.append(f"https://1x2d.{root_host}/{match_id}.js")
+            js_candidates.append(f"http://1x2d.{root_host}/{match_id}.js")
+        # Win007/Titan007 fallback (NowGoal mirrorları çoğu zaman aynı match id kullanır)
+        js_candidates.append(f"https://1x2d.win007.com/{match_id}.js")
+        js_candidates.append(f"http://1x2d.win007.com/{match_id}.js")
+        js_candidates.append(f"https://1x2d.titan007.com/{match_id}.js")
+        js_candidates.append(f"http://1x2d.titan007.com/{match_id}.js")
+
+        for js_url in js_candidates:
+            try:
+                js_text = safe_get(js_url, timeout=15, retries=1, referer=base_url)
+                odds = _parse_bet365_initial_from_1x2_js(js_text)
+                if odds and len(odds) == 3:
+                    log_info(f"Oranlar Başarıyla Çekildi (1X2 JS DATA): {odds[0]} - {odds[1]} - {odds[2]} | SRC: {js_url}")
+                    return odds
+            except Exception as e:
+                # tek tek dene, sessiz geç
+                continue
+
+        # --------------------------------------------------------------------
+        # 1) HTML ODDSCOMP FALLBACK (SENİN ESKİ YÖNTEMİ GELİŞTİRİLDİ)
+        # --------------------------------------------------------------------
         url = f"{base_url}/oddscomp/{match_id}"
         html = safe_get(url, referer=base_url)
-        
-        # 1. Bet365 ve Initial kelimelerinin geçtiği yeri bul
-        # HTML içinde arama yaparken büyük/küçük harf duyarsız yapalım
-        content_lower = html.lower()
-        start_pos = content_lower.find("bet365")
-        
-        if start_pos == -1:
-            log_error("Bet365 satırı bulunamadı.")
-            return [1.0, 1.0, 1.0]
-            
-        # Bet365'ten sonra gelen "Initial" kelimesini bul
-        initial_pos = content_lower.find("initial", start_pos)
-        
-        if initial_pos == -1:
-            log_error("Bet365 içinde Initial satırı bulunamadı.")
-            return [1.0, 1.0, 1.0]
-            
-        # 2. "Initial" kelimesinden sonraki HTML parçasını al (yaklaşık 2000 karakter yeterli)
-        chunk = html[initial_pos : initial_pos + 2000]
-        
-        # 3. HTML Parçasını hücrelere (td) böl
-        # Regex: <td...>(içerik)</td> yapısını yakalar
-        # Non-greedy (.*?) kullanarak hücre içeriklerini tek tek alırız.
-        cells = re.findall(r'<td[^>]*>(.*?)</td>', chunk, re.DOTALL | re.IGNORECASE)
-        
-        # Tablo Yapısı:
-        # Index 0: Asian Home   (Atla)
-        # Index 1: Asian Hdp    (Atla - Burası 0.5/1 gibi olabilir, regex'i bozan yer burasıydı)
-        # Index 2: Asian Away   (Atla)
-        # Index 3: 1X2 HOME     (AL) --> Hedef 1
-        # Index 4: 1X2 DRAW     (AL) --> Hedef 2
-        # Index 5: 1X2 AWAY     (AL) --> Hedef 3
-        
-        if len(cells) < 6:
-            log_error("Yeterli hücre verisi okunamadı.")
-            return [1.0, 1.0, 1.0]
-            
-        # 4. Verileri Temizle ve Çek
-        def clean_val(val):
-            # HTML taglerini temizle, boşlukları sil
-            v = re.sub(r'<.*?>', '', val).strip()
-            # Sadece sayı ve nokta kalsın
-            match = re.search(r'(\d+\.\d{2})', v)
-            return float(match.group(1)) if match else 1.0
 
-        o1 = clean_val(cells[3]) # Ev
-        oX = clean_val(cells[4]) # Beraberlik
-        o2 = clean_val(cells[5]) # Deplasman
-        
-        # Sağlama: Oranlar mantıklı mı?
-        if o1 > 1.0 and oX > 1.0 and o2 > 1.0:
-            log_info(f"Oranlar Başarıyla Çekildi (Hücre Yöntemi): {o1} - {oX} - {o2}")
-            return [o1, oX, o2]
-            
-        # Eğer Bet365 verisi bozuksa, Average (Ortalama) verisine de aynı yöntemle bakalım
-        # (Yedek Plan)
-        avg_pos = content_lower.find("average") 
-        if avg_pos != -1:
-             initial_avg = content_lower.find("initial", avg_pos)
-             if initial_avg != -1:
-                 chunk_avg = html[initial_avg : initial_avg + 2000]
-                 cells_avg = re.findall(r'<td[^>]*>(.*?)</td>', chunk_avg, re.DOTALL | re.IGNORECASE)
-                 if len(cells_avg) >= 6:
-                     o1 = clean_val(cells_avg[3])
-                     oX = clean_val(cells_avg[4])
-                     o2 = clean_val(cells_avg[5])
-                     if o1 > 1.0:
-                         log_info(f"Yedek: Ortalama Oranlar Çekildi: {o1} - {oX} - {o2}")
-                         return [o1, oX, o2]
+        content_lower = (html or "").lower()
 
+        # Bet365 satırını <tr> bazında bul (rowspan durumunu da yakalar)
+        trs = re.findall(r'<tr[^>]*>.*?</tr>', html or '', flags=re.IGNORECASE | re.DOTALL)
+
+        target_tr = None
+        for i, tr in enumerate(trs):
+            low = tr.lower()
+            if 'bet365' in low:
+                # Bet365 + Initial aynı satırdaysa
+                if 'initial' in low:
+                    target_tr = tr
+                    break
+                # Bet365 satırı rowspan ile bir üst satırda, Initial bir alt satırda olabilir
+                if i + 1 < len(trs) and 'initial' in trs[i + 1].lower():
+                    target_tr = trs[i + 1]
+                    break
+
+        if target_tr:
+            cells = re.findall(r'<td[^>]*>(.*?)</td>', target_tr, flags=re.DOTALL | re.IGNORECASE)
+
+            # Initial hücresinin index'ini bul
+            init_idx = None
+            for j, c in enumerate(cells):
+                txt = strip_tags_keep_text(c).strip().lower()
+                if txt == 'initial' or 'initial' in txt:
+                    init_idx = j
+                    break
+            if init_idx is None:
+                # bazı tablolarda Initial hücresi yoksa (çok nadir) 0 kabul et
+                init_idx = 0
+
+            # Initial'dan sonra:
+            # +1 Asian Home (SKIP)
+            # +2 Asian Handicap (SKIP)
+            # +3 Asian Away (SKIP)
+            # +4 1X2 Home (AL)
+            # +5 1X2 Draw (AL)
+            # +6 1X2 Away (AL)
+            def clean_val(val):
+                v = strip_tags_keep_text(val).strip()
+                v = v.replace(',', '.')
+                m = re.search(r'(\d+(?:\.\d+)?)', v)
+                return float(m.group(1)) if m else 1.0
+
+            try:
+                o1 = clean_val(cells[init_idx + 4])
+                oX = clean_val(cells[init_idx + 5])
+                o2 = clean_val(cells[init_idx + 6])
+                if o1 > 0 and oX > 0 and o2 > 0:
+                    log_info(f"Oranlar Başarıyla Çekildi (ODDSCOMP HTML FALLBACK): {o1} - {oX} - {o2}")
+                    return [o1, oX, o2]
+            except Exception:
+                pass
+
+        # Yedek plan: Average satırı varsa aynı mantıkla deneyelim
+        avg_tr = None
+        for i, tr in enumerate(trs):
+            low = tr.lower()
+            if 'average' in low and 'initial' in low:
+                avg_tr = tr
+                break
+            if 'average' in low and i + 1 < len(trs) and 'initial' in trs[i + 1].lower():
+                avg_tr = trs[i + 1]
+                break
+
+        if avg_tr:
+            cells_avg = re.findall(r'<td[^>]*>(.*?)</td>', avg_tr, flags=re.DOTALL | re.IGNORECASE)
+
+            init_idx = None
+            for j, c in enumerate(cells_avg):
+                txt = strip_tags_keep_text(c).strip().lower()
+                if txt == 'initial' or 'initial' in txt:
+                    init_idx = j
+                    break
+            if init_idx is None:
+                init_idx = 0
+
+            def clean_val(val):
+                v = strip_tags_keep_text(val).strip()
+                v = v.replace(',', '.')
+                m = re.search(r'(\d+(?:\.\d+)?)', v)
+                return float(m.group(1)) if m else 1.0
+
+            try:
+                o1 = clean_val(cells_avg[init_idx + 4])
+                oX = clean_val(cells_avg[init_idx + 5])
+                o2 = clean_val(cells_avg[init_idx + 6])
+                if o1 > 0 and oX > 0 and o2 > 0:
+                    log_info(f"Yedek: Ortalama Oranlar Çekildi (HTML): {o1} - {oX} - {o2}")
+                    return [o1, oX, o2]
+            except Exception:
+                pass
+
+        log_error("Oran çekilemedi (Bet365 Initial 1x2).")
         return [1.0, 1.0, 1.0]
 
     except Exception as e:
-        log_error(f"Oran çekme hatası (Hücre Yöntemi): {e}")
+        log_error(f"Oran çekme hatası (Bet365 Initial 1x2): {e}")
         return [1.0, 1.0, 1.0]
 
 def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict[str, Any]:
@@ -1178,7 +1339,7 @@ def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict
     if "Standings" in html: st_count_h = 10; st_count_a = 10 
     
     # === [GÜNCELLENDİ] ORAN ÇEKME ===
-    # Görseldeki tablo yapısına (Bet365 -> Initial -> Skip Asian -> Get 1x2) göre çeker
+    # Bet365 Initial 1X2 çek (Asya oranları alınmaz)
     scraped_odds = fetch_real_odds(match_id, base_domain)
     
     if scraped_odds and scraped_odds != [1.0, 1.0, 1.0]:
