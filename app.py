@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 NowGoal Match Analyzer - ULTIMATE VBA LOGIC REPLICA
-- BASE: Python Scraping Engine (v5.2) - Full Preservation
+- BASE: Python Scraping Engine (v5.4) - JS Data Mining Edition
 - LOGIC: VBA 'Magic Dice' (PoissonRastgele) Logic Implemented
 - SIMULATION: Iterative loop (10,000 runs) exactly like VBA
 - OUTPUT: Exact "ResimGibi" VBA Format
@@ -28,11 +28,19 @@ MC_RUNS_DEFAULT = 10000
 RECENT_N = 10  # PSS analizinde dikkate alınacak maksimum maç sayısı
 H2H_N = 10     # H2H için çekilecek maç sayısı
 
+# Render/Bot Koruması İçin Güçlü Header
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
     "Accept-Language": "en-US,en;q=0.9,tr;q=0.8",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0",
 }
 
 # ============================================================================
@@ -111,11 +119,11 @@ class SplitGFGA:
     matches: int
     gf: int
     ga: int
-
+    
     @property
     def gfpg(self) -> float:
         return self.gf / self.matches if self.matches else 0.0
-
+    
     @property
     def gapg(self) -> float:
         return self.ga / self.matches if self.matches else 0.0
@@ -242,21 +250,21 @@ def parse_teams_from_title(html: str) -> Tuple[str, str]:
         vs_match = re.search(r'(.+?)\s+VS\s+(.+?)(?:\s*-|\s*$)', title_text, flags=re.IGNORECASE)
         if vs_match:
             return (vs_match.group(1).strip(), vs_match.group(2).strip())
-
+    
     title_match = re.search(r'<title[^>]*>([^<]+)</title>', html, flags=re.IGNORECASE)
     if title_match:
         title_text = title_match.group(1).strip()
         vs_match = re.search(r'(.+?)\s+(?:VS|vs)\s+(.+?)(?:\s*-|\s*$)', title_text, flags=re.IGNORECASE)
         if vs_match:
             return (vs_match.group(1).strip(), vs_match.group(2).strip())
-
+    
     h1_match = re.search(r'<h1[^>]*>([^<]+)</h1>', html, flags=re.IGNORECASE)
     if h1_match:
         h1_text = h1_match.group(1).strip()
         vs_match = re.search(r'(.+?)\s+(?:vs|VS)\s+(.+?)(?:\s+Live|\s*$)', h1_text, flags=re.IGNORECASE)
         if vs_match:
             return (vs_match.group(1).strip(), vs_match.group(2).strip())
-
+    
     log_error("Could not parse team names from any source")
     return ("Home", "Away")
 
@@ -288,29 +296,29 @@ def parse_corner_cell(cell: str) -> Tuple[Optional[Tuple[int, int]], Optional[Tu
     txt = (cell or '').strip()
     if txt in ('', '-'):
         return None, None
-
+    
     ftm = CORNER_FT_RE.search(txt)
     htm = CORNER_HT_RE.search(txt)
-
+    
     ft = (int(ftm.group(1)), int(ftm.group(2))) if ftm else None
     ht = (int(htm.group(1)), int(htm.group(2))) if htm else None
-
+    
     return ft, ht
 
 def parse_match_from_cells(cells: List[str]) -> Optional[MatchRow]:
     if not cells:
         return None
-
+    
     def get(i: int) -> str:
         return (cells[i] or '').strip() if i < len(cells) else ''
-
+    
     league = get(0) or ''
     datecell = get(1)
     home = get(2)
     scorecell = get(3)
     away = get(4)
     cornercell = get(5)
-
+    
     scorem = SCORE_RE.search(scorecell) if scorecell else None
     if home and away and scorem:
         fth = int(scorem.group(1))
@@ -318,11 +326,11 @@ def parse_match_from_cells(cells: List[str]) -> Optional[MatchRow]:
         hth = int(scorem.group(3)) if scorem.group(3) else None
         hta = int(scorem.group(4)) if scorem.group(4) else None
         dateval = normalize_date(datecell) or ''
-
+        
         ftcorner, htcorner = parse_corner_cell(cornercell)
         cornerhome, corneraway = ftcorner if ftcorner else (None, None)
         cornerhthome, cornerhtaway = htcorner if htcorner else (None, None)
-
+        
         return MatchRow(
             league=league,
             date=dateval,
@@ -337,7 +345,7 @@ def parse_match_from_cells(cells: List[str]) -> Optional[MatchRow]:
             cornerhthome=cornerhthome,
             cornerhtaway=cornerhtaway,
         )
-
+    
     score_idx = None
     scorem = None
     for i, c in enumerate(cells):
@@ -347,15 +355,15 @@ def parse_match_from_cells(cells: List[str]) -> Optional[MatchRow]:
             score_idx = i
             scorem = m
             break
-
+    
     if not scorem or score_idx is None:
         return None
-
+    
     fth = int(scorem.group(1))
     fta = int(scorem.group(2))
     hth = int(scorem.group(3)) if scorem.group(3) else None
     hta = int(scorem.group(4)) if scorem.group(4) else None
-
+    
     home2 = None
     away2 = None
     for i in range(score_idx - 1, -1, -1):
@@ -366,10 +374,10 @@ def parse_match_from_cells(cells: List[str]) -> Optional[MatchRow]:
         if cells[i] or ''.strip():
             away2 = (cells[i] or '').strip()
             break
-
+    
     if not home2 or not away2:
         return None
-
+    
     league2 = cells[0] or ''.strip() or ''
     dateval2 = ''
     for c in cells:
@@ -377,7 +385,7 @@ def parse_match_from_cells(cells: List[str]) -> Optional[MatchRow]:
         if d:
             dateval2 = d
             break
-
+    
     cornerhome, corneraway = None, None
     cornerhthome, cornerhtaway = None, None
     for i in range(score_idx + 1, min(score_idx + 10, len(cells))):
@@ -388,7 +396,7 @@ def parse_match_from_cells(cells: List[str]) -> Optional[MatchRow]:
             cornerhthome, cornerhtaway = htcorner
         if ftcorner or htcorner:
             break
-
+    
     return MatchRow(
         league=league2,
         date=dateval2,
@@ -435,10 +443,10 @@ def parse_standings_table_rows(rows: List[List[str]]) -> List[StandRow]:
         if head not in wanted:
             continue
         label = 'Last 6' if head == 'Last6' else head
-
+        
         def g(i):
             return cells[i] if i < len(cells) else ''
-
+        
         r = StandRow(
             ft=label,
             matches=to_int(g(1)),
@@ -456,7 +464,7 @@ def parse_standings_table_rows(rows: List[List[str]]) -> List[StandRow]:
         if any(x.ft == r.ft for x in out):
             continue
         out.append(r)
-
+    
     order = {'Total': 0, 'Home': 1, 'Away': 2, 'Last 6': 3}
     out.sort(key=lambda x: order.get(x.ft, 99))
     return out
@@ -487,7 +495,7 @@ def extract_previous_from_page(page_source: str) -> Tuple[List[MatchRow], List[M
         if found_tabs:
             tabs = found_tabs
             break
-
+    
     if not tabs:
         all_tables = extract_tables_html(page_source)
         for t in all_tables:
@@ -496,10 +504,10 @@ def extract_previous_from_page(page_source: str) -> Tuple[List[MatchRow], List[M
                 tabs.append(t)
             if len(tabs) >= 4:
                 break
-
+    
     if not tabs:
         return [], []
-
+    
     match_tables: List[List[MatchRow]] = []
     for t in tabs:
         ms = parse_matches_from_table_html(t)
@@ -507,7 +515,7 @@ def extract_previous_from_page(page_source: str) -> Tuple[List[MatchRow], List[M
             match_tables.append(ms)
         if len(match_tables) >= 2:
             break
-
+    
     if len(match_tables) == 0:
         return [], []
     if len(match_tables) == 1:
@@ -525,7 +533,7 @@ def extract_h2h_matches(page_source: str, hometeam: str, awayteam: str) -> List[
             pair_count = sum(1 for m in cand if is_h2h_pair(m, hometeam, awayteam))
             if pair_count >= 2:
                 return cand
-
+    
     best_pair = 0
     best_list: List[MatchRow] = []
     for tbl in extract_tables_html(page_source):
@@ -536,7 +544,7 @@ def extract_h2h_matches(page_source: str, hometeam: str, awayteam: str) -> List[
         if pair_count > best_pair:
             best_pair = pair_count
             best_list = cand
-
+    
     return best_list
 
 # ============================================================================
@@ -569,25 +577,25 @@ def calculate_weighted_pss_goals(matches: List[MatchRow], team_name: str, is_hom
     total_goals = 0.0
     total_weight = 0.0
     count = 0
-
+    
     for m in matches:
         goals_scored = 0
         if is_home_context:
             goals_scored = m.fthome
         else:
             goals_scored = m.ftaway
-
+        
         count += 1
         weight = 1.2 if count <= 5 else 0.8
-
+        
         total_goals += goals_scored * weight
         total_weight += weight
-
-        if count >= 20: break
-
+        
+        if count >= 20: break 
+        
     if total_weight == 0:
-        return 1.3 if is_home_context else 1.1
-
+        return 1.3 if is_home_context else 1.1 
+        
     return total_goals / total_weight
 
 def calculate_weighted_pss_corners(matches: List[MatchRow], team_name: str, is_home_context: bool) -> Tuple[float, float]:
@@ -598,10 +606,10 @@ def calculate_weighted_pss_corners(matches: List[MatchRow], team_name: str, is_h
 
     for m in matches:
         if m.cornerhome is None or m.corneraway is None: continue
-
+        
         won = 0
         conceded = 0
-
+        
         if is_home_context:
             won = m.cornerhome
             conceded = m.corneraway
@@ -611,16 +619,16 @@ def calculate_weighted_pss_corners(matches: List[MatchRow], team_name: str, is_h
 
         count += 1
         weight = 1.2 if count <= 5 else 0.8
-
+        
         won_total += won * weight
         conceded_total += conceded * weight
         total_weight += weight
-
+        
         if count >= 20: break
 
     if total_weight == 0:
-        return 5.0, 5.0
-
+        return 5.0, 5.0 
+        
     return (won_total / total_weight), (conceded_total / total_weight)
 
 def poisson_pmf(lam: float, k: int) -> float:
@@ -658,13 +666,13 @@ def monte_carlo_simulation_vba(lam_home: float, lam_away: float, num_sims: int =
     draw = 0
     away_win = 0
     score_counts = Counter()
-
+    
     for _ in range(num_sims):
         ev_gol = vba_poisson_random(lam_home)
         dep_gol = vba_poisson_random(lam_away)
-
+        
         toplam = ev_gol + dep_gol
-
+        
         # VBA: If toplamGol <= 10 Then golDagilim(toplamGol) ...
         # Biz burada Counter kullanıyoruz ama mantık aynı
         if toplam <= 10:
@@ -673,18 +681,18 @@ def monte_carlo_simulation_vba(lam_home: float, lam_away: float, num_sims: int =
             # VBA'da dizi 10 elemanlı olduğu için 10'a eklemiyor olabilir
             # ama raporda 6+ gösteriliyor. Biz 11+ için de kaydedelim.
             gol_dagilim[toplam] += 1
-
+            
         if toplam > 2: over25 += 1
         if toplam > 3: over35 += 1
         if ev_gol >= 1 and dep_gol >= 1: btts += 1
-
+        
         if ev_gol > dep_gol: home_win += 1
         elif ev_gol == dep_gol: draw += 1
         else: away_win += 1
-
+        
         score_key = f"{ev_gol}-{dep_gol}"
         score_counts[score_key] += 1
-
+        
     return {
         "dist_goals": gol_dagilim,
         "over25_pct": over25 / num_sims,
@@ -706,34 +714,34 @@ def monte_carlo_corners_vba(lam_home: float, lam_away: float, num_sims: int = 10
     over75 = 0; over85 = 0; over95 = 0; over105 = 0; over115 = 0
     home_more = 0; draw = 0; away_more = 0
     score_counts = Counter()
-
+    
     for _ in range(num_sims):
         ev_k = vba_poisson_random(lam_home)
         dep_k = vba_poisson_random(lam_away)
         top_k = ev_k + dep_k
-
+        
         # 1. Dağılım
         if top_k <= 19:
             dist_total[top_k] += 1
         else:
             dist_total[20] += 1
-
+            
         # 2. Market
         if top_k > 7: over75 += 1
         if top_k > 8: over85 += 1
         if top_k > 9: over95 += 1
         if top_k > 10: over105 += 1
         if top_k > 11: over115 += 1
-
+        
         # 3. Taraf
         if ev_k > dep_k: home_more += 1
         elif ev_k == dep_k: draw += 1
         else: away_more += 1
-
+        
         # 4. Skor
         score_key = f"{ev_k}-{dep_k}"
         score_counts[score_key] += 1
-
+        
     return {
         "dist_total": dist_total,
         "over75": over75 / num_sims,
@@ -766,26 +774,26 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
     mc = data['mc_goals']
     mc_corn = data['mc_corners']
     val = data['value']
-
+    
     lines = []
     lines.append("="*55)
     lines.append("  FUTBOL MAC ANALIZI - %100 PSS MODEL")
     lines.append("  (STANDINGS HIC KULLANILMAZ - SADECE PSS!)")
     lines.append("="*55 + "\n")
-
+    
     lines.append(f"MAC: {t['home']} vs {t['away']}")
     lines.append(f"ORANLAR: 1: {val['odds'][0]:.2f} | X: {val['odds'][1]:.2f} | 2: {val['odds'][2]:.2f}")
     lines.append("="*55 + "\n")
-
+    
     lines.append("="*55)
     lines.append("0) VERI KAYNAK KONTROLU")
     lines.append("="*55 + "\n")
-
+    
     lines.append("STANDINGS VERILERI (SADECE GORUNUM - KULLANILMAYACAK):")
     lines.append(f"  {t['home']}: {data['counts']['home_standings']} ev maci (SADECE GORUNTU)")
     lines.append(f"  {t['away']}: {data['counts']['away_standings']} deplasman maci (SADECE GORUNTU)")
     lines.append("  *** STANDINGS HESAPLAMALARDA KULLANILMAYACAK ***\n")
-
+    
     lines.append("H2H VERILERI (SADECE GORUNUM - HESAPLAMADA KULLANILMAYACAK):")
     h2h_cnt = data['counts']['h2h']
     if h2h_cnt > 0:
@@ -796,7 +804,7 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
     else:
         lines.append("  H2H verisi bulunamadi")
     lines.append("  *** H2H VERILERI HESAPLAMALARDA KULLANILMAYACAK ***\n")
-
+    
     lines.append("EV TAKIMI PSS (%100 ANA VERİ - Hesaplama Kaynagi):")
     if data['counts']['pss_home'] > 0:
         lines.append(f"  TOPLAM {data['counts']['pss_home']} MAC BULUNDU")
@@ -807,7 +815,7 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
     else:
         lines.append("  KRITIK HATA: Ev takimi PSS verisi bulunamadi!")
     lines.append("\n")
-
+    
     lines.append("DEPLASMAN TAKIMI PSS (%100 ANA VERİ - Hesaplama Kaynagi):")
     if data['counts']['pss_away'] > 0:
         lines.append(f"  TOPLAM {data['counts']['pss_away']} MAC BULUNDU")
@@ -818,7 +826,7 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
     else:
         lines.append("  KRITIK HATA: Deplasman PSS verisi bulunamadi!")
     lines.append("\n")
-
+    
     if data['counts']['pss_home'] == 0 or data['counts']['pss_away'] == 0:
         lines.append("="*55)
         lines.append("ANALIZ DURDURULDU: EKSIK PSS VERISI")
@@ -828,28 +836,28 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
     lines.append("="*55)
     lines.append("A) BEKLENEN GOLLER (xG) - %100 PSS")
     lines.append("="*55 + "\n")
-
+    
     lines.append("PSS TABANLI xG (Tek Kaynak - %100 PSS):")
     lines.append(f"   {t['home']} xG: {xg['home']:.2f} gol (Son {data['counts']['pss_home']} mac direkt ortalaması)")
     lines.append(f"   {t['away']} xG: {xg['away']:.2f} gol (Son {data['counts']['pss_away']} mac direkt ortalaması)")
     lines.append(f"   TOPLAM xG = {(xg['home'] + xg['away']):.2f} gol\n")
-
+    
     lines.append("HESAPLAMA MANTIĞI:")
     lines.append("   1) PSS verilerinden DIREKT gol ortalamasi")
     lines.append("   2) Standings HİÇ kullanilmadi")
     lines.append("   3) H2H HİÇ kullanilmadi")
     lines.append("   4) Sadece SON FORM (PSS) baz alindi")
     lines.append("   5) %100 Temiz - Mukerrerlik YOK\n")
-
+    
     lines.append("BEKLENEN KORNERLER (Perplexity AI Yontemi - %100 PSS):")
     lines.append(f"   {t['home']} Korner: {corn['home']:.2f}")
     lines.append(f"   {t['away']} Korner: {corn['away']:.2f}")
     lines.append(f"   TOPLAM Korner = {(corn['home'] + corn['away']):.2f}\n")
-
+    
     lines.append("="*55)
     lines.append("B) POISSON OLASILILIKLARI")
     lines.append("="*55 + "\n")
-
+    
     def print_p(team, probs):
         lines.append(f"{team} Gol Olasılıkları:")
         lines.append(f"   P(0 gol) = {probs[0]*100:.1f}%")
@@ -857,43 +865,43 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
         lines.append(f"   P(2 gol) = {probs[2]*100:.1f}%")
         p3p = 1.0 - sum(probs[:3])
         lines.append(f"   P(3+ gol) = {p3p*100:.1f}%\n")
-
+    
     print_p(t['home'], pois['home_dist'])
     print_p(t['away'], pois['away_dist'])
-
+    
     p00 = pois['home_dist'][0] * pois['away_dist'][0]
     lines.append("OZEL: 0-0 SKOR OLASILIĞI:")
     lines.append(f"   P(0-0) = {p00*100:.1f}%")
     lines.append("   NOT: Dusuk olasilik ama her zaman mumkundur!\n")
-
+    
     lines.append("En Olası 7 Skor:")
     for i, (score, prob) in enumerate(pois['top_scores'], 1):
         lines.append(f"   {i}) {score} - %{prob*100:.1f}")
     lines.append("")
-
+    
     lines.append("="*55)
     lines.append("C) MARKET OLASILILIKLARI (GOL)")
     lines.append("="*55 + "\n")
-
+    
     m = market
     lines.append("Toplam Gol:")
     lines.append(f"   Ust 0.5: %{m['o05']*100:.1f} | Alt 0.5: %{(1-m['o05'])*100:.1f}")
     lines.append(f"   Ust 1.5: %{m['o15']*100:.1f} | Alt 1.5: %{(1-m['o15'])*100:.1f}")
     lines.append(f"   Ust 2.5: %{m['o25']*100:.1f} | Alt 2.5: %{(1-m['o25'])*100:.1f}")
     lines.append(f"   Ust 3.5: %{m['o35']*100:.1f} | Alt 3.5: %{(1-m['o35'])*100:.1f}\n")
-
+    
     lines.append("BTTS (Karsilıklı Gol):")
     lines.append(f"   Var: %{m['btts']*100:.1f} | Yok: %{(1-m['btts'])*100:.1f}\n")
-
+    
     lines.append("1X2 Olasılıkları:")
     lines.append(f"   Ev (1): %{m['1']*100:.1f}")
     lines.append(f"   Beraberlik (X): %{m['X']*100:.1f}")
     lines.append(f"   Deplasman (2): %{m['2']*100:.1f}\n")
-
+    
     lines.append("="*55)
     lines.append("D) MARKET OLASILILIKLARI (KORNER)")
     lines.append("="*55 + "\n")
-
+    
     mcorn = market_corn
     lines.append("Toplam Korner:")
     for k in [8.5, 9.5, 10.5, 11.5]:
@@ -901,19 +909,19 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
         prob = mcorn[key]
         lines.append(f"   Ust {k}: %{prob*100:.1f} | Alt {k}: %{(1-prob)*100:.1f}")
     lines.append("")
-
+    
     lines.append(f"{t['home']} Korner:")
     lines.append(f"   Ust 4.5: %{mcorn['home_o45']*100:.1f} | Alt 4.5: %{(1-mcorn['home_o45'])*100:.1f}")
     lines.append(f"   Ust 5.5: %{mcorn['home_o55']*100:.1f} | Alt 5.5: %{(1-mcorn['home_o55'])*100:.1f}\n")
-
+    
     lines.append(f"{t['away']} Korner:")
     lines.append(f"   Ust 4.5: %{mcorn['away_o45']*100:.1f} | Alt 4.5: %{(1-mcorn['away_o45'])*100:.1f}")
     lines.append(f"   Ust 5.5: %{mcorn['away_o55']*100:.1f} | Alt 5.5: %{(1-mcorn['away_o55'])*100:.1f}\n")
-
+    
     lines.append("="*55)
     lines.append(f"E) MONTE CARLO SIMULASYONU ({mc['total_sims']:,} KOSU)")
     lines.append("="*55 + "\n")
-
+    
     lines.append(f"Monte Carlo Sonuclari ({mc['total_sims']:,} simulasyon):\n")
     lines.append("Toplam Gol Dagilimi:")
     for i in range(6):
@@ -924,7 +932,7 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
     # 6+ gol hesabı (dağılım dictionarysinde 6 ve üstü keylerin toplamı)
     plus6 = sum(mc['dist_goals'][k] for k in mc['dist_goals'] if k >= 6)
     lines.append(f" 6+ gol: %{plus6/mc['total_sims']*100:.1f}\n")
-
+    
     lines.append("Market Sonuclari:")
     lines.append(f" Ust 2.5: %{mc['over25_pct']*100:.1f}")
     lines.append(f" Ust 3.5: %{mc['over35_pct']*100:.1f}")
@@ -932,16 +940,16 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
     lines.append(f" Ev (1): %{mc['1_pct']*100:.1f}")
     lines.append(f" Beraberlik (X): %{mc['X_pct']*100:.1f}")
     lines.append(f" Deplasman (2): %{mc['2_pct']*100:.1f}\n")
-
+    
     lines.append("En Sik Gorulen 10 Skor:")
     for i, (sc, cnt) in enumerate(mc['top_scores'], 1):
         lines.append(f" {i}) {sc} - %{cnt/mc['total_sims']*100:.1f}")
     lines.append("")
-
+    
     lines.append("="*55)
     lines.append(f"E-1) MONTE CARLO KORNER SIMULASYONU ({mc_corn['total_sims']:,} KOSU)")
     lines.append("="*55 + "\n")
-
+    
     lines.append("Toplam Korner Dagilimi:")
     for k in range(6, 16):
         cnt = mc_corn['dist_total'][k]
@@ -949,103 +957,103 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
         bar = "-" * int(pct * 50)
         lines.append(f" {k:02d} Korner: %{pct*100:.1f} {bar}")
     lines.append("")
-
+    
     lines.append("Korner Alt/Ust Olasiliklari:")
     for k in [7, 8, 9, 10, 11]:
         pct = mc_corn[f'over{k}5']
         lines.append(f" {k}.5 Ust: %{pct*100:.1f} | Alt: %{(1-pct)*100:.1f}")
     lines.append("")
-
+    
     lines.append("Korner Mac Sonucu:")
     lines.append(f" Ev Sahibi: %{mc_corn['home_more']*100:.1f}")
     lines.append(f" Beraberlik: %{mc_corn['draw']*100:.1f}")
     lines.append(f" Deplasman: %{mc_corn['away_more']*100:.1f}\n")
-
+    
     lines.append("En Sik Gorulen 5 Korner Skoru:")
     for i, (sc, cnt) in enumerate(mc_corn['top_scores'], 1):
         lines.append(f" {i}) {sc} - %{cnt/mc_corn['total_sims']*100:.1f}")
     lines.append("")
-
+    
     lines.append("="*55)
     lines.append("F) VALUE BET VE KELLY ANALIZI")
     lines.append("="*55 + "\n")
-
+    
     # Kelly & Value
     def calc_kelly(odds, prob):
         if odds <= 1: return 0.0
         k = ((odds - 1) * prob - (1 - prob)) / (odds - 1)
         return max(0.0, k * 0.25)
-
+    
     def check_val(odds, prob):
         val = (odds * prob) - 1
         return val, "TICK DEGER VAR" if val >= 0.05 else "CROSS"
-
+    
     probs_1x2 = [market['1'], market['X'], market['2']]
     labels_1x2 = ["Ev (1)", "Beraberlik (X)", "Deplasman (2)"]
-
+    
     lines.append("1X2 Marketleri:")
     has_value = False
     best_value = -1.0
-
+    
     for i in range(3):
         o = val['odds'][i]
         p = probs_1x2[i]
         v_score, v_txt = check_val(o, p)
         if v_score >= 0.05: has_value = True
         best_value = max(best_value, v_score)
-
+        
         lines.append(f"   {labels_1x2[i]}: Oran {o:.2f} | Olasilik %{p*100:.1f} | Value: {v_score*100:.1f}% {v_txt}")
         kelly = calc_kelly(o, p)
         if kelly > 0:
             lines.append(f"      Kelly: %{kelly*100:.1f} (maks %2-5 onerilir)")
     lines.append("")
-
+    
     lines.append("="*55)
     lines.append("G) NET SONUC VE ONERILER")
     lines.append("="*55 + "\n")
-
+    
     total_xg = xg['home'] + xg['away']
     tempo = "ORTA (Dengeli mac)"
     if total_xg < 2.3: tempo = "DUSUK (Savunmaci, kapali mac)"
     elif total_xg > 3.2: tempo = "YUKSEK (Hucum odakli, acik mac)"
-
+    
     lines.append("1) Beklenen Goller:")
     lines.append(f"   Lambda_home = {xg['home']:.2f} gol")
     lines.append(f"   Lambda_away = {xg['away']:.2f} gol")
     lines.append(f"   xG_toplam = {total_xg:.2f} gol\n")
-
+    
     lines.append(f"2) Mac Temposu: {tempo}\n")
-
+    
     lines.append("3) NET SKOR TAHMINI:")
     for i in range(3):
         sc, pr = pois['top_scores'][i]
         lines.append(f"   {i+1}. Tahmin: {sc} (%{pr*100:.1f})")
     lines.append("")
-
+    
     ou_conf = get_confidence(market['o25'] if market['o25'] > 0.5 else 1-market['o25'])
     ou_sel = "2.5 UST" if market['o25'] > 0.5 else "2.5 ALT"
     ou_pct = market['o25'] if market['o25'] > 0.5 else 1-market['o25']
     lines.append(f"4) NET ALT/UST: {ou_sel} (%{ou_pct*100:.1f}) - Guven: {ou_conf}\n")
-
+    
     btts_conf = get_confidence(market['btts'] if market['btts'] > 0.5 else 1-market['btts'])
     btts_sel = "KG VAR" if market['btts'] > 0.5 else "KG YOK"
     btts_pct = market['btts'] if market['btts'] > 0.5 else 1-market['btts']
     lines.append(f"5) NET BTTS: {btts_sel} (%{btts_pct*100:.1f}) - Guven: {btts_conf}\n")
-
+    
     lines.append("6) En Iyi 3 Bahis Adayi:")
     if has_value:
         lines.append("   (Yukaridaki Value bolumune bakiniz)")
     else:
         lines.append("   Value Bahis Bulunamadi")
     lines.append("")
-
+    
     decision = "TICK BAHIS OYNANABILIR" if has_value and max(probs_1x2) >= 0.5 else "CROSS BU MACA BAHIS OYNAMA"
     lines.append(f"7) SON KARAR: {decision}")
     if has_value:
         lines.append(f"   Gerekce: Value bet bulundu (+{best_value*100:.1f}%), model uyumu iyi")
     else:
         lines.append("   Gerekce: Yeterli value bulunamadi, oranlar modele gore dusuk, bekleme tavsiye edilir")
-
+    
     lines.append("\n" + "="*55)
     lines.append("ONEMLI HATIRLATMA!")
     lines.append("="*55)
@@ -1058,7 +1066,7 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
     lines.append("="*55)
     lines.append("ANALIZ TAMAMLANDI")
     lines.append("="*55)
-
+    
     return "\n".join(lines)
 
 # ============================================================================
@@ -1067,396 +1075,120 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
 
 def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
     """
-    [HATASIZ - BET365 INITIAL 1X2 ÇEKME (ASYA ORANLARINI ÇEKMEZ)]
-    NowGoal odds sayfası çoğu zaman JS ile doldurulur; HTML içinde '---' görürsün.
-    Bu yüzden doğru kaynak genelde Win007/NowGoal'un 1X2 veri dosyasıdır:
-        1x2d.* / {match_id}.js  -> game=Array("...|Bet365|2.20|3.10|3.25|...","...")
-
-    Bu fonksiyon sırasıyla:
-    1) Oddscomp HTML içinde gerçekten sayı varsa (nadir), eski hücre yöntemi ile dener.
-    2) Oddscomp HTML içinden {match_id}.js / 1x2d host linklerini keşfedip dener.
-    3) Bilinen mirror host listesi üzerinden {match_id}.js dener.
-    4) Bet365 satırını bulup INITIAL 1X2 (Ev-X-Dep) döner.
-       INITIAL yoksa (boş/0 vs) LIVE 1X2'yi (format uygunsa) fallback olarak döner.
-
-    Başarısız olursa: [1.0, 1.0, 1.0]
+    [BET365 JAVASCRIPT DATA MINER] - Chromium GEREKTİRMEZ!
+    
+    Mantık:
+    1. Render edilen tabloyu GÖREMİYORUZ.
+    2. Ama tabloyu dolduran 'JavaScript Verisi' (Aşçının tarifi) sayfanın içinde gömülü.
+    3. Biz direkt o yazıyı (Variable) okuyacağız.
+    4. "Bet365" kelimesini bulup, yanındaki sayıları cımbızla çekeceğiz.
     """
     try:
-        import json
-        from urllib.parse import urljoin, urlparse
+        url = f"{base_url}/oddscomp/{match_id}"
+        html = safe_get(url, referer=base_url)
+        
+        # 1. HTML taglerinden kurtul, saf metne odaklan (Veri javascript değişkeninde)
+        # Javascript değişkenleri genellikle satır sonu olmadan da yazılabilir, o yüzden düzleştiriyoruz.
+        flat_html = html.replace('\n', '').replace('\r', '').replace('\t', '')
 
-        oddscomp_url = f"{base_url}/oddscomp/{match_id}"
+        # 2. Bet365'i bul (Veri içinde '8' idsi veya 'Bet365' stringi geçer)
+        if "Bet365" not in flat_html and "bet365" not in flat_html:
+            return [1.0, 1.0, 1.0]
 
-        # --- küçük yardımcılar (sadece bu fonksiyon içinde) ---
-        def _norm_book(s: str) -> str:
-            return re.sub(r'\s+', '', (s or '').lower())
+        # 3. İlgili bloğu kesip al (Bet365'ten sonraki 500 karakteri incele)
+        parts = re.split(r'Bet365', flat_html, flags=re.IGNORECASE)
+        if len(parts) < 2: return [1.0, 1.0, 1.0]
+        
+        data_chunk = parts[1][:500] # Bet365'ten sonraki 500 karakter
 
-        def _ok_odd(x: float) -> bool:
-            # 1X2 odds mantığı: genelde 1.01 - 200 arası
-            return isinstance(x, (int, float)) and (x >= 1.01) and (x <= 200.0)
-
-        def _clean_float(s: str) -> Optional[float]:
-            if s is None:
-                return None
-            t = (s or "").strip()
-            if not t or t in ("-", "--", "---"):
-                return None
-            # virgül olursa noktaya çevir
-            t = t.replace(",", ".")
-            # içinden ilk float'ı çek
-            m = re.search(r'(\d+(?:\.\d+)?)', t)
-            if not m:
-                return None
+        # 4. Sayı Avcısı (Float veya Int)
+        # > ve < işaretleri arasına sıkışmış sayıları (HTML Render edilmişse)
+        # VEYA | veya , ile ayrılmış sayıları (JS raw data ise) bul.
+        # Bu regex her iki durumu da yakalar: (sayı.nokta.sayı)
+        
+        # Örnek JS Data: ...|2.50|3.20|2.50|...
+        # Örnek HTML: ...>2.50<...>3.20<...
+        
+        # Regex mantığı: Bir sayı (örn: 2.50) bul.
+        numbers = re.findall(r'(\d+\.\d{2})', data_chunk)
+        
+        if len(numbers) < 6:
+             # Eğer ondalıklı bulamazsa (örn: 3) tamsayıları da ara
+             numbers = re.findall(r'(\d+(?:\.\d+)?)', data_chunk)
+        
+        # BEKLENEN SIRALAMA (Genelde):
+        # 1. Asya Home
+        # 2. Asya Line (Sayı ise)
+        # 3. Asya Away
+        # 4. 1x2 Home (BİZİM HEDEF)
+        # 5. 1x2 Draw (BİZİM HEDEF)
+        # 6. 1x2 Away (BİZİM HEDEF)
+        
+        # Güvenlik Kontrolü: 1x2 oranları genelde 1.05'ten büyüktür. Asya oranları 0.80 olabilir.
+        valid_odds = []
+        for n in numbers:
             try:
-                return float(m.group(1))
-            except Exception:
-                return None
+                f = float(n)
+                # Tarih (2024), ID (281) gibi büyük sayılar veya çok küçük (0.5) handikaplar hariç
+                if 1.01 < f < 25.0: 
+                    valid_odds.append(f)
+            except:
+                continue
 
-        def _session_get_text(url: str, referer: Optional[str] = None, timeout: int = 20, retries: int = 2) -> Optional[str]:
-            last_err = None
-            headers = dict(HEADERS)
-            # JS endpointleri bazen Accept: */* ister
-            headers["Accept"] = "*/*"
-            headers["Cache-Control"] = "no-cache"
-            headers["Pragma"] = "no-cache"
-            if referer:
-                headers["Referer"] = referer
-            try:
-                headers["Host"] = urlparse(url).netloc
-            except Exception:
-                pass
+        # Elimizde mantıklı oranlar kaldı. Genelde Asya oranları başta olur.
+        # Bizim aradığımız 1x2 oranları genellikle listedeki 3., 4. ve 5. sırada gelir (Asya varsa).
+        # Eğer Asya yoksa 0, 1, 2 olabilir.
+        
+        # NowGoal "Initial" verisi genelde 6'lı settir: [AH, AH, AH, 1, X, 2]
+        if len(valid_odds) >= 6:
+            o1 = valid_odds[3]
+            oX = valid_odds[4]
+            o2 = valid_odds[5]
+            log_info(f"Bet365 JS Verisi (Full Mod): {o1} - {oX} - {o2}")
+            return [o1, oX, o2]
+            
+        elif len(valid_odds) >= 3:
+            # Belki sadece 1x2 vardır? (Riskli ama varsayılandan iyidir)
+            o1 = valid_odds[0]
+            oX = valid_odds[1]
+            o2 = valid_odds[2]
+            log_info(f"Bet365 JS Verisi (Kısa Mod): {o1} - {oX} - {o2}")
+            return [o1, oX, o2]
 
-            for attempt in range(retries + 1):
-                try:
-                    log_info(f"Fetching (odds-data) {url} (attempt {attempt + 1})")
-                    r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
-                    if r.status_code >= 400:
-                        last_err = RuntimeError(f"HTTP {r.status_code}")
-                        continue
-                    r.encoding = r.apparent_encoding
-                    txt = r.text or ""
-                    if len(txt.strip()) < 20:
-                        last_err = RuntimeError("Empty/too short response")
-                        continue
-                    return txt
-                except requests.exceptions.Timeout as e:
-                    last_err = e
-                    if attempt < retries:
-                        time.sleep(0.4)
-                except Exception as e:
-                    last_err = e
-                    if attempt < retries:
-                        time.sleep(0.6)
-
-            if last_err:
-                log_error(f"Odds-data fetch failed: {url} - {last_err}")
-            return None
-
-        def _parse_bet365_initial_from_html(html: str) -> Optional[List[float]]:
-            """
-            HTML gerçekten odds içeriyorsa (bazı mirror’larda olabiliyor) Bet365 -> Initial satırından
-            1X2 (Ev-X-Dep) hücrelerini alır. Asya hücreleri otomatik atlanır.
-            """
-            if not html:
-                return None
-
-            low = html.lower()
-            bet_pos = low.find("bet365")
-            if bet_pos == -1:
-                bet_pos = low.find("bet 365")
-            if bet_pos == -1:
-                return None
-
-            # Bet365 etrafındaki daha geniş bir parça al
-            chunk = html[bet_pos: bet_pos + 8000]
-
-            # Initial satırını bul (Bet365 satırında bazen 2 satır olur)
-            ini_pos = chunk.lower().find("initial")
-            if ini_pos == -1:
-                return None
-
-            sub = chunk[ini_pos: ini_pos + 6000]
-            # td içeriklerini sırayla çek
-            cells = re.findall(r'<td[^>]*>(.*?)</td>', sub, re.DOTALL | re.IGNORECASE)
-            if len(cells) < 6:
-                return None
-
-            def clean_val(val):
-                v = re.sub(r'<.*?>', '', val).strip()
-                m = re.search(r'(\d+\.\d{1,2})', v)
-                return float(m.group(1)) if m else None
-
-            # Görseldeki gibi: [0]=AsianHome, [1]=AsianHdp, [2]=AsianAway, [3]=1x2Home, [4]=Draw, [5]=Away
-            o1 = clean_val(cells[3])
-            oX = clean_val(cells[4])
-            o2 = clean_val(cells[5])
-
-            if o1 and oX and o2 and _ok_odd(o1) and _ok_odd(oX) and _ok_odd(o2):
-                return [o1, oX, o2]
-            return None
-
-        def _extract_game_array_strings(js_text: str) -> List[str]:
-            """
-            1x2d*.js içinden satır stringlerini çıkartır.
-            Destek:
-              - game=Array("...","...");
-              - var game=new Array("...","...");
-              - game[0]="..."; game[1]="...";
-              - game.push("...");
-            """
-            if not js_text:
-                return []
-
-            # 1) game=Array(...)
-            m = re.search(r'game\s*=\s*(?:new\s+)?Array\s*\((.*?)\)\s*;?', js_text, flags=re.IGNORECASE | re.DOTALL)
-            if m:
-                inner = (m.group(1) or "").strip()
-                inner = re.sub(r',\s*$', '', inner)  # sonda virgül varsa temizle
-                if inner:
-                    try:
-                        arr = json.loads('[' + inner + ']')
-                        # bazen js dosyası bytes gibi gelebilir ama json list of str bekliyoruz
-                        return [x for x in arr if isinstance(x, str)]
-                    except Exception:
-                        # JSON parse olmadıysa en azından quoted stringleri yakala (kaçışları basitçe çöz)
-                        raw = re.findall(r'"((?:\\.|[^"\\])*)"', inner, flags=re.DOTALL)
-                        out = []
-                        for s in raw:
-                            try:
-                                out.append(bytes(s, "utf-8").decode("unicode_escape"))
-                            except Exception:
-                                out.append(s)
-                        return out
-
-            # 2) game[index]="..."
-            arr2 = re.findall(r'game\[\d+\]\s*=\s*"((?:\\.|[^"\\])*)"', js_text, flags=re.IGNORECASE | re.DOTALL)
-            if arr2:
-                out = []
-                for s in arr2:
-                    try:
-                        out.append(bytes(s, "utf-8").decode("unicode_escape"))
-                    except Exception:
-                        out.append(s)
-                return out
-
-            # 3) game.push("...")
-            arr3 = re.findall(r'game\.push\(\s*"((?:\\.|[^"\\])*)"\s*\)', js_text, flags=re.IGNORECASE | re.DOTALL)
-            if arr3:
-                out = []
-                for s in arr3:
-                    try:
-                        out.append(bytes(s, "utf-8").decode("unicode_escape"))
-                    except Exception:
-                        out.append(s)
-                return out
-
-            return []
-
-        def _parse_bet365_from_1x2_js(js_text: str) -> Optional[List[float]]:
-            """
-            1x2d js formatından Bet365 INITIAL 1X2 odds döndürür.
-            Format örneği (StackOverflow’da da aynı):
-              ['281','...','Bet 365','2.75','3.3','2.5', ... ,'2.3','3.4','3.4', ...]
-            Burada genelde:
-              index 3,4,5 -> INITIAL 1X2
-              index 10,11,12 -> LIVE 1X2 (varsa)
-            Ama yine de daha sağlam olsun diye:
-              - İlk 6 field içinde Bet365 geçen field'ı bulur
-              - Hemen sonraki 3 field'ı INITIAL diye dener
-              - Olmazsa 10/11/12 LIVE diye dener
-            """
-            rows = _extract_game_array_strings(js_text)
-            if not rows:
-                return None
-
-            for row in rows:
-                parts = row.split('|')
-                if len(parts) < 6:
-                    continue
-
-                # Bet365 adı genelde ilk 6 alan içinde olur (companyName)
-                bet_idx = None
-                for i in range(min(6, len(parts))):
-                    if 'bet365' in _norm_book(parts[i]) or _norm_book(parts[i]) == 'bet365':
-                        bet_idx = i
-                        break
-
-                if bet_idx is None:
-                    # bazı dosyalarda companyName index 2'dir; ama yukarı zaten yakalar.
-                    continue
-
-                # 1) INITIAL: bet_idx'ten sonraki 3 alan
-                if len(parts) >= bet_idx + 4:
-                    o1 = _clean_float(parts[bet_idx + 1])
-                    oX = _clean_float(parts[bet_idx + 2])
-                    o2 = _clean_float(parts[bet_idx + 3])
-                    if o1 is not None and oX is not None and o2 is not None and _ok_odd(o1) and _ok_odd(oX) and _ok_odd(o2):
-                        return [o1, oX, o2]
-
-                # 2) LIVE fallback (format uygunsa)
-                if len(parts) >= 13:
-                    o1 = _clean_float(parts[10])
-                    oX = _clean_float(parts[11])
-                    o2 = _clean_float(parts[12])
-                    if o1 is not None and oX is not None and o2 is not None and _ok_odd(o1) and _ok_odd(oX) and _ok_odd(o2):
-                        return [o1, oX, o2]
-
-            return None
-
-        # =========================================================================
-        # 1) Oddscomp HTML'de gerçekten odds varsa (bazı mirror'lar) direkt çek
-        # =========================================================================
-        try:
-            html = safe_get(oddscomp_url, referer=base_url)
-            parsed = _parse_bet365_initial_from_html(html)
-            if parsed:
-                log_info(f"Oranlar HTML'den çekildi (Bet365 Initial 1X2): {parsed}")
-                return parsed
-        except Exception as e:
-            log_error(f"Oddscomp HTML parse denemesi hata: {e}")
-
-        # =========================================================================
-        # 2) Oddscomp HTML içinden {match_id}.js / 1x2d linklerini keşfet ve dene
-        # =========================================================================
-        discovered_urls: List[str] = []
-        try:
-            html = safe_get(oddscomp_url, referer=base_url)
-            # {match_id}.js geçen mutlak URL'ler
-            abs_js = re.findall(r'(https?://[^\s"\'<>]+%s[^\s"\'<>]*\.js[^\s"\'<>]*)' % re.escape(match_id), html, flags=re.IGNORECASE)
-            # {match_id}.js geçen relative URL'ler
-            rel_js = re.findall(r'["\'](/[^"\']+%s[^"\']*\.js[^"\']*)["\']' % re.escape(match_id), html, flags=re.IGNORECASE)
-
-            for u in abs_js:
-                discovered_urls.append(u)
-            for u in rel_js:
-                discovered_urls.append(urljoin(base_url, u))
-
-            # HTML içinde 1x2d host geçiyorsa (id içermese bile) host'u yakalayıp {id}.js üret
-            host_hits = re.findall(r'(https?://[^"\']*1x2d[^"\']*/)', html, flags=re.IGNORECASE)
-            for h in host_hits:
-                discovered_urls.append(urljoin(h, f"{match_id}.js"))
-
-            # Benzersizleştir
-            uniq = []
-            seen = set()
-            for u in discovered_urls:
-                if u in seen:
-                    continue
-                seen.add(u)
-                uniq.append(u)
-            discovered_urls = uniq
-
-            # Dene
-            for u in discovered_urls:
-                js = _session_get_text(u, referer=oddscomp_url)
-                if not js:
-                    continue
-                parsed = _parse_bet365_from_1x2_js(js)
-                if parsed:
-                    log_info(f"Oranlar keşfedilen JS'den çekildi (Bet365 1X2): {parsed} | src={u}")
-                    return parsed
-        except Exception as e:
-            log_error(f"Odds JS keşif denemesi hata: {e}")
-
-        # =========================================================================
-        # 3) Bilinen mirror host listesi ile 1x2d*.js dene (KESİN KAYNAK)
-        # =========================================================================
-        try:
-            # base_url hostundan root domain türet: live4.nowgoal26.com -> nowgoal26.com
-            host = ""
-            try:
-                host = urlparse(base_url).netloc
-            except Exception:
-                host = base_url.replace("https://", "").replace("http://", "").split("/")[0]
-
-            parts = host.split(".")
-            root2 = ".".join(parts[-2:]) if len(parts) >= 2 else host  # nowgoal26.com gibi
-
-            candidate_hosts = []
-            # Kullanıcının domain kökü üzerinden olası 1x2d mirror:
-            candidate_hosts.append(f"1x2d.{root2}")     # 1x2d.nowgoal26.com
-            candidate_hosts.append(f"1x2d.{host}")      # 1x2d.live4.nowgoal26.com (nadir ama dursun)
-
-            # Bilinen klasik kaynaklar:
-            candidate_hosts.extend([
-                "1x2d.win007.com",
-                "1x2d.nowgoal.com",
-                "1x2d.nowgoal.net",
-            ])
-
-            # Benzersizleştir
-            seen_h = set()
-            cand_h2 = []
-            for h in candidate_hosts:
-                h = (h or "").strip()
-                if not h:
-                    continue
-                if h in seen_h:
-                    continue
-                seen_h.add(h)
-                cand_h2.append(h)
-            candidate_hosts = cand_h2
-
-            candidate_urls = []
-            # js bazen direkt kökte, bazen /odds/ altında olur.
-            for h in candidate_hosts:
-                candidate_urls.append(f"http://{h}/{match_id}.js")
-                candidate_urls.append(f"https://{h}/{match_id}.js")
-                candidate_urls.append(f"http://{h}/odds/{match_id}.js")
-                candidate_urls.append(f"https://{h}/odds/{match_id}.js")
-
-            # cache-buster (bazı CDN'lerde faydalı)
-            ts = int(time.time())
-            candidate_urls.extend([u + f"?t={ts}" for u in list(candidate_urls)])
-
-            # Deneme
-            for u in candidate_urls:
-                js = _session_get_text(u, referer=oddscomp_url)
-                if not js:
-                    continue
-                parsed = _parse_bet365_from_1x2_js(js)
-                if parsed:
-                    log_info(f"Oranlar mirror JS'den çekildi (Bet365 1X2): {parsed} | src={u}")
-                    return parsed
-
-        except Exception as e:
-            log_error(f"Mirror odds denemesi hata: {e}")
-
-        log_error("Bet365 Initial 1X2 oranları çekilemedi (tüm yöntemler denendi).")
         return [1.0, 1.0, 1.0]
 
     except Exception as e:
-        log_error(f"Oran çekme hatası (Bet365 Initial 1X2): {e}")
+        log_error(f"Oran çekme hatası (JS Madenciliği): {e}")
         return [1.0, 1.0, 1.0]
 
 def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict[str, Any]:
     log_info(f"Starting PSS analysis for: {url}")
-
+    
     match_id = extract_match_id(url)
     base_domain = extract_base_domain(url)
 
     # 1. SCRAPING
     h2h_url = build_h2h_url(url)
     html = safe_get(h2h_url, referer=extract_base_domain(url))
-
+    
     home_team, away_team = parse_teams_from_title(html)
-
+    
     # H2H ve İstatistikler
     h2h_matches = extract_h2h_matches(html, home_team, away_team)
     raw_home_list, raw_away_list = extract_previous_from_page(html)
-
+    
     # Filtering
     prev_home_list = filter_team_home_only(raw_home_list, home_team)[:RECENT_N]
     prev_away_list = filter_team_away_only(raw_away_list, away_team)[:RECENT_N]
-
-    st_count_h = 0
+    
+    st_count_h = 0 
     st_count_a = 0
-    if "Standings" in html: st_count_h = 10; st_count_a = 10
-
+    if "Standings" in html: st_count_h = 10; st_count_a = 10 
+    
     # === [GÜNCELLENDİ] ORAN ÇEKME ===
-    # Bet365 -> Initial -> 1X2 (Ev-X-Dep) çeker, Asya oranlarını çekmez
+    # Görseldeki tablo yapısına (Bet365 -> Initial -> Skip Asian -> Get 1x2) göre çeker
     scraped_odds = fetch_real_odds(match_id, base_domain)
-
+    
     if scraped_odds and scraped_odds != [1.0, 1.0, 1.0]:
         odds = scraped_odds
     elif manual_odds and len(manual_odds) >= 3:
@@ -1469,26 +1201,26 @@ def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict
     # 2. HESAPLAMALAR
     lam_home = calculate_weighted_pss_goals(prev_home_list, home_team, True)
     lam_away = calculate_weighted_pss_goals(prev_away_list, away_team, False)
-
+    
     h_won, h_conceded = calculate_weighted_pss_corners(prev_home_list, home_team, True)
     a_won, a_conceded = calculate_weighted_pss_corners(prev_away_list, away_team, False)
-
+    
     lam_corn_h = (h_won + a_conceded) / 2.0
     lam_corn_a = (a_won + h_conceded) / 2.0
-
+    
     if lam_corn_h <= 0: lam_corn_h = 4.0
     if lam_corn_a <= 0: lam_corn_a = 3.5
-
+    
     # Poisson
     h_dist = [poisson_pmf(lam_home, i) for i in range(6)]
     a_dist = [poisson_pmf(lam_away, i) for i in range(6)]
-
+    
     scores = []
     for h in range(6):
         for a in range(6):
             scores.append((f"{h}-{a}", h_dist[h] * a_dist[a]))
     scores.sort(key=lambda x: x[1], reverse=True)
-
+    
     # Market Goals
     m_goals = {'o05': 0, 'o15': 0, 'o25': 0, 'o35': 0, 'btts': 0, '1': 0, 'X': 0, '2': 0}
     for h in range(6):
@@ -1503,15 +1235,15 @@ def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict
             if h > a: m_goals['1'] += prob
             elif h == a: m_goals['X'] += prob
             else: m_goals['2'] += prob
-
+            
     # Market Corners
     h_corn_dist_trunc = [poisson_pmf(lam_corn_h, i) for i in range(11)]
     a_corn_dist_trunc = [poisson_pmf(lam_corn_a, i) for i in range(11)]
-
-    m_corn = {'o85': 0, 'o95': 0, 'o105': 0, 'o115': 0,
+    
+    m_corn = {'o85': 0, 'o95': 0, 'o105': 0, 'o115': 0, 
               'home_o45': 0, 'home_o55': 0, 'away_o45': 0, 'away_o55': 0}
-
-    for h in range(11):
+              
+    for h in range(11): 
         for a in range(11):
             prob = h_corn_dist_trunc[h] * a_corn_dist_trunc[a]
             tot = h + a
@@ -1519,16 +1251,16 @@ def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict
             if tot > 9: m_corn['o95'] += prob
             if tot > 10: m_corn['o105'] += prob
             if tot > 11: m_corn['o115'] += prob
-
+            
     m_corn['home_o45'] = sum(h_corn_dist_trunc[5:])
     m_corn['home_o55'] = sum(h_corn_dist_trunc[6:])
     m_corn['away_o45'] = sum(a_corn_dist_trunc[5:])
     m_corn['away_o55'] = sum(a_corn_dist_trunc[6:])
-
+    
     # Simulations
     mc_goals = monte_carlo_simulation_vba(lam_home, lam_away, MC_RUNS_DEFAULT)
     mc_corners = monte_carlo_corners_vba(lam_corn_h, lam_corn_a, MC_RUNS_DEFAULT)
-
+    
     full_data = {
         'teams': {'home': home_team, 'away': away_team},
         'counts': {
@@ -1550,9 +1282,9 @@ def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict
         'mc_corners': mc_corners,
         'value': {'odds': odds}
     }
-
+    
     report_text = generate_vba_report(full_data)
-
+    
     return {
         "ok": True,
         "report": report_text,
@@ -1582,7 +1314,7 @@ def health():
 def analizet_route():
     request_start = time.time()
     log_info("=== REQUEST STARTED: /analiz_et ===")
-
+    
     try:
         try:
             payload = request.get_json(silent=True) or {}
@@ -1590,30 +1322,30 @@ def analizet_route():
         except Exception as e:
             log_error("JSON parse failed", e)
             return jsonify({"ok": False, "error": f"JSON hatası: {e}"}), 400
-
+        
         url = (payload.get("url") or '').strip()
         odds = payload.get("odds", [2.50, 3.20, 2.50])
-
+        
         if not url:
             log_error("URL is empty")
             return jsonify({"ok": False, "error": "URL boş"}), 400
-
+        
         if not re.match(r'https?://', url):
             log_error(f"Invalid URL: {url}")
             return jsonify({"ok": False, "error": "Geçersiz URL"}), 400
-
+        
         log_info(f"Analyzing: {url}")
-
+        
         try:
             result = analyze_nowgoal(url, odds)
             elapsed = time.time() - request_start
             log_info(f"Analysis OK in {elapsed:.2f}s")
-
+            
             data = result['raw_data']
             top_skor = data['poisson']['top_scores'][0]
             m = data['market_goals']
             corn = data['corners']
-
+            
             response = {
                 "ok": True,
                 "skor": f"{top_skor[0]}: {top_skor[1]*100:.1f}%",
@@ -1627,16 +1359,16 @@ def analizet_route():
                 "detay": result['report'],
                 "sure": f"{elapsed:.2f}s"
             }
-
+            
             return jsonify(response)
-
+            
         except requests.exceptions.Timeout as e:
             log_error("Timeout", e)
             return jsonify({"ok": False, "error": "Zaman aşımı", "detail": str(e)}), 504
         except Exception as e:
             log_error("Analysis failed", e)
             return jsonify({"ok": False, "error": f"Analiz hatası: {str(e)}", "traceback": traceback.format_exc()}), 500
-
+            
     except Exception as e:
         log_error("Unhandled exception", e)
         return jsonify({"ok": False, "error": f"Beklenmeyen hata: {str(e)}"}), 500
@@ -1645,7 +1377,7 @@ if __name__ == "__main__":
     log_info("=" * 70)
     log_info("NowGoal Analyzer ULTIMATE EXACT REPLICA VERSION (LOOP) - COMPLETE")
     log_info("=" * 70)
-
+    
     if len(sys.argv) > 1 and sys.argv[1] == "serve":
         log_info("Starting Flask server on 0.0.0.0:5000...")
         app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
