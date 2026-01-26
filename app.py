@@ -29,10 +29,11 @@ RECENT_N = 10  # PSS analizinde dikkate alınacak maksimum maç sayısı
 H2H_N = 10     # H2H için çekilecek maç sayısı
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept-Language": "en-US,en;q=0.9,tr;q=0.8",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 # ============================================================================
@@ -1067,55 +1068,70 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
 
 def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
     """
-    [BET365 INITIAL 1X2 ONLY REPLICA]
+    [BET365 INITIAL 1X2 ROBUST PARSER]
     
-    Logic:
-    1. Find 'Bet365' row.
-    2. Find 'Initial' inside/after that row.
-    3. Skip the first 3 numeric cells (Asian Odds).
-    4. Grab the next 3 numeric cells (1x2 Odds).
+    Mantık:
+    1. HTML'de 'Bet365' satırını bul.
+    2. Hemen altındaki 'Initial' satırına git.
+    3. O satırdaki TÜM hücrelerin (td) içindeki yazıları temizleyip bir listeye at.
+    4. Bu listedeki 3., 4. ve 5. sıradaki SAYISAL değerleri al.
+       (Çünkü ilk 3 değer Asya Handikap, sonraki 3 değer 1x2 Oranlarıdır)
     """
     try:
         url = f"{base_url}/oddscomp/{match_id}"
         html = safe_get(url, referer=base_url)
         
-        # 1. Bet365'i bul ve sonrasını al
+        # 1. Bet365'i bul
         if "Bet365" not in html and "bet365" not in html:
             return [1.0, 1.0, 1.0]
 
+        # Bet365'ten sonrasını kes al
         parts = re.split(r'Bet365', html, flags=re.IGNORECASE)
         if len(parts) < 2: return [1.0, 1.0, 1.0]
-        
-        after_bet365 = parts[1]
+        chunk = parts[1]
 
-        # 2. "Initial" kelimesini bul ve sonrasını al
-        initial_split = re.split(r'>\s*Initial\s*<', after_bet365, flags=re.IGNORECASE)
+        # 2. 'Initial' kelimesini bul ve sonrasını al
+        initial_split = re.split(r'Initial', chunk, flags=re.IGNORECASE)
         if len(initial_split) < 2:
             return [1.0, 1.0, 1.0]
         
-        # 3. Initial'dan sonraki hücreleri (td) topla
-        odds_chunk = initial_split[1]
-        cells = re.findall(r'<td[^>]*>(.*?)</td>', odds_chunk, re.IGNORECASE | re.DOTALL)
+        # Sadece ilgili satırı (row) veya yakın bloğu alalım (2000 karakter yeterli)
+        row_chunk = initial_split[1][:2000]
+
+        # 3. Tüm TD hücrelerini regex ile ayıkla
+        # Regex açıklaması: <td...>(içinde ne varsa)</td>
+        # DOTALL modu açık, yani satır sonlarını da okur.
+        td_cells = re.findall(r'<td[^>]*>(.*?)</td>', row_chunk, re.IGNORECASE | re.DOTALL)
         
-        # HÜCRE SIRALAMASI (GÖRSELE GÖRE):
-        # [0] Asian Home
-        # [1] Asian Line (HDP)
-        # [2] Asian Away
-        # [3] 1X2 HOME  <-- HEDEF
-        # [4] 1X2 DRAW  <-- HEDEF
-        # [5] 1X2 AWAY  <-- HEDEF
-        
-        if len(cells) < 6:
-            return [1.0, 1.0, 1.0]
+        cleaned_values = []
+        for cell in td_cells:
+            # HTML taglerinden temizle (<span>, <b> vs sil)
+            text = re.sub(r'<[^>]+>', '', cell).strip()
+            if not text: continue
             
-        def extract_float(txt):
-            txt = re.sub(r'<[^>]+>', '', txt).strip() # HTML tagleri temizle
-            m = re.search(r'(\d+\.\d{2})', txt)       # Sayıyı bul
+            # Sadece sayısal değer mi kontrol et (örn: 2.20 veya 0/0.5 gibi)
+            # Ama biz sadece 1x2 arıyoruz, onlar float görünümlü (2.20)
+            if re.search(r'\d', text):
+                cleaned_values.append(text)
+        
+        # LİSTE YAPISI (Beklenen):
+        # 0: Asya Home (örn: 0.95)
+        # 1: Asya HDP  (örn: 0/0.5) -> Bu bazen sayı, bazen yazı olabilir
+        # 2: Asya Away (örn: 0.90)
+        # 3: 1X2 HOME  <-- HEDEF
+        # 4: 1X2 DRAW  <-- HEDEF
+        # 5: 1X2 AWAY  <-- HEDEF
+        
+        if len(cleaned_values) < 6:
+             return [1.0, 1.0, 1.0]
+
+        def parse_float(val):
+            m = re.search(r'(\d+\.\d{2})', val)
             return float(m.group(1)) if m else 0.0
 
-        o1 = extract_float(cells[3]) # Ev Sahibi 1x2
-        oX = extract_float(cells[4]) # Beraberlik 1x2
-        o2 = extract_float(cells[5]) # Deplasman 1x2
+        o1 = parse_float(cleaned_values[3])
+        oX = parse_float(cleaned_values[4])
+        o2 = parse_float(cleaned_values[5])
 
         if o1 > 1.0 and oX > 1.0 and o2 > 1.0:
             log_info(f"Bet365 Initial 1x2 Bulundu: {o1} - {oX} - {o2}")
@@ -1124,7 +1140,7 @@ def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
         return [1.0, 1.0, 1.0]
 
     except Exception as e:
-        log_error(f"Oran çekme hatası (Bet365 Initial): {e}")
+        log_error(f"Oran çekme hatası (Yeni Mantık): {e}")
         return [1.0, 1.0, 1.0]
 
 def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict[str, Any]:
