@@ -1067,377 +1067,90 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
 
 def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
     """
-    [KESİN ÇÖZÜM - BET365 INITIAL 1X2]
-    ÖNEMLİ: OddsComp sayfasının HTML'inde çoğu zaman '---' placeholder var (JS ile yükleniyor).
-    Bu yüzden "Bet365 Initial 1x2" oranlarını en sağlam şekilde, Win007/NowGoal'un 1X2 JS feed'inden çekeriz.
-
-    Ana Kaynak (en stabil):
-      - http(s)://1x2d.win007.com/{match_id}.js  (ve alternatif hostlar)
-        JS formatı genelde: game=Array("...|Bet 365|o1|ox|o2|...","...");
-
-    Ek Sağlamlık (Render/Server DNS sorunu için):
-      - Sistem DNS başarısız olursa DoH (DNS over HTTPS) ile IP çözümleme
-      - IP ile bağlanıp Host header override + verify=False ile TLS/SNI sorunlarına dayanıklılık
-
-    Fallback:
-      - Eğer oddscomp HTML içinde gerçekten sayı varsa (bazı sayfalarda olabilir), oradan da dener.
+    [KESİN ÇÖZÜM - HÜCRE SAYMA YÖNTEMİ]
+    Bet365 > Initial satırını bulur.
+    Sonrasındaki <td> etiketlerini sırayla okur.
+    İlk 3 hücre (Asian Handicap) -> ATLA.
+    Sonraki 3 hücre (1X2) -> AL.
+    Regex hatasına düşmez, sırayla hücre sayar.
     """
     try:
-        import socket
-        from urllib.parse import urlsplit, urlunsplit
+        url = f"{base_url}/oddscomp/{match_id}"
+        html = safe_get(url, referer=base_url)
+        
+        # 1. Bet365 ve Initial kelimelerinin geçtiği yeri bul
+        # HTML içinde arama yaparken büyük/küçük harf duyarsız yapalım
+        content_lower = html.lower()
+        start_pos = content_lower.find("bet365")
+        
+        if start_pos == -1:
+            log_error("Bet365 satırı bulunamadı.")
+            return [1.0, 1.0, 1.0]
+            
+        # Bet365'ten sonra gelen "Initial" kelimesini bul
+        initial_pos = content_lower.find("initial", start_pos)
+        
+        if initial_pos == -1:
+            log_error("Bet365 içinde Initial satırı bulunamadı.")
+            return [1.0, 1.0, 1.0]
+            
+        # 2. "Initial" kelimesinden sonraki HTML parçasını al (yaklaşık 2000 karakter yeterli)
+        chunk = html[initial_pos : initial_pos + 2000]
+        
+        # 3. HTML Parçasını hücrelere (td) böl
+        # Regex: <td...>(içerik)</td> yapısını yakalar
+        # Non-greedy (.*?) kullanarak hücre içeriklerini tek tek alırız.
+        cells = re.findall(r'<td[^>]*>(.*?)</td>', chunk, re.DOTALL | re.IGNORECASE)
+        
+        # Tablo Yapısı:
+        # Index 0: Asian Home   (Atla)
+        # Index 1: Asian Hdp    (Atla - Burası 0.5/1 gibi olabilir, regex'i bozan yer burasıydı)
+        # Index 2: Asian Away   (Atla)
+        # Index 3: 1X2 HOME     (AL) --> Hedef 1
+        # Index 4: 1X2 DRAW     (AL) --> Hedef 2
+        # Index 5: 1X2 AWAY     (AL) --> Hedef 3
+        
+        if len(cells) < 6:
+            log_error("Yeterli hücre verisi okunamadı.")
+            return [1.0, 1.0, 1.0]
+            
+        # 4. Verileri Temizle ve Çek
+        def clean_val(val):
+            # HTML taglerini temizle, boşlukları sil
+            v = re.sub(r'<.*?>', '', val).strip()
+            # Sadece sayı ve nokta kalsın
+            match = re.search(r'(\d+\.\d{2})', v)
+            return float(match.group(1)) if match else 1.0
 
-        # -----------------------------
-        # 1) OddsComp HTML (Sadece görünür textten, attribute'lardan ASLA sayı çekme!)
-        # -----------------------------
-        def _parse_bet365_initial_from_oddscomp_html_visible(html: str) -> Optional[List[float]]:
-            if not html:
-                return None
+        o1 = clean_val(cells[3]) # Ev
+        oX = clean_val(cells[4]) # Beraberlik
+        o2 = clean_val(cells[5]) # Deplasman
+        
+        # Sağlama: Oranlar mantıklı mı?
+        if o1 > 1.0 and oX > 1.0 and o2 > 1.0:
+            log_info(f"Oranlar Başarıyla Çekildi (Hücre Yöntemi): {o1} - {oX} - {o2}")
+            return [o1, oX, o2]
+            
+        # Eğer Bet365 verisi bozuksa, Average (Ortalama) verisine de aynı yöntemle bakalım
+        # (Yedek Plan)
+        avg_pos = content_lower.find("average") 
+        if avg_pos != -1:
+             initial_avg = content_lower.find("initial", avg_pos)
+             if initial_avg != -1:
+                 chunk_avg = html[initial_avg : initial_avg + 2000]
+                 cells_avg = re.findall(r'<td[^>]*>(.*?)</td>', chunk_avg, re.DOTALL | re.IGNORECASE)
+                 if len(cells_avg) >= 6:
+                     o1 = clean_val(cells_avg[3])
+                     oX = clean_val(cells_avg[4])
+                     o2 = clean_val(cells_avg[5])
+                     if o1 > 1.0:
+                         log_info(f"Yedek: Ortalama Oranlar Çekildi: {o1} - {oX} - {o2}")
+                         return [o1, oX, o2]
 
-            def _pick_float_from_visible_text(cell_html: str) -> Optional[float]:
-                txt = strip_tags_keep_text(cell_html or '')
-                if not txt:
-                    return None
-                if txt.strip() in ('---', '-', ''):
-                    return None
-                # odds tipik 1.01 - 100 aralığında olur
-                # sadece text içinden sayı çekiyoruz
-                m = re.search(r'(?<!\d)(\d{1,3}(?:\.\d{1,2})?)(?!\d)', txt)
-                if not m:
-                    return None
-                try:
-                    v = float(m.group(1))
-                except Exception:
-                    return None
-                if 1.01 <= v <= 100.0:
-                    return v
-                return None
-
-            trs = re.findall(r'<tr[^>]*>.*?</tr>', html, flags=re.IGNORECASE | re.DOTALL)
-            for tr in trs:
-                low = tr.lower()
-                if "bet365" not in low:
-                    continue
-                if "initial" not in low:
-                    continue
-
-                tds = re.findall(r'<td[^>]*>.*?</td>', tr, flags=re.IGNORECASE | re.DOTALL)
-                if not tds or len(tds) < 6:
-                    continue
-
-                # Bu tablo yapısı farklılaşabiliyor. "1X2 Odds" bölümündeki 3 hücreyi hedeflemek için:
-                # - Önce hücrelerin VISIBLE text'lerini çıkar
-                td_texts = [strip_tags_keep_text(x) for x in tds]
-
-                # "HW" "D" "AW" gibi başlıklar yoksa bile
-                # Bet365 satırında genelde sıralama: [Company][Asian 3 hücre][1x2 3 hücre][OU 3 hücre]...
-                # Bu yüzden: görünür odds bulabildiğimiz ilk üç uygun float'ı, Asian tarafı atlayarak almaya çalışacağız.
-                floats: List[float] = []
-                for cell in tds:
-                    v = _pick_float_from_visible_text(cell)
-                    if v is not None:
-                        floats.append(v)
-
-                # Eğer satırda hiç odds yoksa zaten '---' demektir
-                if len(floats) < 3:
-                    continue
-
-                # Eğer satırda çok sayı varsa, 1X2 için genelde "3 ardışık" odds bulunur.
-                # En güvenlisi: 1X2 odds (3'lü) genellikle birbirine yakın ölçek (1.2-15) ve 3 adet.
-                # Biz ilk uygun 3'ü değil, "3'lünün aynı aralıkta" olanını seçelim.
-                best = None
-                for i in range(0, len(floats) - 2):
-                    a, b, c = floats[i], floats[i + 1], floats[i + 2]
-                    if 1.01 <= a <= 100 and 1.01 <= b <= 100 and 1.01 <= c <= 100:
-                        # Çok bariz yanlış "7,7,7" gibi eşitlikleri ele
-                        if abs(a - b) < 1e-9 and abs(b - c) < 1e-9:
-                            continue
-                        best = [a, b, c]
-                        break
-
-                if best:
-                    return best
-
-            return None
-
-        # -----------------------------
-        # 2) Robust fetch helpers (DNS + TLS/SNI bypass)
-        # -----------------------------
-        def _build_headers(referer: Optional[str] = None, host_override: Optional[str] = None) -> Dict[str, str]:
-            h = dict(HEADERS)
-            # JS endpoint'ler için daha geniş accept
-            h["Accept"] = "*/*"
-            if referer:
-                h["Referer"] = referer
-            if host_override:
-                h["Host"] = host_override
-            return h
-
-        def _http_get(url: str, referer: Optional[str] = None, host_override: Optional[str] = None,
-                      verify: bool = True, timeout: int = 20) -> str:
-            h = _build_headers(referer=referer, host_override=host_override)
-            r = requests.get(url, headers=h, timeout=timeout, allow_redirects=True, verify=verify)
-            r.raise_for_status()
-            r.encoding = r.apparent_encoding
-            return r.text
-
-        def _doh_resolve_ips(hostname: str) -> List[str]:
-            """
-            Sistem DNS fail olursa DoH ile A kayıtlarını çöz.
-            (Render'da "NameResolutionError" yaşadığın için asıl kritik burası.)
-            """
-            ips: List[str] = []
-
-            # 1) sistem DNS
-            try:
-                ips.extend(socket.gethostbyname_ex(hostname)[2])
-            except Exception:
-                pass
-
-            # 2) DoH Providers
-            # Google DNS JSON: https://dns.google/resolve?name=...&type=A
-            # Cloudflare DNS JSON: https://cloudflare-dns.com/dns-query?name=...&type=A (Accept: application/dns-json)
-            doh_providers = [
-                ("google", f"https://dns.google/resolve?name={hostname}&type=A", {"Accept": "application/dns-json"}),
-                ("cloudflare", f"https://cloudflare-dns.com/dns-query?name={hostname}&type=A", {"Accept": "application/dns-json"}),
-                ("quad9", f"https://dns.quad9.net:5053/dns-query?name={hostname}&type=A", {"Accept": "application/dns-json"}),
-            ]
-
-            for name, doh_url, extra_headers in doh_providers:
-                try:
-                    hh = dict(HEADERS)
-                    hh.update(extra_headers)
-                    # DoH endpoint'lerde referer şart değil
-                    rr = requests.get(doh_url, headers=hh, timeout=10)
-                    rr.raise_for_status()
-                    js = rr.json()
-                    ans = js.get("Answer") or []
-                    for a in ans:
-                        if a.get("type") == 1 and a.get("data"):
-                            ips.append(a["data"])
-                    if ips:
-                        break
-                except Exception:
-                    continue
-
-            # uniq
-            out: List[str] = []
-            for ip in ips:
-                if ip and ip not in out:
-                    out.append(ip)
-            return out
-
-        def _robust_fetch(url: str, referer: Optional[str] = None, timeout: int = 20) -> str:
-            """
-            1) Normal fetch
-            2) SSL/SNI sorunu veya DNS sorunu varsa:
-               - DoH ile IP çöz
-               - IP URL + Host header override + verify=False
-            """
-            last_err = None
-            try:
-                return _http_get(url, referer=referer, verify=True, timeout=timeout)
-            except Exception as e:
-                last_err = e
-
-            # IP fallback
-            try:
-                parts = urlsplit(url)
-                host = parts.hostname
-                if not host:
-                    raise last_err
-
-                ips = _doh_resolve_ips(host)
-                if not ips:
-                    raise last_err
-
-                for ip in ips:
-                    # port varsa koru
-                    netloc = ip
-                    if parts.port:
-                        netloc = f"{ip}:{parts.port}"
-                    ip_url = urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
-                    try:
-                        return _http_get(ip_url, referer=referer, host_override=host, verify=False, timeout=timeout)
-                    except Exception as e2:
-                        last_err = e2
-                        continue
-            except Exception as e3:
-                last_err = e3
-
-            raise last_err
-
-        # -----------------------------
-        # 3) Parse Bet365 Initial 1X2 from JS feed (game=Array(...))
-        # -----------------------------
-        def _parse_bet365_initial_1x2_from_js(js_text: str) -> Optional[List[float]]:
-            if not js_text:
-                return None
-
-            m = re.search(r'\bgame\s*=\s*Array\((.*?)\)\s*;', js_text, flags=re.IGNORECASE | re.DOTALL)
-            if not m:
-                m = re.search(r'\bgame\s*=\s*Array\((.*?)\)\s*$', js_text, flags=re.IGNORECASE | re.DOTALL)
-            if not m:
-                return None
-
-            body = m.group(1)
-
-            # Çoğunlukla "..." ile listelenir, bazen '...' olabilir.
-            items = re.findall(r'"([^"]*)"', body, flags=re.DOTALL)
-            if not items:
-                items = re.findall(r"'([^']*)'", body, flags=re.DOTALL)
-
-            if not items:
-                return None
-
-            for row in items:
-                parts = row.split('|')
-                if len(parts) < 6:
-                    continue
-
-                # parts[2] = company name (Bet 365 / Bet365)
-                if norm_key(parts[2]) != "bet365":
-                    continue
-
-                # Initial 1X2 odds (çok yaygın format):
-                # parts[3]=Home, parts[4]=Draw, parts[5]=Away
-                try:
-                    o1 = float(parts[3])
-                    oX = float(parts[4])
-                    o2 = float(parts[5])
-                except Exception:
-                    continue
-
-                # Sağlam filtre
-                if not (1.01 <= o1 <= 100.0 and 1.01 <= oX <= 100.0 and 1.01 <= o2 <= 100.0):
-                    continue
-                # "7-7-7" gibi attribute kaynaklı saçmalıkları ekstra filtrele (genelde olmaz ama garanti)
-                if abs(o1 - oX) < 1e-9 and abs(oX - o2) < 1e-9:
-                    continue
-
-                return [o1, oX, o2]
-
-            return None
-
-        # -----------------------------
-        # 4) Execution
-        # -----------------------------
-        base_url = (base_url or "").strip()
-        if not base_url:
-            base_url = "https://live3.nowgoal26.com"
-
-        # referer olarak oddscomp sayfası daha iyi
-        oddscomp_page_url = f"{base_url}/oddscomp/{match_id}"
-        html = ""
-        try:
-            html = safe_get(oddscomp_page_url, referer=base_url)
-        except Exception as e:
-            log_error(f"Oddscomp sayfası çekilemedi: {oddscomp_page_url}", e)
-            html = ""
-
-        # 4.1) Eğer oddscomp HTML içinde gerçekten odds varsa, önce onu kullan
-        try:
-            from_html = _parse_bet365_initial_from_oddscomp_html_visible(html)
-            if from_html and len(from_html) == 3:
-                log_info(f"Bet365 Initial 1X2 (oddscomp HTML-visible): {from_html[0]} - {from_html[1]} - {from_html[2]}")
-                return from_html
-        except Exception as e:
-            log_error("Oddscomp HTML-visible parse hatası", e)
-
-        # 4.2) JS endpoint'lerini HTML içinden keşfet (varsa)
-        js_urls: List[str] = []
-        try:
-            # match_id içeren .js referansları (absolute veya protocol-relative)
-            found = re.findall(r'((?:https?:)?//[^"\']+?' + re.escape(match_id) + r'[^"\']*?\.js[^"\']*)',
-                               html or '', flags=re.IGNORECASE)
-            for u in found:
-                u = u.strip()
-                if u.startswith("//"):
-                    u = "https:" + u
-                if u and u not in js_urls:
-                    js_urls.append(u)
-
-            # src="/...{match_id}.js" gibi relative yakala
-            found2 = re.findall(r'src\s*=\s*["\'](/[^"\']*?' + re.escape(match_id) + r'[^"\']*?\.js[^"\']*)["\']',
-                                html or '', flags=re.IGNORECASE)
-            for rel in found2:
-                rel = rel.strip()
-                if not rel:
-                    continue
-                absu = base_url.rstrip("/") + rel
-                if absu not in js_urls:
-                    js_urls.append(absu)
-        except Exception:
-            pass
-
-        # 4.3) Hard-coded en sağlam adaylar (Win007 formatı + alternatif hostlar)
-        # Not: cache bypass için ?t=... ekliyoruz
-        ts = int(time.time())
-        candidates: List[str] = []
-
-        def _add(url: str):
-            if url and url not in candidates:
-                candidates.append(url)
-
-        # Win007 / NowGoal klasik feed hostları
-        _add(f"http://1x2d.win007.com/{match_id}.js?t={ts}")
-        _add(f"https://1x2d.win007.com/{match_id}.js?t={ts}")
-        _add(f"http://1x2d.win007.com/odds/{match_id}.js?t={ts}")
-        _add(f"https://1x2d.win007.com/odds/{match_id}.js?t={ts}")
-
-        _add(f"http://op1.win007.com/{match_id}.js?t={ts}")
-        _add(f"https://op1.win007.com/{match_id}.js?t={ts}")
-        _add(f"http://op1.win007.com/odds/{match_id}.js?t={ts}")
-        _add(f"https://op1.win007.com/odds/{match_id}.js?t={ts}")
-
-        # NowGoal alternatif feed hostları (bazı regionlarda çalışabiliyor)
-        _add(f"http://1x2d.nowgoal.com/{match_id}.js?t={ts}")
-        _add(f"https://1x2d.nowgoal.com/{match_id}.js?t={ts}")
-        _add(f"http://1x2d.nowgoal.com/odds/{match_id}.js?t={ts}")
-        _add(f"https://1x2d.nowgoal.com/odds/{match_id}.js?t={ts}")
-
-        _add(f"http://1x2d.nowgoal26.com/{match_id}.js?t={ts}")
-        _add(f"https://1x2d.nowgoal26.com/{match_id}.js?t={ts}")
-        _add(f"http://1x2d.nowgoal26.com/odds/{match_id}.js?t={ts}")
-        _add(f"https://1x2d.nowgoal26.com/odds/{match_id}.js?t={ts}")
-
-        # base host'a göre 1x2d.<host> denemesi (ör: 1x2d.live4.nowgoal26.com)
-        try:
-            bh = urlsplit(base_url).hostname or ""
-            if bh:
-                _add(f"http://1x2d.{bh}/{match_id}.js?t={ts}")
-                _add(f"https://1x2d.{bh}/{match_id}.js?t={ts}")
-                _add(f"http://1x2d.{bh}/odds/{match_id}.js?t={ts}")
-                _add(f"https://1x2d.{bh}/odds/{match_id}.js?t={ts}")
-        except Exception:
-            pass
-
-        # 4.4) Önce HTML'den keşfedilenleri, sonra adayları dene
-        all_try_urls = []
-        for u in js_urls:
-            if u not in all_try_urls:
-                all_try_urls.append(u)
-        for u in candidates:
-            if u not in all_try_urls:
-                all_try_urls.append(u)
-
-        # 4.5) Deneme döngüsü
-        for js_url in all_try_urls:
-            try:
-                log_info(f"Fetching (1x2-js) {js_url}")
-                js_text = _robust_fetch(js_url, referer=oddscomp_page_url, timeout=20)
-                odds = _parse_bet365_initial_1x2_from_js(js_text)
-                if odds and len(odds) == 3:
-                    log_info(f"Bet365 Initial 1X2 (JS-feed): {odds[0]} - {odds[1]} - {odds[2]}")
-                    return odds
-            except Exception as e:
-                # çok spam olmasın ama hata görünür olsun
-                log_error(f"Odds JS fetch/parse failed: {js_url} - {e}")
-
-        log_error("Bet365 Initial 1X2 oranları çekilemedi (tüm yöntemler denendi).")
         return [1.0, 1.0, 1.0]
 
     except Exception as e:
-        log_error(f"Oran çekme hatası (Bet365 Initial 1X2): {e}")
+        log_error(f"Oran çekme hatası (Hücre Yöntemi): {e}")
         return [1.0, 1.0, 1.0]
 
 def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict[str, Any]:
@@ -1465,7 +1178,7 @@ def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict
     if "Standings" in html: st_count_h = 10; st_count_a = 10 
     
     # === [GÜNCELLENDİ] ORAN ÇEKME ===
-    # Bet365 Initial 1X2 (Asian handicap çekmez)
+    # Görseldeki tablo yapısına (Bet365 -> Initial -> Skip Asian -> Get 1x2) göre çeker
     scraped_odds = fetch_real_odds(match_id, base_domain)
     
     if scraped_odds and scraped_odds != [1.0, 1.0, 1.0]:
