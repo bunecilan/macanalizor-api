@@ -1068,250 +1068,145 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
 def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
     """
     [KESİN ÇÖZÜM - BET365 INITIAL 1X2]
-    NowGoal / NowGoal26 / Win007 ailesinde 1X2 oranlar çoğu zaman HTML içinde değil,
-    harici bir JS data dosyasından (game=Array(...)) yüklenir.
+    Görselde işaretlediğin tablo /match/h2h-{match_id} sayfasında:
+      "Live Odds Comparison" -> Bet365 -> Initial -> 1X2 Odds (Home/Draw/Away)
 
     Bu fonksiyon:
-    1) Önce 1x2 JS data kaynaklarını dener (Bet365 satırını bulur -> Initial 1X2 alır)
-    2) Olmazsa eski HTML "hücre sayma" yöntemine düşer (sende çalışıyorsa yine çalışır)
+      1) Önce /match/h2h-{id} HTML içinden Bet365+Initial satırının 1X2 oranlarını çeker.
+         (Asya oranlarını ve O/U oranlarını ALMAZ)
+      2) Bulamazsa /oddscomp/{id} sayfasından aynı mantıkla dener (yedek)
+      3) Hâlâ olmazsa [1.0, 1.0, 1.0] döndürür.
 
-    NOT: Asya oranlarını ALMAZ. Sadece BET365 -> Initial -> 1X2 (Home/Draw/Away) döndürür.
+    Not: Bet365 hücresi bazen <img alt="Bet365"> / title="Bet365" içinde olabildiği için
+    hücre metnini okurken alt/title da desteklenir.
     """
     try:
-        # --------------------------------------------------------------------
-        # 0) 1X2 DATA (JS) YÖNTEMİ - EN SAĞLAM
-        # --------------------------------------------------------------------
-        def _host_from_base(url: str) -> str:
-            try:
-                h = re.sub(r'^https?://', '', (url or '').strip(), flags=re.IGNORECASE)
-                h = h.split('/')[0].strip()
-                return h
-            except Exception:
-                return ""
+        def cell_to_text(cell_html: str) -> str:
+            txt = strip_tags_keep_text(cell_html or '')
+            if txt:
+                return txt.strip()
+            m = re.search(r'alt=["\']([^"\']+)["\']', cell_html or '', flags=re.IGNORECASE)
+            if m:
+                return (m.group(1) or '').strip()
+            m = re.search(r'title=["\']([^"\']+)["\']', cell_html or '', flags=re.IGNORECASE)
+            if m:
+                return (m.group(1) or '').strip()
+            return ""
 
-        def _root_host_from_live(host: str) -> str:
-            # live4.nowgoal26.com -> nowgoal26.com
-            h = (host or '').strip()
-            h = re.sub(r'^www\.', '', h, flags=re.IGNORECASE)
-            h = re.sub(r'^live\d+\.', '', h, flags=re.IGNORECASE)
-            return h
-
-        def _to_float(val: str) -> Optional[float]:
+        def to_float(val: str) -> Optional[float]:
+            if val is None:
+                return None
+            v = (val or '').strip()
+            if not v or v == '-':
+                return None
+            v = v.replace(',', '.')
+            m = re.search(r'(\d+(?:\.\d+)?)', v)
+            if not m:
+                return None
             try:
-                v = (val or '').strip()
-                if not v:
-                    return None
-                v = re.sub(r'<.*?>', '', v)
-                v = v.replace('&nbsp;', ' ').strip()
-                v = v.replace(',', '.')
-                m = re.search(r'-?\d+(?:\.\d+)?', v)
-                if not m:
-                    return None
-                return float(m.group(0))
+                return float(m.group(1))
             except Exception:
                 return None
 
-        def _parse_bet365_initial_from_1x2_js(js_text: str) -> Optional[List[float]]:
+        def extract_bet365_initial_1x2(page_html: str) -> Tuple[Optional[List[float]], Optional[List[float]]]:
             """
-            JS içinde tipik olarak:
-              game=Array("...|Bet 365|2.20|3.10|3.25|...", "....");
-            veya
-              var game=Array(("..."),("..."));
-            gibi data bulunur.
-
-            Bet365 satırını bulur, Initial 1X2 olarak [home, draw, away] döndürür.
+            Dönen: (initial_odds, live_odds)
+            initial_odds = [home, draw, away]
             """
-            if not js_text:
-                return None
+            trs = re.findall(r'<tr[^>]*>.*?</tr>', page_html or '', flags=re.IGNORECASE | re.DOTALL)
 
-            # game=Array( ... ) bloğunu yakala
-            m = re.search(r'\bgame\s*=\s*Array\s*\((.*?)\)\s*;?', js_text, flags=re.IGNORECASE | re.DOTALL)
-            if not m:
-                m = re.search(r'\bvar\s+game\s*=\s*Array\s*\((.*?)\)\s*;?', js_text, flags=re.IGNORECASE | re.DOTALL)
-            if not m:
-                return None
+            current_company_key = None
+            bet365_initial = None
+            bet365_live = None
 
-            inside = m.group(1)
-
-            # Array içindeki tüm quoted satırları çek
-            rows = re.findall(r'"([^"]*)"', inside, flags=re.DOTALL)
-            if not rows:
-                rows = re.findall(r"'([^']*)'", inside, flags=re.DOTALL)
-            if not rows:
-                return None
-
-            # Bet365 satırını ara
-            for row in rows:
-                parts = row.split('|')
-                if not parts:
+            for tr in trs:
+                cell_blocks = re.findall(r'<t[dh][^>]*>.*?</t[dh]>', tr, flags=re.IGNORECASE | re.DOTALL)
+                if not cell_blocks:
                     continue
 
-                joined_low = " ".join(parts).lower()
-                if ('bet365' not in joined_low) and ('bet 365' not in joined_low):
+                texts = [cell_to_text(c) for c in cell_blocks]
+                low = [(t or '').strip().lower() for t in texts]
+
+                # Bu satır Initial/Live satırı mı?
+                label_idx = None
+                label = None
+                for i, t in enumerate(low):
+                    if t == 'initial':
+                        label_idx = i
+                        label = 'initial'
+                        break
+                    if t == 'live':
+                        label_idx = i
+                        label = 'live'
+                        break
+
+                if label_idx is None:
                     continue
 
-                # %99: [.., .., CompanyName, Home, Draw, Away, ...]
-                if len(parts) >= 6:
-                    o1 = _to_float(parts[3])
-                    oX = _to_float(parts[4])
-                    o2 = _to_float(parts[5])
-                    if o1 is not None and oX is not None and o2 is not None and o1 > 0 and oX > 0 and o2 > 0:
-                        return [o1, oX, o2]
+                # Company hücresi bu satırda var mı?
+                # Eğer label_idx > 0 ise genelde texts[0] company olur.
+                if label_idx > 0:
+                    current_company_key = norm_key(texts[0])
+                # label_idx == 0 ise company rowspan ile bir üst satırdadır, current_company_key korunur.
 
-                # Fallback: Bet365 kelimesinden sonraki ilk 3 float
-                idx_book = None
-                for i, p in enumerate(parts):
-                    pl = (p or '').lower()
-                    if 'bet365' in pl or 'bet 365' in pl:
-                        idx_book = i
-                        break
+                if current_company_key != 'bet365':
+                    continue
 
-                if idx_book is None:
-                    idx_book = 2
+                # Görseldeki tablo düzeni:
+                # label_idx (Initial/Live) den sonra:
+                # +1 AH Home, +2 AH Hdp, +3 AH Away, +4 1X2 Home, +5 1X2 Draw, +6 1X2 Away
+                if label_idx + 6 >= len(texts):
+                    continue
 
-                floats_after = []
-                for p in parts[idx_book + 1:]:
-                    f = _to_float(p)
-                    if f is not None:
-                        floats_after.append(f)
-                    if len(floats_after) >= 3:
-                        break
+                o1 = to_float(texts[label_idx + 4])
+                oX = to_float(texts[label_idx + 5])
+                o2 = to_float(texts[label_idx + 6])
 
-                if len(floats_after) >= 3 and all(x > 0 for x in floats_after[:3]):
-                    return floats_after[:3]
+                # 1X2 odds her zaman > 1 olur. Yanlış kayma (asya vs) olmasın diye kontrol:
+                if o1 is not None and oX is not None and o2 is not None and o1 > 1.0 and oX > 1.0 and o2 > 1.0:
+                    if label == 'initial':
+                        bet365_initial = [o1, oX, o2]
+                    else:
+                        bet365_live = [o1, oX, o2]
 
-            return None
+                    # Initial bulunduysa direkt dön
+                    if bet365_initial:
+                        return bet365_initial, bet365_live
 
-        base_host = _host_from_base(base_url)
-        root_host = _root_host_from_live(base_host)
+            return bet365_initial, bet365_live
 
-        # Aday JS data URL listesi (farklı mirror/domain ihtimallerine karşı)
-        js_candidates = []
-        if root_host:
-            js_candidates.append(f"https://1x2d.{root_host}/{match_id}.js")
-            js_candidates.append(f"http://1x2d.{root_host}/{match_id}.js")
-        # Win007/Titan007 fallback (NowGoal mirrorları çoğu zaman aynı match id kullanır)
-        js_candidates.append(f"https://1x2d.win007.com/{match_id}.js")
-        js_candidates.append(f"http://1x2d.win007.com/{match_id}.js")
-        js_candidates.append(f"https://1x2d.titan007.com/{match_id}.js")
-        js_candidates.append(f"http://1x2d.titan007.com/{match_id}.js")
+        # 1) ÖNCE: Görseldeki sayfa (match/h2h) içinden çek
+        h2h_url = f"{base_url}/match/h2h-{match_id}"
+        html_h2h = safe_get(h2h_url, referer=base_url)
+        init_odds, live_odds = extract_bet365_initial_1x2(html_h2h)
 
-        for js_url in js_candidates:
-            try:
-                js_text = safe_get(js_url, timeout=15, retries=1, referer=base_url)
-                odds = _parse_bet365_initial_from_1x2_js(js_text)
-                if odds and len(odds) == 3:
-                    log_info(f"Oranlar Başarıyla Çekildi (1X2 JS DATA): {odds[0]} - {odds[1]} - {odds[2]} | SRC: {js_url}")
-                    return odds
-            except Exception as e:
-                # tek tek dene, sessiz geç
-                continue
+        if init_odds:
+            log_info(f"Oranlar Başarıyla Çekildi (H2H - Bet365 Initial 1X2): {init_odds[0]} - {init_odds[1]} - {init_odds[2]}")
+            return init_odds
 
-        # --------------------------------------------------------------------
-        # 1) HTML ODDSCOMP FALLBACK (SENİN ESKİ YÖNTEMİ GELİŞTİRİLDİ)
-        # --------------------------------------------------------------------
+        # Eğer illa “güncel” istiyorsa ve Initial yoksa Live dönebilsin diye (yedek)
+        if live_odds:
+            log_info(f"Initial bulunamadı, Live döndürüldü (H2H - Bet365 Live 1X2): {live_odds[0]} - {live_odds[1]} - {live_odds[2]}")
+            return live_odds
+
+        # 2) YEDEK: oddscomp sayfasından dene
         url = f"{base_url}/oddscomp/{match_id}"
         html = safe_get(url, referer=base_url)
+        init_odds2, live_odds2 = extract_bet365_initial_1x2(html)
 
-        content_lower = (html or "").lower()
+        if init_odds2:
+            log_info(f"Oranlar Başarıyla Çekildi (ODDSCOMP - Bet365 Initial 1X2): {init_odds2[0]} - {init_odds2[1]} - {init_odds2[2]}")
+            return init_odds2
 
-        # Bet365 satırını <tr> bazında bul (rowspan durumunu da yakalar)
-        trs = re.findall(r'<tr[^>]*>.*?</tr>', html or '', flags=re.IGNORECASE | re.DOTALL)
+        if live_odds2:
+            log_info(f"Initial bulunamadı, Live döndürüldü (ODDSCOMP - Bet365 Live 1X2): {live_odds2[0]} - {live_odds2[1]} - {live_odds2[2]}")
+            return live_odds2
 
-        target_tr = None
-        for i, tr in enumerate(trs):
-            low = tr.lower()
-            if 'bet365' in low:
-                # Bet365 + Initial aynı satırdaysa
-                if 'initial' in low:
-                    target_tr = tr
-                    break
-                # Bet365 satırı rowspan ile bir üst satırda, Initial bir alt satırda olabilir
-                if i + 1 < len(trs) and 'initial' in trs[i + 1].lower():
-                    target_tr = trs[i + 1]
-                    break
-
-        if target_tr:
-            cells = re.findall(r'<td[^>]*>(.*?)</td>', target_tr, flags=re.DOTALL | re.IGNORECASE)
-
-            # Initial hücresinin index'ini bul
-            init_idx = None
-            for j, c in enumerate(cells):
-                txt = strip_tags_keep_text(c).strip().lower()
-                if txt == 'initial' or 'initial' in txt:
-                    init_idx = j
-                    break
-            if init_idx is None:
-                # bazı tablolarda Initial hücresi yoksa (çok nadir) 0 kabul et
-                init_idx = 0
-
-            # Initial'dan sonra:
-            # +1 Asian Home (SKIP)
-            # +2 Asian Handicap (SKIP)
-            # +3 Asian Away (SKIP)
-            # +4 1X2 Home (AL)
-            # +5 1X2 Draw (AL)
-            # +6 1X2 Away (AL)
-            def clean_val(val):
-                v = strip_tags_keep_text(val).strip()
-                v = v.replace(',', '.')
-                m = re.search(r'(\d+(?:\.\d+)?)', v)
-                return float(m.group(1)) if m else 1.0
-
-            try:
-                o1 = clean_val(cells[init_idx + 4])
-                oX = clean_val(cells[init_idx + 5])
-                o2 = clean_val(cells[init_idx + 6])
-                if o1 > 0 and oX > 0 and o2 > 0:
-                    log_info(f"Oranlar Başarıyla Çekildi (ODDSCOMP HTML FALLBACK): {o1} - {oX} - {o2}")
-                    return [o1, oX, o2]
-            except Exception:
-                pass
-
-        # Yedek plan: Average satırı varsa aynı mantıkla deneyelim
-        avg_tr = None
-        for i, tr in enumerate(trs):
-            low = tr.lower()
-            if 'average' in low and 'initial' in low:
-                avg_tr = tr
-                break
-            if 'average' in low and i + 1 < len(trs) and 'initial' in trs[i + 1].lower():
-                avg_tr = trs[i + 1]
-                break
-
-        if avg_tr:
-            cells_avg = re.findall(r'<td[^>]*>(.*?)</td>', avg_tr, flags=re.DOTALL | re.IGNORECASE)
-
-            init_idx = None
-            for j, c in enumerate(cells_avg):
-                txt = strip_tags_keep_text(c).strip().lower()
-                if txt == 'initial' or 'initial' in txt:
-                    init_idx = j
-                    break
-            if init_idx is None:
-                init_idx = 0
-
-            def clean_val(val):
-                v = strip_tags_keep_text(val).strip()
-                v = v.replace(',', '.')
-                m = re.search(r'(\d+(?:\.\d+)?)', v)
-                return float(m.group(1)) if m else 1.0
-
-            try:
-                o1 = clean_val(cells_avg[init_idx + 4])
-                oX = clean_val(cells_avg[init_idx + 5])
-                o2 = clean_val(cells_avg[init_idx + 6])
-                if o1 > 0 and oX > 0 and o2 > 0:
-                    log_info(f"Yedek: Ortalama Oranlar Çekildi (HTML): {o1} - {oX} - {o2}")
-                    return [o1, oX, o2]
-            except Exception:
-                pass
-
-        log_error("Oran çekilemedi (Bet365 Initial 1x2).")
+        log_error("Bet365 Initial 1X2 oranları bulunamadı (h2h + oddscomp).")
         return [1.0, 1.0, 1.0]
 
     except Exception as e:
-        log_error(f"Oran çekme hatası (Bet365 Initial 1x2): {e}")
+        log_error(f"Oran çekme hatası (Bet365 Initial 1X2): {e}")
         return [1.0, 1.0, 1.0]
 
 def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict[str, Any]:
@@ -1339,7 +1234,7 @@ def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict
     if "Standings" in html: st_count_h = 10; st_count_a = 10 
     
     # === [GÜNCELLENDİ] ORAN ÇEKME ===
-    # Bet365 Initial 1X2 çek (Asya oranları alınmaz)
+    # Görseldeki tablo: Bet365 -> Initial -> 1X2
     scraped_odds = fetch_real_odds(match_id, base_domain)
     
     if scraped_odds and scraped_odds != [1.0, 1.0, 1.0]:
