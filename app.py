@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 NowGoal Match Analyzer - ULTIMATE VBA LOGIC REPLICA
-- BASE: Python Scraping Engine (v5.4) - JS Data Mining Edition
+- BASE: Python Scraping Engine (v5.5) - Strict Segment Parser
 - LOGIC: VBA 'Magic Dice' (PoissonRastgele) Logic Implemented
 - SIMULATION: Iterative loop (10,000 runs) exactly like VBA
 - OUTPUT: Exact "ResimGibi" VBA Format
@@ -1075,90 +1075,60 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
 
 def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
     """
-    [BET365 JAVASCRIPT DATA MINER] - Chromium GEREKTİRMEZ!
+    [BET365 'INITIAL' SNIPER MODE]
     
     Mantık:
-    1. Render edilen tabloyu GÖREMİYORUZ.
-    2. Ama tabloyu dolduran 'JavaScript Verisi' (Aşçının tarifi) sayfanın içinde gömülü.
-    3. Biz direkt o yazıyı (Variable) okuyacağız.
-    4. "Bet365" kelimesini bulup, yanındaki sayıları cımbızla çekeceğiz.
+    1. HTML'i tek satır yapıp (flatten), Bet365 bloğunu bul.
+    2. O bloğun içinde 'Initial' (Başlangıç) kelimesini bul.
+    3. 'Initial' kelimesinden SONRA gelen ve >...< tagleri arasına gizlenmiş sayıları topla.
+    4. Bu sayılar şöyledir: [Asya1, Asya2, Asya3, 1x2_Ev, 1x2_X, 1x2_Dep]
+    5. Biz 4., 5. ve 6. sıradakileri (İndeks: 3,4,5) alacağız.
     """
     try:
         url = f"{base_url}/oddscomp/{match_id}"
         html = safe_get(url, referer=base_url)
         
-        # 1. HTML taglerinden kurtul, saf metne odaklan (Veri javascript değişkeninde)
-        # Javascript değişkenleri genellikle satır sonu olmadan da yazılabilir, o yüzden düzleştiriyoruz.
-        flat_html = html.replace('\n', '').replace('\r', '').replace('\t', '')
+        # 1. HTML Dümdüz Yap (Satır kaymalarını yoksaymak için)
+        html = html.replace('\n', '').replace('\r', '').replace('\t', '')
 
-        # 2. Bet365'i bul (Veri içinde '8' idsi veya 'Bet365' stringi geçer)
-        if "Bet365" not in flat_html and "bet365" not in flat_html:
+        # 2. Regex ile Bet365 satırını ve içindeki Initial kısmını yakala
+        # Açıklama: Bet365'i bul, sonrasında Initial'ı bul, sonrasında Live veya başka Bet365 gelene kadar al.
+        # Bu, yanlışlıkla alt satırdaki Live oranlarını almamızı engeller.
+        pattern = r'Bet365.*?Initial(.*?)(?:Live|Bet365|$)'
+        match = re.search(pattern, html, re.IGNORECASE)
+        
+        if not match:
             return [1.0, 1.0, 1.0]
 
-        # 3. İlgili bloğu kesip al (Bet365'ten sonraki 500 karakteri incele)
-        parts = re.split(r'Bet365', flat_html, flags=re.IGNORECASE)
-        if len(parts) < 2: return [1.0, 1.0, 1.0]
-        
-        data_chunk = parts[1][:500] # Bet365'ten sonraki 500 karakter
+        # Sadece "Initial" satırındaki veriler elimizde
+        segment = match.group(1)
 
-        # 4. Sayı Avcısı (Float veya Int)
-        # > ve < işaretleri arasına sıkışmış sayıları (HTML Render edilmişse)
-        # VEYA | veya , ile ayrılmış sayıları (JS raw data ise) bul.
-        # Bu regex her iki durumu da yakalar: (sayı.nokta.sayı)
+        # 3. Bu segment içindeki >SAYI< formatındaki her şeyi topla
+        # Örn: >2.50< veya > 2.50 <
+        odds_strings = re.findall(r'>\s*(\d+\.\d{2})\s*<', segment)
         
-        # Örnek JS Data: ...|2.50|3.20|2.50|...
-        # Örnek HTML: ...>2.50<...>3.20<...
+        # Beklenen Sıra:
+        # 0: Asya Home
+        # 1: Asya Line
+        # 2: Asya Away
+        # 3: 1X2 HOME (ALINACAK)
+        # 4: 1X2 DRAW (ALINACAK)
+        # 5: 1X2 AWAY (ALINACAK)
         
-        # Regex mantığı: Bir sayı (örn: 2.50) bul.
-        numbers = re.findall(r'(\d+\.\d{2})', data_chunk)
-        
-        if len(numbers) < 6:
-             # Eğer ondalıklı bulamazsa (örn: 3) tamsayıları da ara
-             numbers = re.findall(r'(\d+(?:\.\d+)?)', data_chunk)
-        
-        # BEKLENEN SIRALAMA (Genelde):
-        # 1. Asya Home
-        # 2. Asya Line (Sayı ise)
-        # 3. Asya Away
-        # 4. 1x2 Home (BİZİM HEDEF)
-        # 5. 1x2 Draw (BİZİM HEDEF)
-        # 6. 1x2 Away (BİZİM HEDEF)
-        
-        # Güvenlik Kontrolü: 1x2 oranları genelde 1.05'ten büyüktür. Asya oranları 0.80 olabilir.
-        valid_odds = []
-        for n in numbers:
-            try:
-                f = float(n)
-                # Tarih (2024), ID (281) gibi büyük sayılar veya çok küçük (0.5) handikaplar hariç
-                if 1.01 < f < 25.0: 
-                    valid_odds.append(f)
-            except:
-                continue
-
-        # Elimizde mantıklı oranlar kaldı. Genelde Asya oranları başta olur.
-        # Bizim aradığımız 1x2 oranları genellikle listedeki 3., 4. ve 5. sırada gelir (Asya varsa).
-        # Eğer Asya yoksa 0, 1, 2 olabilir.
-        
-        # NowGoal "Initial" verisi genelde 6'lı settir: [AH, AH, AH, 1, X, 2]
-        if len(valid_odds) >= 6:
-            o1 = valid_odds[3]
-            oX = valid_odds[4]
-            o2 = valid_odds[5]
-            log_info(f"Bet365 JS Verisi (Full Mod): {o1} - {oX} - {o2}")
-            return [o1, oX, o2]
+        if len(odds_strings) >= 6:
+            o1 = float(odds_strings[3])
+            oX = float(odds_strings[4])
+            o2 = float(odds_strings[5])
             
-        elif len(valid_odds) >= 3:
-            # Belki sadece 1x2 vardır? (Riskli ama varsayılandan iyidir)
-            o1 = valid_odds[0]
-            oX = valid_odds[1]
-            o2 = valid_odds[2]
-            log_info(f"Bet365 JS Verisi (Kısa Mod): {o1} - {oX} - {o2}")
-            return [o1, oX, o2]
+            # Mantık kontrolü: Oranlar 1.01 ile 30.00 arasında olmalı
+            if 1.01 < o1 < 30.0 and 1.01 < oX < 30.0 and 1.01 < o2 < 30.0:
+                log_info(f"Bet365 Initial 1x2 (Sniper Mod): {o1} - {oX} - {o2}")
+                return [o1, oX, o2]
 
         return [1.0, 1.0, 1.0]
 
     except Exception as e:
-        log_error(f"Oran çekme hatası (JS Madenciliği): {e}")
+        log_error(f"Oran çekme hatası (Sniper Mod): {e}")
         return [1.0, 1.0, 1.0]
 
 def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict[str, Any]:
