@@ -1067,294 +1067,64 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
 
 def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
     """
-    [KESİN ÇÖZÜM - BET365 INITIAL 1X2 (ASYA ORANLARI YOK)]
-    NowGoal çoğu zaman OddsComp tablosunu JS ile doldurur; bu yüzden HTML'den hücre sayma
-    yöntemi tek başına yetmez.
-
-    Bu fonksiyon:
-      1) OddsComp HTML'den (varsa) Bet365 -> Initial satırındaki 1X2 (HW/D/AW) oranlarını alır.
-      2) HTML'de oran yoksa, sayfadan ilgili 1x2d*.js kaynaklarını keşfeder ve oradan çeker.
-      3) Keşif olmazsa, bilinen data host'larını (özellikle 1x2d.win007.com) dener.
-      4) HER ZAMAN sadece 1X2 odds (Home/Draw/Away) döndürür. Asian Handicap odds çekmez.
+    [BET365 INITIAL 1X2 ONLY REPLICA]
+    
+    Logic:
+    1. Find 'Bet365' row.
+    2. Find 'Initial' inside/after that row.
+    3. Skip the first 3 numeric cells (Asian Odds).
+    4. Grab the next 3 numeric cells (1x2 Odds).
     """
     try:
-        def _to_float(txt: Any) -> Optional[float]:
-            if txt is None:
-                return None
-            t = re.sub(r'<.*?>', '', str(txt), flags=re.DOTALL).strip()
-            t = t.replace('&nbsp;', ' ').strip()
-            if t in ('', '-', '--', '---'):
-                return None
-            m = re.search(r'(\d+(?:\.\d+)?)', t)
-            if not m:
-                return None
-            try:
-                return float(m.group(1))
-            except Exception:
-                return None
+        url = f"{base_url}/oddscomp/{match_id}"
+        html = safe_get(url, referer=base_url)
+        
+        # 1. Bet365'i bul ve sonrasını al
+        if "Bet365" not in html and "bet365" not in html:
+            return [1.0, 1.0, 1.0]
 
-        def _is_valid_odds(o: Optional[float]) -> bool:
-            return o is not None and 1.01 <= o <= 1000.0
+        parts = re.split(r'Bet365', html, flags=re.IGNORECASE)
+        if len(parts) < 2: return [1.0, 1.0, 1.0]
+        
+        after_bet365 = parts[1]
 
-        def _extract_from_oddscomp_html(html: str) -> Optional[List[float]]:
-            if not html:
-                return None
-            content_lower = html.lower()
-            start_pos = content_lower.find("bet365")
-            if start_pos == -1:
-                start_pos = content_lower.find("bet 365")
-            if start_pos == -1:
-                return None
+        # 2. "Initial" kelimesini bul ve sonrasını al
+        initial_split = re.split(r'>\s*Initial\s*<', after_bet365, flags=re.IGNORECASE)
+        if len(initial_split) < 2:
+            return [1.0, 1.0, 1.0]
+        
+        # 3. Initial'dan sonraki hücreleri (td) topla
+        odds_chunk = initial_split[1]
+        cells = re.findall(r'<td[^>]*>(.*?)</td>', odds_chunk, re.IGNORECASE | re.DOTALL)
+        
+        # HÜCRE SIRALAMASI (GÖRSELE GÖRE):
+        # [0] Asian Home
+        # [1] Asian Line (HDP)
+        # [2] Asian Away
+        # [3] 1X2 HOME  <-- HEDEF
+        # [4] 1X2 DRAW  <-- HEDEF
+        # [5] 1X2 AWAY  <-- HEDEF
+        
+        if len(cells) < 6:
+            return [1.0, 1.0, 1.0]
+            
+        def extract_float(txt):
+            txt = re.sub(r'<[^>]+>', '', txt).strip() # HTML tagleri temizle
+            m = re.search(r'(\d+\.\d{2})', txt)       # Sayıyı bul
+            return float(m.group(1)) if m else 0.0
 
-            initial_pos = content_lower.find("initial", start_pos)
-            if initial_pos == -1:
-                return None
+        o1 = extract_float(cells[3]) # Ev Sahibi 1x2
+        oX = extract_float(cells[4]) # Beraberlik 1x2
+        o2 = extract_float(cells[5]) # Deplasman 1x2
 
-            chunk = html[initial_pos: initial_pos + 8000]
-            cells = re.findall(r'<td[^>]*>(.*?)</td>', chunk, re.DOTALL | re.IGNORECASE)
-
-            # Tablo Yapısı (NowGoal OddsComp):
-            # 0: Asian Home  | 1: Asian Handicap | 2: Asian Away  (BUNLARI ATLAR)
-            # 3: 1X2 Home    | 4: 1X2 Draw       | 5: 1X2 Away   (BUNLARI ALIR)
-            if len(cells) < 6:
-                return None
-
-            o1 = _to_float(cells[3])
-            oX = _to_float(cells[4])
-            o2 = _to_float(cells[5])
-
-            if _is_valid_odds(o1) and _is_valid_odds(oX) and _is_valid_odds(o2):
-                return [float(o1), float(oX), float(o2)]
-            return None
-
-        def _discover_js_urls_from_html(html: str) -> List[str]:
-            if not html:
-                return []
-            urls = set()
-
-            # Match id içeren .js URL'leri (absolute)
-            for m in re.finditer(
-                r'(https?://[^"\']+%s[^"\']*\.js[^"\']*)' % re.escape(match_id),
-                html,
-                flags=re.IGNORECASE
-            ):
-                urls.add(m.group(1))
-
-            # 1x2d geçen .js URL'leri (absolute)
-            for m in re.finditer(
-                r'(https?://[^"\']*1x2d[^"\']+\.js[^"\']*)',
-                html,
-                flags=re.IGNORECASE
-            ):
-                urls.add(m.group(1))
-
-            # Match id içeren relative .js URL'leri
-            for m in re.finditer(
-                r'(["\'])(/[^"\']*%s[^"\']*\.js[^"\']*)\1' % re.escape(match_id),
-                html,
-                flags=re.IGNORECASE
-            ):
-                rel = m.group(2)
-                urls.add(base_url.rstrip('/') + rel)
-
-            # Quote olmadan gömülü relative URL yakalama
-            for m in re.finditer(
-                r'(/[^ \t\r\n"\']*%s[^ \t\r\n"\']*\.js)' % re.escape(match_id),
-                html,
-                flags=re.IGNORECASE
-            ):
-                rel = m.group(1)
-                urls.add(base_url.rstrip('/') + rel)
-
-            return list(urls)
-
-        def _parse_bet365_from_game_array(js_text: str) -> Optional[List[float]]:
-            if not js_text:
-                return None
-
-            import json
-
-            # 1) game = Array(...)
-            m = re.search(
-                r'\bgame\s*=\s*(?:new\s+)?Array\s*\((.*?)\)\s*;?',
-                js_text,
-                flags=re.IGNORECASE | re.DOTALL
-            )
-
-            arr: List[str] = []
-            if m:
-                inner = (m.group(1) or '').strip()
-                # Bazı dosyalarda elemanlar ("...") şeklinde gelebilir -> parantezleri normalize et
-                inner = re.sub(r'\(\s*"', '"', inner)
-                inner = re.sub(r'"\s*\)', '"', inner)
-                inner = inner.strip().strip(',')
-
-                try:
-                    arr = json.loads('[' + inner + ']')
-                except Exception:
-                    tokens = re.findall(r'"((?:\\.|[^"\\])*)"', inner)
-                    arr = []
-                    for tok in tokens:
-                        try:
-                            arr.append(json.loads('"' + tok + '"'))
-                        except Exception:
-                            arr.append(tok)
-
-            # 2) game = [ ... ] (bazı varyantlar)
-            if not arr:
-                m2 = re.search(
-                    r'\bgame\s*=\s*\[(.*?)\]\s*;?',
-                    js_text,
-                    flags=re.IGNORECASE | re.DOTALL
-                )
-                if m2:
-                    inner = (m2.group(1) or '').strip()
-                    inner = inner.strip().strip(',')
-                    try:
-                        arr = json.loads('[' + inner + ']')
-                    except Exception:
-                        tokens = re.findall(r'"((?:\\.|[^"\\])*)"', inner)
-                        arr = []
-                        for tok in tokens:
-                            try:
-                                arr.append(json.loads('"' + tok + '"'))
-                            except Exception:
-                                arr.append(tok)
-
-            if not isinstance(arr, list) or not arr:
-                return None
-
-            # Bet365 kaydını bul: Format genellikle:
-            # ...|CompanyName|I_H|I_D|I_A|...|C_H|C_D|C_A|...
-            for rec in arr:
-                if not rec or not isinstance(rec, str):
-                    continue
-                parts = rec.split('|')
-                if len(parts) < 6:
-                    continue
-
-                company = parts[2] if len(parts) > 2 else ''
-                ck = norm_key(company)
-                if 'bet365' not in ck:
-                    continue
-
-                # INITIAL 1X2 (3,4,5)
-                o1 = _to_float(parts[3]) if len(parts) > 3 else None
-                oX = _to_float(parts[4]) if len(parts) > 4 else None
-                o2 = _to_float(parts[5]) if len(parts) > 5 else None
-
-                # LIVE/CURRENT 1X2 (10,11,12) (yedek)
-                lo1 = _to_float(parts[10]) if len(parts) > 10 else None
-                loX = _to_float(parts[11]) if len(parts) > 11 else None
-                lo2 = _to_float(parts[12]) if len(parts) > 12 else None
-
-                # Kullanıcı isteği: Initial öncelikli
-                if _is_valid_odds(o1) and _is_valid_odds(oX) and _is_valid_odds(o2):
-                    return [float(o1), float(oX), float(o2)]
-
-                # Initial yoksa live'a düş
-                if _is_valid_odds(lo1) and _is_valid_odds(loX) and _is_valid_odds(lo2):
-                    return [float(lo1), float(loX), float(lo2)]
-
-            return None
-
-        def _try_js_url(js_url: str, referer: Optional[str] = None) -> Optional[List[float]]:
-            try:
-                js = safe_get(js_url, referer=referer or base_url)
-                out = _parse_bet365_from_game_array(js)
-                if out:
-                    return out
-            except Exception as e:
-                log_error(f"JS odds fetch failed: {js_url}", e)
-            return None
-
-        # 1) Önce HTML içinden (varsa) OddsComp tablosu ile dene + JS keşfi yap
-        discovery_pages = [
-            f"{base_url}/oddscomp/{match_id}",
-            f"{base_url}/match/h2h-{match_id}",
-            f"{base_url}/1x2-odds/{match_id}",
-        ]
-
-        for page_url in discovery_pages:
-            try:
-                html = safe_get(page_url, referer=base_url)
-            except Exception as e:
-                log_error(f"HTML fetch failed for odds discovery: {page_url}", e)
-                continue
-
-            direct = _extract_from_oddscomp_html(html)
-            if direct:
-                log_info(f"Oranlar HTML'den çekildi: {direct[0]} - {direct[1]} - {direct[2]}")
-                return direct
-
-            js_urls = _discover_js_urls_from_html(html)
-            for jsu in js_urls:
-                got = _try_js_url(jsu, referer=page_url)
-                if got:
-                    log_info(f"Oranlar JS kaynağından çekildi: {got[0]} - {got[1]} - {got[2]} ({jsu})")
-                    return got
-
-        # 2) Bilinen 1X2 data host'larını dene (en sağlam yol)
-        base_host = re.sub(r'^https?://', '', base_url.strip()).split('/')[0]
-        host_parts = base_host.split('.')
-        parent_domain = '.'.join(host_parts[-2:]) if len(host_parts) >= 2 else base_host
-
-        known_js = [
-            # Win007 (NowGoal ağında en sık çalışan 1X2 kaynağı)
-            f"http://1x2d.win007.com/{match_id}.js",
-            f"https://1x2d.win007.com/{match_id}.js",
-
-            # NowGoal standart
-            f"http://1x2d.nowgoal.com/{match_id}.js",
-            f"https://1x2d.nowgoal.com/{match_id}.js",
-
-            # NowGoal mirror (parent domain üzerinden)
-            f"http://1x2d.{parent_domain}/{match_id}.js",
-            f"https://1x2d.{parent_domain}/{match_id}.js",
-
-            # Mirror host üzerinden (live4 gibi)
-            f"http://1x2d.{base_host}/{match_id}.js",
-            f"https://1x2d.{base_host}/{match_id}.js",
-        ]
-
-        for jsu in known_js:
-            got = _try_js_url(jsu, referer=base_url)
-            if got:
-                log_info(f"Oranlar known host'tan çekildi: {got[0]} - {got[1]} - {got[2]} ({jsu})")
-                return got
-
-        # 3) Son çare: win007 oddslist sayfasından js keşfi yap
-        oddslist_urls = [
-            f"http://op1.win007.com/oddslist/{match_id}.htm",
-            f"https://op1.win007.com/oddslist/{match_id}.htm",
-            f"http://op1.win007.com/oddslist/{match_id}.shtml",
-            f"https://op1.win007.com/oddslist/{match_id}.shtml",
-        ]
-        for u in oddslist_urls:
-            try:
-                html = safe_get(u, referer="http://op1.win007.com/")
-            except Exception as e:
-                log_error(f"Oddslist fetch failed: {u}", e)
-                continue
-
-            js_urls = _discover_js_urls_from_html(html)
-            if not js_urls:
-                js_urls = [
-                    f"http://1x2d.win007.com/{match_id}.js",
-                    f"https://1x2d.win007.com/{match_id}.js",
-                ]
-
-            for jsu in js_urls:
-                got = _try_js_url(jsu, referer=u)
-                if got:
-                    log_info(f"Oranlar oddslist üzerinden çekildi: {got[0]} - {got[1]} - {got[2]} ({jsu})")
-                    return got
-
-        log_error("Bet365 1X2 oranları bulunamadı (tüm yöntemler denendi).")
+        if o1 > 1.0 and oX > 1.0 and o2 > 1.0:
+            log_info(f"Bet365 Initial 1x2 Bulundu: {o1} - {oX} - {o2}")
+            return [o1, oX, o2]
+        
         return [1.0, 1.0, 1.0]
 
     except Exception as e:
-        log_error(f"Oran çekme hatası (Bet365 1X2 kesin): {e}")
+        log_error(f"Oran çekme hatası (Bet365 Initial): {e}")
         return [1.0, 1.0, 1.0]
 
 def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict[str, Any]:
@@ -1382,7 +1152,7 @@ def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict
     if "Standings" in html: st_count_h = 10; st_count_a = 10 
     
     # === [GÜNCELLENDİ] ORAN ÇEKME ===
-    # Bet365 -> Initial -> 1X2 (HW/D/AW) ONLY
+    # Görseldeki tablo yapısına (Bet365 -> Initial -> Skip Asian -> Get 1x2) göre çeker
     scraped_odds = fetch_real_odds(match_id, base_domain)
     
     if scraped_odds and scraped_odds != [1.0, 1.0, 1.0]:
