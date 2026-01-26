@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 NowGoal Match Analyzer - ULTIMATE VBA LOGIC REPLICA
-- BASE: Python Scraping Engine (v5.5) - Strict Segment Parser
+- BASE: Python Scraping Engine (v5.2) - Full Preservation
 - LOGIC: VBA 'Magic Dice' (PoissonRastgele) Logic Implemented
 - SIMULATION: Iterative loop (10,000 runs) exactly like VBA
 - OUTPUT: Exact "ResimGibi" VBA Format
@@ -28,19 +28,11 @@ MC_RUNS_DEFAULT = 10000
 RECENT_N = 10  # PSS analizinde dikkate alınacak maksimum maç sayısı
 H2H_N = 10     # H2H için çekilecek maç sayısı
 
-# Render/Bot Koruması İçin Güçlü Header
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept-Language": "en-US,en;q=0.9,tr;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Cache-Control": "max-age=0",
 }
 
 # ============================================================================
@@ -929,7 +921,6 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
         pct = cnt / mc['total_sims']
         bar = "-" * int(pct * 50)
         lines.append(f" {i} gol: %{pct*100:.1f} {bar}")
-    # 6+ gol hesabı (dağılım dictionarysinde 6 ve üstü keylerin toplamı)
     plus6 = sum(mc['dist_goals'][k] for k in mc['dist_goals'] if k >= 6)
     lines.append(f" 6+ gol: %{plus6/mc['total_sims']*100:.1f}\n")
     
@@ -978,7 +969,6 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
     lines.append("F) VALUE BET VE KELLY ANALIZI")
     lines.append("="*55 + "\n")
     
-    # Kelly & Value
     def calc_kelly(odds, prob):
         if odds <= 1: return 0.0
         k = ((odds - 1) * prob - (1 - prob)) / (odds - 1)
@@ -1075,60 +1065,103 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
 
 def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
     """
-    [BET365 'INITIAL' SNIPER MODE]
-    
-    Mantık:
-    1. HTML'i tek satır yapıp (flatten), Bet365 bloğunu bul.
-    2. O bloğun içinde 'Initial' (Başlangıç) kelimesini bul.
-    3. 'Initial' kelimesinden SONRA gelen ve >...< tagleri arasına gizlenmiş sayıları topla.
-    4. Bu sayılar şöyledir: [Asya1, Asya2, Asya3, 1x2_Ev, 1x2_X, 1x2_Dep]
-    5. Biz 4., 5. ve 6. sıradakileri (İndeks: 3,4,5) alacağız.
+    [KESİN ÇÖZÜM - SADECE LIVE4 DOMAIN HTML'INDEN]
+    Bet365 -> Initial satırındaki 1X2 oranlarını (Home/Draw/Away) çeker.
+    Asya oranlarını çekmez.
+
+    ÖNEMLİ:
+      - Senin loglarda görünen DNS/SSL sorunları yüzünden 1x2d.* gibi harici hostlara
+        giderek çekmek senin ortamında çalışmıyor.
+      - Bu yüzden sadece erişebildiğin sayfaların HTML'inden (oddscomp ve/veya h2h)
+        Bet365 + Initial satırını bulup, "Initial" hücresini referans alarak 1X2'yi alıyoruz.
+
+    Tablo mantığı:
+      ... | Bet365 | Initial | (Asian Home) | (Asian Hdp) | (Asian Away) | (1X2 Home) | (1X2 Draw) | (1X2 Away) | ...
+                       ^ idx_initial
+      1X2 = idx_initial + 4, +5, +6
     """
     try:
-        url = f"{base_url}/oddscomp/{match_id}"
-        html = safe_get(url, referer=base_url)
-        
-        # 1. HTML Dümdüz Yap (Satır kaymalarını yoksaymak için)
-        html = html.replace('\n', '').replace('\r', '').replace('\t', '')
+        def float_from_cell(cell_html: str) -> Optional[float]:
+            if not cell_html:
+                return None
+            s = cell_html.replace(",", ".")
+            # Hücre içinde/attribute içinde geçen ilk float'ı al
+            m = re.search(r'(\d+(?:\.\d+)?)', s)
+            if not m:
+                return None
+            try:
+                return float(m.group(1))
+            except Exception:
+                return None
 
-        # 2. Regex ile Bet365 satırını ve içindeki Initial kısmını yakala
-        # Açıklama: Bet365'i bul, sonrasında Initial'ı bul, sonrasında Live veya başka Bet365 gelene kadar al.
-        # Bu, yanlışlıkla alt satırdaki Live oranlarını almamızı engeller.
-        pattern = r'Bet365.*?Initial(.*?)(?:Live|Bet365|$)'
-        match = re.search(pattern, html, re.IGNORECASE)
-        
-        if not match:
-            return [1.0, 1.0, 1.0]
+        def parse_bet365_initial_1x2_from_html(html: str) -> Optional[List[float]]:
+            if not html:
+                return None
 
-        # Sadece "Initial" satırındaki veriler elimizde
-        segment = match.group(1)
+            # Tüm <tr> bloklarını tara
+            trs = re.findall(r'<tr[^>]*>.*?</tr>', html, flags=re.IGNORECASE | re.DOTALL)
+            if not trs:
+                return None
 
-        # 3. Bu segment içindeki >SAYI< formatındaki her şeyi topla
-        # Örn: >2.50< veya > 2.50 <
-        odds_strings = re.findall(r'>\s*(\d+\.\d{2})\s*<', segment)
-        
-        # Beklenen Sıra:
-        # 0: Asya Home
-        # 1: Asya Line
-        # 2: Asya Away
-        # 3: 1X2 HOME (ALINACAK)
-        # 4: 1X2 DRAW (ALINACAK)
-        # 5: 1X2 AWAY (ALINACAK)
-        
-        if len(odds_strings) >= 6:
-            o1 = float(odds_strings[3])
-            oX = float(odds_strings[4])
-            o2 = float(odds_strings[5])
-            
-            # Mantık kontrolü: Oranlar 1.01 ile 30.00 arasında olmalı
-            if 1.01 < o1 < 30.0 and 1.01 < oX < 30.0 and 1.01 < o2 < 30.0:
-                log_info(f"Bet365 Initial 1x2 (Sniper Mod): {o1} - {oX} - {o2}")
-                return [o1, oX, o2]
+            for tr_html in trs:
+                # Bet365 kontrolünü raw HTML üzerinde yap (alt/title attribute içinde de yakalasın)
+                if not re.search(r'bet\s*365', tr_html, flags=re.IGNORECASE):
+                    continue
 
+                # Satırdaki hücreleri komple yakala (attribute içi sayı ihtimali için)
+                cells_full = re.findall(r'<t[dh][^>]*>.*?</t[dh]>', tr_html, flags=re.IGNORECASE | re.DOTALL)
+                if not cells_full:
+                    continue
+
+                cells_text = [strip_tags_keep_text(c) for c in cells_full]
+
+                # "Initial" hücresini bul
+                idx_initial = None
+                for i, tx in enumerate(cells_text):
+                    if norm_key(tx) == "initial" or "initial" in (tx or "").lower():
+                        idx_initial = i
+                        break
+
+                # Bu satır Initial değilse geç
+                if idx_initial is None:
+                    continue
+
+                # idx_initial + 4/5/6 -> 1X2 (Home/Draw/Away)
+                need = [idx_initial + 4, idx_initial + 5, idx_initial + 6]
+                if need[-1] >= len(cells_full):
+                    # Beklenen ofset yoksa bu tr formatı farklıdır; geç
+                    continue
+
+                o1 = float_from_cell(cells_full[need[0]])
+                oX = float_from_cell(cells_full[need[1]])
+                o2 = float_from_cell(cells_full[need[2]])
+
+                if o1 and oX and o2 and o1 > 1.0 and oX > 1.0 and o2 > 1.0:
+                    return [o1, oX, o2]
+
+            return None
+
+        # 1) Önce oddscomp sayfasından dene
+        oddscomp_url = f"{base_url}/oddscomp/{match_id}"
+        html1 = safe_get(oddscomp_url, referer=base_url)
+        out = parse_bet365_initial_1x2_from_html(html1)
+        if out:
+            log_info(f"Bet365 Initial 1X2 (oddscomp HTML): {out[0]} - {out[1]} - {out[2]}")
+            return out
+
+        # 2) Olmazsa h2h sayfasından dene (ekranda gördüğün tablo burada da var)
+        h2h_url = f"{base_url}/match/h2h-{match_id}"
+        html2 = safe_get(h2h_url, referer=base_url)
+        out = parse_bet365_initial_1x2_from_html(html2)
+        if out:
+            log_info(f"Bet365 Initial 1X2 (h2h HTML): {out[0]} - {out[1]} - {out[2]}")
+            return out
+
+        log_error("Bet365 Initial 1X2 oranları HTML içinde bulunamadı (oddscomp + h2h denendi).")
         return [1.0, 1.0, 1.0]
 
     except Exception as e:
-        log_error(f"Oran çekme hatası (Sniper Mod): {e}")
+        log_error(f"Oran çekme hatası (HTML Bet365 Initial 1X2): {e}")
         return [1.0, 1.0, 1.0]
 
 def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict[str, Any]:
@@ -1156,7 +1189,6 @@ def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict
     if "Standings" in html: st_count_h = 10; st_count_a = 10 
     
     # === [GÜNCELLENDİ] ORAN ÇEKME ===
-    # Görseldeki tablo yapısına (Bet365 -> Initial -> Skip Asian -> Get 1x2) göre çeker
     scraped_odds = fetch_real_odds(match_id, base_domain)
     
     if scraped_odds and scraped_odds != [1.0, 1.0, 1.0]:
