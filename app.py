@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 NowGoal Match Analyzer - ULTIMATE VBA LOGIC REPLICA
-- BASE: Python Scraping Engine (v5.6) - BLIND NUMBER SCANNER
+- BASE: Python Scraping Engine (v5.7) - BRUTE FORCE TEXT MINER
 - LOGIC: VBA 'Magic Dice' (PoissonRastgele) Logic Implemented
 - SIMULATION: Iterative loop (10,000 runs) exactly like VBA
 - OUTPUT: Exact "ResimGibi" VBA Format
@@ -30,7 +30,7 @@ H2H_N = 10     # H2H için çekilecek maç sayısı
 
 # Render/Bot Koruması İçin Güçlü Header
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
     "Accept-Language": "en-US,en;q=0.9,tr;q=0.8",
     "Accept-Encoding": "gzip, deflate, br",
@@ -1075,81 +1075,53 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
 
 def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
     """
-    [BET365 'INITIAL' UNIVERSAL SCANNER]
-    
-    Mantık:
-    1. HTML yapısına (table, td, span) hiç güvenme.
-    2. 'Bet365' ismini bul.
-    3. 'Initial' kelimesini bul.
-    4. Ondan sonra gelen, arada ne tür işaretler olursa olsun,
-       SAYIYA BENZEYEN her şeyi sıraya diz.
-    5. Listeden 3, 4 ve 5. sıradaki sayıları çek (İlk 3'ü Asya'dır).
+    [BET365 KESİN ÇÖZÜM - TEMİZLİKÇİ METODU]
     """
     try:
         url = f"{base_url}/oddscomp/{match_id}"
         html = safe_get(url, referer=base_url)
         
-        # 1. HTML Dümdüz Yap (Satır kaymalarını yoksaymak için)
-        flat_html = html.replace('\n', '').replace('\r', '').replace('\t', '')
-
-        # 2. Bet365...Initial bloğunu bul
-        pattern = r'Bet365.*?Initial(.*?)(?:Live|Bet365|$)'
-        match = re.search(pattern, flat_html, re.IGNORECASE)
-        
-        if not match:
+        # 1. Bet365 bulamazsa çık
+        if "Bet365" not in html and "bet365" not in html:
             return [1.0, 1.0, 1.0]
-
-        segment = match.group(1)
-
-        # 3. YENİ MANTIK: "Körleme Sayı Toplama"
-        # Bu regex (sayı.nokta.sayı) formatındaki her şeyi,
-        # önünde arkasında ne olduğuna bakmaksızın toplar.
-        # Bu sayede >2.50< de olsa |2.50| de olsa yakalar.
-        found_numbers = re.findall(r'(\d+\.\d{2})', segment)
         
-        # Eğer hiç ondalıklı bulamazsa, belki tamsayıdır (3, 7 gibi)
-        if not found_numbers:
-            found_numbers = re.findall(r'(\d+)', segment)
-
-        # Temizlenmiş ve float yapılmış liste
-        clean_odds = []
-        for num_str in found_numbers:
-            try:
-                val = float(num_str)
-                # Mantık Süzgeci:
-                # Bir bahis oranı 1.01'den küçük olamaz.
-                # 30.00'dan büyük oran (Initial için) nadirdir, genelde tarih/ID karışır.
-                # Bu süzgeç, ID numaralarını (örn: 284142) eler.
-                if 1.01 < val < 30.0:
-                    clean_odds.append(val)
-            except:
-                continue
+        # 2. Bet365 sonrasını al
+        parts = re.split(r'Bet365', html, flags=re.IGNORECASE)
+        if len(parts) < 2: return [1.0, 1.0, 1.0]
         
-        # Beklenen Sıra: [Asya1, AsyaLine, Asya2, 1x2_Ev, 1x2_X, 1x2_Dep]
-        # Bazen AsyaLine "0" veya "0.5" gibi gelir.
+        raw_data = parts[1] # Bet365'ten sonraki kısım
         
-        if len(clean_odds) >= 6:
-            # İlk 3'ü atla (Asya), sonraki 3'ü al (1x2)
-            o1 = clean_odds[3]
-            oX = clean_odds[4]
-            o2 = clean_odds[5]
+        # 3. HTML TAGLERINI SİL (Sadece sayılar kalsın)
+        # <td class=...>2.50</td>  -->  2.50
+        clean_text = re.sub(r'<[^>]+>', ' ', raw_data) # Tagleri boşluk yap
+        
+        # 4. İLK 1000 KARAKTERİ AL (Çok uzağa gitme)
+        clean_text = clean_text[:1000]
+        
+        # 5. ONDALIKLI SAYILARI BUL (örn: 2.50, 10.00)
+        # 1.01 ile 99.00 arası sayıları al (tarihleri/idleri elemek için)
+        found = re.findall(r'\b(\d+\.\d{2})\b', clean_text)
+        
+        # 6. SÜZME VE SEÇME
+        valid_odds = []
+        for f in found:
+            val = float(f)
+            if 1.01 < val < 40.0: # Bahis oranı mantığı
+                valid_odds.append(val)
+        
+        # Listede şunlar olmalı: [Asya1, Asya2, Asya3, 1x2_Ev, 1x2_X, 1x2_Dep, ...]
+        # Biz 3, 4, 5. indeksleri istiyoruz.
+        if len(valid_odds) >= 6:
+            return [valid_odds[3], valid_odds[4], valid_odds[5]]
+        
+        # Eğer Asya yoksa ve direkt 1x2 varsa (nadir ama olur)
+        if len(valid_odds) >= 3:
+            return [valid_odds[0], valid_odds[1], valid_odds[2]]
             
-            log_info(f"Bet365 Initial 1x2 (Universal Mod): {o1} - {oX} - {o2}")
-            return [o1, oX, o2]
-            
-        elif len(clean_odds) >= 3:
-             # Eğer sadece 3 tane makul sayı bulabildiysek, mecburen onları alalım
-             # (Asya handikap yoksa)
-             o1 = clean_odds[0]
-             oX = clean_odds[1]
-             o2 = clean_odds[2]
-             log_info(f"Bet365 Initial 1x2 (Kısa Liste Mod): {o1} - {oX} - {o2}")
-             return [o1, oX, o2]
-
         return [1.0, 1.0, 1.0]
-
+        
     except Exception as e:
-        log_error(f"Oran çekme hatası (Universal Mod): {e}")
+        log_error(f"HATA: {e}")
         return [1.0, 1.0, 1.0]
 
 def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict[str, Any]:
