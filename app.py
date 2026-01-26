@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 NowGoal Match Analyzer - ULTIMATE VBA LOGIC REPLICA
-- BASE: Python Scraping Engine (v5.2) - Full Preservation
+- BASE: Python Scraping Engine (v5.3) - Robust Regex & Headers
 - LOGIC: VBA 'Magic Dice' (PoissonRastgele) Logic Implemented
 - SIMULATION: Iterative loop (10,000 runs) exactly like VBA
 - OUTPUT: Exact "ResimGibi" VBA Format
@@ -28,12 +28,19 @@ MC_RUNS_DEFAULT = 10000
 RECENT_N = 10  # PSS analizinde dikkate alınacak maksimum maç sayısı
 H2H_N = 10     # H2H için çekilecek maç sayısı
 
+# BOT KORUMASINI GEÇMEK İÇİN GÜÇLENDİRİLMİŞ HEADERS
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
     "Accept-Language": "en-US,en;q=0.9,tr;q=0.8",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0",
 }
 
 # ============================================================================
@@ -1068,79 +1075,74 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
 
 def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
     """
-    [BET365 INITIAL 1X2 ROBUST PARSER]
+    [BET365 INITIAL 1X2 - AGGRESSIVE FLATTENED PARSER]
     
     Mantık:
-    1. HTML'de 'Bet365' satırını bul.
-    2. Hemen altındaki 'Initial' satırına git.
-    3. O satırdaki TÜM hücrelerin (td) içindeki yazıları temizleyip bir listeye at.
-    4. Bu listedeki 3., 4. ve 5. sıradaki SAYISAL değerleri al.
-       (Çünkü ilk 3 değer Asya Handikap, sonraki 3 değer 1x2 Oranlarıdır)
+    1. HTML'deki tüm yeni satırları (\n) silip TEK SATIR yap.
+    2. 'Bet365' kelimesini bul ve sonrasını kes.
+    3. 'Initial' kelimesini bul ve sonrasını kes.
+    4. Kalan metindeki TÜM '>' ve '<' arasına sıkışmış sayıları (2.50, 0.95 vb.) topla.
+    5. İlk 3 sayı Asya handikapıdır (Atla).
+    6. Sonraki 3 sayı (3, 4, 5. indeks) 1x2 Oranlarıdır (AL).
     """
     try:
         url = f"{base_url}/oddscomp/{match_id}"
         html = safe_get(url, referer=base_url)
         
-        # 1. Bet365'i bul
-        if "Bet365" not in html and "bet365" not in html:
+        # 1. HTML DÜZLEŞTİRME (Çok önemli - Regex'in satır atlamasını önler)
+        flat_html = html.replace('\n', '').replace('\r', '').replace('\t', '')
+
+        # 2. Bet365'i bul
+        if "Bet365" not in flat_html and "bet365" not in flat_html:
             return [1.0, 1.0, 1.0]
 
-        # Bet365'ten sonrasını kes al
-        parts = re.split(r'Bet365', html, flags=re.IGNORECASE)
+        # Case-insensitive split
+        parts = re.split(r'Bet365', flat_html, flags=re.IGNORECASE)
         if len(parts) < 2: return [1.0, 1.0, 1.0]
         chunk = parts[1]
 
-        # 2. 'Initial' kelimesini bul ve sonrasını al
+        # 3. Initial'i bul
         initial_split = re.split(r'Initial', chunk, flags=re.IGNORECASE)
         if len(initial_split) < 2:
             return [1.0, 1.0, 1.0]
         
-        # Sadece ilgili satırı (row) veya yakın bloğu alalım (2000 karakter yeterli)
-        row_chunk = initial_split[1][:2000]
+        # Sadece ilgili kısmı al (ilk 1500 karakter yeterli, çok uzağa gitme)
+        target_area = initial_split[1][:1500]
 
-        # 3. Tüm TD hücrelerini regex ile ayıkla
-        # Regex açıklaması: <td...>(içinde ne varsa)</td>
-        # DOTALL modu açık, yani satır sonlarını da okur.
-        td_cells = re.findall(r'<td[^>]*>(.*?)</td>', row_chunk, re.IGNORECASE | re.DOTALL)
+        # 4. AGRESİF SAYI AVCISI
+        # Regex: > karakteri, ardından opsiyonel boşluk, ardından sayı (ondalıklı olabilir), ardından <
+        # Bu yöntem <td>, <span>, <b> ne varsa umursamaz, sadece içeriği alır.
+        matches = re.findall(r'>\s*(\d+\.\d{2})\s*<', target_area)
         
-        cleaned_values = []
-        for cell in td_cells:
-            # HTML taglerinden temizle (<span>, <b> vs sil)
-            text = re.sub(r'<[^>]+>', '', cell).strip()
-            if not text: continue
-            
-            # Sadece sayısal değer mi kontrol et (örn: 2.20 veya 0/0.5 gibi)
-            # Ama biz sadece 1x2 arıyoruz, onlar float görünümlü (2.20)
-            if re.search(r'\d', text):
-                cleaned_values.append(text)
+        # Beklenen Sıra (Görseldeki tabloya göre):
+        # [0] Asian Home (0.95)
+        # [1] Asian Line (0.5) - Bazen bu format farklı olabilir ama sayı ise buraya düşer
+        # [2] Asian Away (0.90)
+        # [3] 1X2 HOME (2.20) -> HEDEF
+        # [4] 1X2 DRAW (3.10) -> HEDEF
+        # [5] 1X2 AWAY (3.25) -> HEDEF
         
-        # LİSTE YAPISI (Beklenen):
-        # 0: Asya Home (örn: 0.95)
-        # 1: Asya HDP  (örn: 0/0.5) -> Bu bazen sayı, bazen yazı olabilir
-        # 2: Asya Away (örn: 0.90)
-        # 3: 1X2 HOME  <-- HEDEF
-        # 4: 1X2 DRAW  <-- HEDEF
-        # 5: 1X2 AWAY  <-- HEDEF
-        
-        if len(cleaned_values) < 6:
-             return [1.0, 1.0, 1.0]
+        if len(matches) < 6:
+            # Bazen Asian Line sayı formatında olmayabilir (0/0.5 gibi).
+            # O zaman sayıları biraz daha esnek arayalım.
+            log_info("Tam sayı formatı bulunamadı, esnek arama yapılıyor...")
+            # Bu regex 2.50'yi de bulur, 3'ü de bulur.
+            matches = re.findall(r'>\s*(\d+(?:\.\d+)?)\s*<', target_area)
 
-        def parse_float(val):
-            m = re.search(r'(\d+\.\d{2})', val)
-            return float(m.group(1)) if m else 0.0
+        if len(matches) >= 6:
+            # 3, 4 ve 5. indeksteki sayıları al
+            o1 = float(matches[3])
+            oX = float(matches[4])
+            o2 = float(matches[5])
 
-        o1 = parse_float(cleaned_values[3])
-        oX = parse_float(cleaned_values[4])
-        o2 = parse_float(cleaned_values[5])
-
-        if o1 > 1.0 and oX > 1.0 and o2 > 1.0:
-            log_info(f"Bet365 Initial 1x2 Bulundu: {o1} - {oX} - {o2}")
-            return [o1, oX, o2]
+            if o1 > 1.0 and oX > 1.0 and o2 > 1.0:
+                log_info(f"Bet365 Initial 1x2 Bulundu: {o1} - {oX} - {o2}")
+                return [o1, oX, o2]
         
         return [1.0, 1.0, 1.0]
 
     except Exception as e:
-        log_error(f"Oran çekme hatası (Yeni Mantık): {e}")
+        log_error(f"Oran çekme hatası (Agresif Mod): {e}")
         return [1.0, 1.0, 1.0]
 
 def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict[str, Any]:
