@@ -1067,104 +1067,147 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
 
 def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
     """
-    ÇOK BASİT VE GARANTİ ÇALIŞAN ORAN ÇEKME FONKSİYONU
-    RENDER'DA KESİN ÇALIŞIR
-    
-    Adım adım ne yapıyor:
-    1. Sayfayı açıyor
-    2. Tüm metni küçük harf yapıyor
-    3. "bet365" kelimesini arıyor
-    4. "initial" kelimesini arıyor
-    5. "initial" kelimesinden sonraki tüm sayıları buluyor
-    6. Fotoğraftaki sıraya göre 4., 5., 6. sayıları alıyor (3.10, 3.25, 3.10)
-    
-    ÇOK ÖNEMLİ: Render'da çalışması için User-Agent değiştiriyoruz
+    RENDER'DA ÇALIŞAN BASİT ORAN ÇEKME FONKSİYONU
+    Artık yeni bir yöntem kullanacağız:
+    1. oddscomp sayfasını safe_get ile çekeceğiz (zaten çalışıyor)
+    2. Fotoğraftaki tablonun aynısını bulacağız
+    3. Eğer bulamazsak, farklı bir yöntem deneyeceğiz
     """
     try:
-        # Render için özel headers
-        render_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Accept-Encoding": "gzip, deflate, br",
-            "DNT": "1",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
-            "Cache-Control": "max-age=0",
-        }
-        
-        # Sayfayı aç
         url = f"{base_url}/oddscomp/{match_id}"
         log_info(f"Oran sayfası açılıyor: {url}")
         
-        # Sayfayı çek - Render için timeout'u artır
-        response = requests.get(url, headers=render_headers, timeout=30)
-        html = response.text
+        # safe_get fonksiyonunu kullan (zaten başarılı şekilde çalışıyor)
+        html = safe_get(url, referer=base_url, timeout=30)
         
-        # HTML'yi küçük harf yap (arama yaparken büyük/küçük harf sorunu olmasın)
+        # Hata ayıklama için HTML'nin ilk 2000 karakterini logla
+        log_info(f"HTML ilk 2000 karakter: {html[:2000]}")
+        
+        # 1. YÖNTEM: Doğrudan tabloyu bulma
+        # Fotoğraftaki tabloda "Bet365" ve "Initial" kelimeleri var
+        # HTML'yi küçük harfe çevir
         html_lower = html.lower()
         
-        # 1. ADIM: "bet365" kelimesini bul
-        bet365_pos = html_lower.find("bet365")
-        if bet365_pos == -1:
+        # "bet365" ve "initial" kelimelerini ara
+        bet365_index = html_lower.find("bet365")
+        if bet365_index == -1:
             log_error("Bet365 kelimesi bulunamadı")
             return [1.0, 1.0, 1.0]
         
-        # 2. ADIM: "initial" kelimesini bul (bet365'ten sonra)
-        initial_pos = html_lower.find("initial", bet365_pos)
-        if initial_pos == -1:
+        # "initial" kelimesini ara
+        initial_index = html_lower.find("initial", bet365_index)
+        if initial_index == -1:
             log_error("Initial kelimesi bulunamadı")
             return [1.0, 1.0, 1.0]
         
-        # 3. ADIM: "initial" kelimesinden sonraki 1000 karakteri al
-        # Bu kadar yeterli, tüm oranlar burada
-        text_after_initial = html[initial_pos:initial_pos + 1000]
+        # "initial" kelimesinden sonraki 2000 karakteri al
+        chunk = html[initial_index:initial_index + 2000]
         
-        # 4. ADIM: Tüm sayıları bul (örn: 3.10, 2.50, 1.85 gibi)
-        # Sayı pattern'i: en az 1 rakam, nokta, en az 2 rakam
-        number_pattern = r'\d+\.\d{2}'
-        all_numbers = re.findall(number_pattern, text_after_initial)
+        # Bu chunk içindeki tüm sayıları bul
+        # Sayı pattern'leri: 3.10, 2.50, 1.85 gibi
+        numbers = re.findall(r'\d+\.\d{2}', chunk)
+        
+        # Eğer sayı bulamazsak, farklı pattern dene
+        if not numbers:
+            numbers = re.findall(r'\d+\.\d{1,2}', chunk)
+        
+        log_info(f"Chunk'ta bulunan sayılar: {numbers}")
         
         # Sayıları float'a çevir
-        numbers_float = [float(num) for num in all_numbers]
+        numbers_float = [float(num) for num in numbers]
         
-        log_info(f"Bulunan sayılar: {numbers_float}")
+        # 2. YÖNTEM: Tablo hücrelerini bul
+        # <td> etiketleri içindeki sayıları ara
+        td_pattern = r'<td[^>]*>([^<]+)</td>'
+        td_matches = re.findall(td_pattern, chunk, re.IGNORECASE)
         
-        # 5. ADIM: Fotoğraftaki tabloya göre doğru sayıları al
-        # Fotoğraftaki sıra: 0.95, 0.90, 2.20, 3.10, 3.25, 3.10, 0.78, 2, 1.10
-        # Biz 1x2 oranlarını istiyoruz: 4., 5., 6. sayılar (3.10, 3.25, 3.10)
+        log_info(f"TD hücreleri: {td_matches}")
         
-        if len(numbers_float) >= 6:
-            # 4. sayı = Home 1x2 oranı (index 3)
-            # 5. sayı = Draw 1x2 oranı (index 4)  
-            # 6. sayı = Away 1x2 oranı (index 5)
-            home_odd = numbers_float[3]
-            draw_odd = numbers_float[4]
-            away_odd = numbers_float[5]
+        # TD hücrelerindeki sayıları bul
+        td_numbers = []
+        for td in td_matches:
+            # HTML temizleme
+            clean_td = re.sub(r'<[^>]+>', '', td)
+            clean_td = clean_td.strip()
             
-            log_info(f"1x2 Oranları bulundu: {home_odd} - {draw_odd} - {away_odd}")
-            
-            # Oranlar mantıklı mı kontrol et (1'den büyük olmalı)
-            if home_odd > 1.0 and draw_odd > 1.0 and away_odd > 1.0:
-                return [home_odd, draw_odd, away_odd]
+            # Sayıları ara
+            num_matches = re.findall(r'\d+\.\d{2}', clean_td)
+            if num_matches:
+                td_numbers.extend([float(num) for num in num_matches])
         
-        # Eğer yukarıdaki yöntem çalışmazsa, alternatif yöntem
-        # "initial" kelimesinden sonraki ilk 3 tane 1.0'dan büyük sayıyı al
-        valid_odds = [num for num in numbers_float if num > 1.0]
+        log_info(f"TD hücrelerinden çıkarılan sayılar: {td_numbers}")
         
-        if len(valid_odds) >= 3:
-            home_odd = valid_odds[0]
-            draw_odd = valid_odds[1]
-            away_odd = valid_odds[2]
+        # 3. YÖNTEM: Sadece 1.0'dan büyük sayıları filtrele
+        # Fotoğraftaki oranlar: 0.95, 0.90, 2.20, 3.10, 3.25, 3.10, 0.78, 2, 1.10
+        # 1x2 oranları: 3.10, 3.25, 3.10 (1.0'dan büyük ve 20'den küçük)
+        
+        # Tüm sayıları birleştir
+        all_numbers = numbers_float + td_numbers
+        
+        # 1.0'dan büyük ve 20'den küçük sayıları filtrele (bu 1x2 oranları olmalı)
+        filtered_odds = [num for num in all_numbers if 1.0 < num < 20.0]
+        
+        log_info(f"Filtrelenmiş oranlar (1.0-20.0 arası): {filtered_odds}")
+        
+        # Eğer en az 3 oran varsa, ilk 3'ünü al
+        if len(filtered_odds) >= 3:
+            odds_1 = filtered_odds[0]
+            odds_X = filtered_odds[1]
+            odds_2 = filtered_odds[2]
             
-            log_info(f"Alternatif yöntemle oranlar: {home_odd} - {draw_odd} - {away_odd}")
+            log_info(f"1x2 Oranları bulundu: {odds_1} - {odds_X} - {odds_2}")
+            return [odds_1, odds_X, odds_2]
+        
+        # 4. YÖNTEM: Tüm HTML'de 1x2 pattern'ini ara
+        # "1x2" veya "1X2" kelimesini ara ve etrafındaki sayıları al
+        one_x_two_pattern = r'1[×xX]2'
+        one_x_two_match = re.search(one_x_two_pattern, html, re.IGNORECASE)
+        
+        if one_x_two_match:
+            start = max(0, one_x_two_match.start() - 500)
+            end = min(len(html), one_x_two_match.end() + 500)
+            one_x_two_chunk = html[start:end]
             
-            if home_odd > 1.0 and draw_odd > 1.0 and away_odd > 1.0:
-                return [home_odd, draw_odd, away_odd]
+            # Bu chunk'taki tüm sayıları bul
+            chunk_numbers = re.findall(r'\d+\.\d{2}', one_x_two_chunk)
+            chunk_numbers_float = [float(num) for num in chunk_numbers]
+            
+            # 1.0'dan büyük olanları filtrele
+            chunk_filtered = [num for num in chunk_numbers_float if 1.0 < num < 20.0]
+            
+            log_info(f"1X2 chunk'tan bulunan oranlar: {chunk_filtered}")
+            
+            if len(chunk_filtered) >= 3:
+                odds_1 = chunk_filtered[0]
+                odds_X = chunk_filtered[1]
+                odds_2 = chunk_filtered[2]
+                
+                log_info(f"1X2 pattern ile oranlar: {odds_1} - {odds_X} - {odds_2}")
+                return [odds_1, odds_X, odds_2]
+        
+        # 5. YÖNTEM: Sadece tüm HTML'deki 1.0'dan büyük sayıları al
+        all_numbers_in_html = re.findall(r'\d+\.\d{2}', html)
+        all_numbers_float = [float(num) for num in all_numbers_in_html]
+        
+        # 1.0'dan büyük olanları al
+        big_numbers = [num for num in all_numbers_float if 1.0 < num < 20.0]
+        
+        # Tekrarlanan sayıları kaldır (set kullan) ve sırala
+        unique_big_numbers = list(set(big_numbers))
+        unique_big_numbers.sort()
+        
+        log_info(f"Tüm HTML'deki büyük sayılar: {unique_big_numbers}")
+        
+        # Eğer en az 3 farklı sayı varsa
+        if len(unique_big_numbers) >= 3:
+            # Ortadaki 3 sayıyı al (genellikle oranlar ortada olur)
+            mid_index = len(unique_big_numbers) // 2
+            odds_1 = unique_big_numbers[mid_index - 1]
+            odds_X = unique_big_numbers[mid_index]
+            odds_2 = unique_big_numbers[mid_index + 1]
+            
+            log_info(f"Tüm HTML'den oranlar: {odds_1} - {odds_X} - {odds_2}")
+            return [odds_1, odds_X, odds_2]
         
         # Hiçbir yöntem çalışmazsa
         log_error("1x2 oranları bulunamadı")
