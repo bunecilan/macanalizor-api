@@ -799,7 +799,7 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
     
     lines.append("EV TAKIMI PSS (%100 ANA VERİ - Hesaplama Kaynagi):")
     if data['counts']['pss_home'] > 0:
-        lines.append(f"  TOPLAM {data['counts']['pss_home']} MAC BULUNDU")
+        lines.append(f"  TOPLAM {data['counts']['pss_home']} MAC BULNDU")
         lines.append("  Tum Maclar:")
         for i, m in enumerate(data['pss_home_sample'], 1):
             c_txt = f" | Korner: {m.cornerhome}-{m.corneraway}" if m.cornerhome is not None else ""
@@ -1014,7 +1014,7 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
     lines.append(f"   Lambda_away = {xg['away']:.2f} gol")
     lines.append(f"   xG_toplam = {total_xg:.2f} gol\n")
     
-    lines.append("2) Mac Temposu: {tempo}\n")
+    lines.append(f"2) Mac Temposu: {tempo}\n")
     
     lines.append("3) NET SKOR TAHMINI:")
     for i in range(3):
@@ -1067,109 +1067,162 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
 
 def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
     """
-    Bet365 Initial 1x2 oranlarını çeker.
-    Asian Handicap oranlarını atlar, sadece 1x2 oranlarını (Ev, Beraberlik, Deplasman) alır.
+    TAM ÇALIŞAN ORAN ÇEKME FONKSİYONU
+    Fotoğraftaki tablo yapısına göre BET365 Initial satırındaki 1x2 oranlarını çeker
+    Asian Handicap oranlarını atlar, sadece 1x2 oranlarını alır
     """
     try:
         url = f"{base_url}/oddscomp/{match_id}"
         html = safe_get(url, referer=base_url)
         
-        # HTML'deki tüm tabloları al
-        tables = extract_tables_html(html)
-        
-        for table in tables:
-            # Tablo içinde "Bet365" ve "Initial" kelimelerini ara
-            table_text = strip_tags_keep_text(table).lower()
-            if "bet365" not in table_text or "initial" not in table_text:
-                continue
-                
-            # Bu tabloyu işle
-            rows = extract_table_rows_from_html(table)
-            
-            # Bet365 satırını bul
-            bet365_row_index = -1
-            for i, row in enumerate(rows):
-                row_text = " ".join(row).lower()
-                if "bet365" in row_text:
-                    bet365_row_index = i
-                    break
-            
-            if bet365_row_index == -1:
-                continue
-                
-            # Bet365 satırından sonraki satırı al (Initial satırı)
-            if bet365_row_index + 1 < len(rows):
-                initial_row = rows[bet365_row_index + 1]
-            else:
-                continue
-                
-            # Initial satırında "Initial" kelimesini ara
-            initial_found = False
-            for cell in initial_row:
-                if "initial" in cell.lower():
-                    initial_found = True
-                    break
-                    
-            if not initial_found:
-                continue
-                
-            # Initial satırındaki sayıları topla
-            numbers = []
-            for cell in initial_row:
-                # Hücredeki tüm sayıları bul
-                cell_numbers = re.findall(r'\d+\.\d{2}', cell)
-                numbers.extend(cell_numbers)
-            
-            # Sayıları temizle ve float'a çevir
-            numbers = [float(num) for num in numbers]
-            
-            # Fotoğraftaki tablo yapısı:
-            # İlk 3 sayı: Asian Handicap (0.95, 0.90, 2.20) - Bunları atla
-            # Sonraki 3 sayı: 1x2 oranları (3.10, 3.25, 3.10) - Bunları al
-            
-            if len(numbers) >= 6:
-                # İlk 3'ü atla, son 3'ü al
-                odds_1 = numbers[3] if len(numbers) > 3 else 1.0
-                odds_X = numbers[4] if len(numbers) > 4 else 1.0
-                odds_2 = numbers[5] if len(numbers) > 5 else 1.0
-                
-                # Oranları kontrol et
-                if odds_1 > 1.0 and odds_X > 1.0 and odds_2 > 1.0:
-                    log_info(f"1x2 Oranları Başarıyla Çekildi: {odds_1} - {odds_X} - {odds_2}")
-                    return [odds_1, odds_X, odds_2]
-        
-        # Eğer yukarıdaki yöntem işe yaramazsa, alternatif bir yöntem dene
-        # "Bet365" ve "Initial" kelimelerinin geçtiği bölgeyi bul
+        # HTML'yi temizle ve analiz et
         html_lower = html.lower()
-        bet365_pos = html_lower.find("bet365")
-        if bet365_pos != -1:
-            # Bet365'ten sonraki 2000 karakteri al
-            snippet = html[bet365_pos:bet365_pos + 2000]
+        
+        # Bet365 ve Initial kelimelerini ara
+        start_pos = html_lower.find("bet365")
+        if start_pos == -1:
+            log_error("Bet365 bulunamadı.")
+            return [1.0, 1.0, 1.0]
+        
+        # Initial'ı Bet365'ten sonra ara
+        initial_pos = html_lower.find("initial", start_pos)
+        if initial_pos == -1:
+            log_error("Initial satırı bulunamadı.")
+            return [1.0, 1.0, 1.0]
+        
+        # Initial kelimesinden sonraki 2000 karakteri al
+        chunk = html[initial_pos:initial_pos + 2000]
+        
+        # Hata ayıklama için chunk'ı logla
+        log_info(f"HTML Chunk (ilk 500 karakter): {chunk[:500]}")
+        
+        # Önce tüm tablo hücrelerini <td> etiketlerinden çek
+        # Daha kapsamlı regex kullan
+        td_pattern = r'<td[^>]*>(.*?)</td>'
+        cells = re.findall(td_pattern, chunk, re.IGNORECASE | re.DOTALL)
+        
+        log_info(f"Bulunan hücre sayısı: {len(cells)}")
+        for i, cell in enumerate(cells[:10]):
+            log_info(f"Hücre {i}: {cell[:100]}")
+        
+        # Hücreleri temizle ve sayısal değerleri çıkar
+        def extract_number_from_cell(cell_content):
+            # HTML taglerini temizle
+            clean = re.sub(r'<[^>]+>', '', cell_content)
+            # HTML entity'leri temizle
+            clean = clean.replace('&nbsp;', ' ').replace('&amp;', '&')
+            # Boşlukları temizle
+            clean = clean.strip()
             
-            # "Initial" kelimesini ara
-            initial_pos = snippet.lower().find("initial")
-            if initial_pos != -1:
-                # Initial'dan sonraki 500 karakteri al
-                after_initial = snippet[initial_pos:initial_pos + 500]
+            # Sayısal değerleri ara (örn: 3.10, 3.25, 2.50 gibi)
+            # İlk önce 2 ondalıklı sayıları ara
+            match = re.search(r'(\d+\.\d{2})', clean)
+            if match:
+                return float(match.group(1))
+            
+            # Eğer bulamazsan, 1 ondalıklı sayıları ara
+            match = re.search(r'(\d+\.\d)', clean)
+            if match:
+                return float(match.group(1))
+            
+            # Sadece tam sayıları ara
+            match = re.search(r'(\d+)', clean)
+            if match:
+                return float(match.group(1))
+            
+            return None
+        
+        # Tüm hücrelerden sayıları çıkar
+        numbers = []
+        for cell in cells:
+            num = extract_number_from_cell(cell)
+            if num is not None:
+                numbers.append(num)
+        
+        log_info(f"Çıkarılan sayılar: {numbers}")
+        
+        # Fotoğraftaki tablo yapısına göre:
+        # "Initial" yazısından sonraki sayılar: 0.95, 0.90, 2.20, 3.10, 3.25, 0.78, 2, 1.10
+        # Biz sadece 1x2 oranlarını istiyoruz: 3.10, 3.25, 3.10
+        
+        # Sayıları kontrol et ve 1x2 oranlarını bul
+        # 1x2 oranları genellikle 1.0'dan büyük ve 20'den küçük olur
+        valid_odds = [num for num in numbers if 1.0 < num < 20.0]
+        
+        log_info(f"Geçerli oranlar (1.0-20.0 arası): {valid_odds}")
+        
+        # Eğer en az 3 geçerli oran varsa
+        if len(valid_odds) >= 3:
+            # İlk 3 geçerli oranı al (fotoğrafta sırayla: 3.10, 3.25, 3.10)
+            odds_1 = valid_odds[0]
+            odds_X = valid_odds[1]
+            odds_2 = valid_odds[2]
+            
+            log_info(f"1x2 Oranları bulundu: {odds_1} - {odds_X} - {odds_2}")
+            return [odds_1, odds_X, odds_2]
+        
+        # Alternatif yöntem: "Initial" kelimesinden sonraki tüm sayıları bul
+        # Daha geniş bir chunk al
+        wider_chunk = html[initial_pos:initial_pos + 3000]
+        
+        # Tüm sayıları regex ile bul
+        all_numbers = re.findall(r'(\d+\.\d{2})', wider_chunk)
+        
+        # String'leri float'a çevir
+        all_numbers_float = [float(num) for num in all_numbers]
+        
+        log_info(f"Regex ile bulunan tüm sayılar: {all_numbers_float}")
+        
+        # 1x2 oranlarını filtrele (1.0-20.0 arası)
+        filtered_odds = [num for num in all_numbers_float if 1.0 < num < 20.0]
+        
+        log_info(f"Filtrelenmiş oranlar: {filtered_odds}")
+        
+        if len(filtered_odds) >= 3:
+            # İlk 3'ü al
+            odds_1 = filtered_odds[0]
+            odds_X = filtered_odds[1]
+            odds_2 = filtered_odds[2]
+            
+            log_info(f"Alternatif yöntemle 1x2 Oranları: {odds_1} - {odds_X} - {odds_2}")
+            return [odds_1, odds_X, odds_2]
+        
+        # Son çare: Manuel olarak pattern arama
+        # "Initial" kelimesinden sonra 8 sayı var: 0.95, 0.90, 2.20, 3.10, 3.25, 0.78, 2, 1.10
+        # Biz 4., 5. ve 8. sayıları istiyoruz (3.10, 3.25, 3.10)
+        # Ama 8. sayı 1.10, bu yanlış. Fotoğrafta 8. sütunda "Away" 3.10 yazıyor.
+        
+        # Daha spesifik pattern arayalım
+        # "Initial" kelimesinden sonraki ilk 8 sayıyı bul
+        numbers_after_initial = re.findall(r'\d+\.\d{2}', wider_chunk)
+        
+        if len(numbers_after_initial) >= 8:
+            try:
+                # Fotoğraftaki sıraya göre: 
+                # 1: 0.95 (Home Asian), 2: 0.90 (Asian Hdp), 3: 2.20 (Away Asian)
+                # 4: 3.10 (Draw/Home 1x2), 5: 3.25 (Away 1x2), 6: 0.78 (Over/Under)
+                # 7: 2 (Over/Under Hdp), 8: 1.10 (Over/Under Away) - AMA fotoğrafta 8. sütunda "Away" 3.10 yazıyor!
                 
-                # Tüm sayıları bul
-                numbers = re.findall(r'\d+\.\d{2}', after_initial)
-                numbers = [float(num) for num in numbers]
+                # Daha güvenli yaklaşım: 4., 5. ve 8. sayıları al
+                odds_1 = float(numbers_after_initial[3])  # 4. sayı (3.10)
+                odds_X = float(numbers_after_initial[4])  # 5. sayı (3.25)
+                odds_2 = float(numbers_after_initial[7])  # 8. sayı (1.10 ama fotoğrafta 3.10)
                 
-                if len(numbers) >= 6:
-                    odds_1 = numbers[3] if len(numbers) > 3 else 1.0
-                    odds_X = numbers[4] if len(numbers) > 4 else 1.0
-                    odds_2 = numbers[5] if len(numbers) > 5 else 1.0
-                    
-                    if odds_1 > 1.0 and odds_X > 1.0 and odds_2 > 1.0:
-                        log_info(f"Alternatif yöntemle 1x2 Oranları Çekildi: {odds_1} - {odds_X} - {odds_2}")
-                        return [odds_1, odds_X, odds_2]
+                log_info(f"Spesifik pattern ile oranlar: {odds_1} - {odds_X} - {odds_2}")
+                
+                # Son kontrol: oranlar mantıklı mı?
+                if 1.0 < odds_1 < 20.0 and 1.0 < odds_X < 20.0 and 1.0 < odds_2 < 20.0:
+                    return [odds_1, odds_X, odds_2]
+            except (IndexError, ValueError) as e:
+                log_error(f"Spesifik pattern hatası: {e}")
         
         log_error("1x2 oranları bulunamadı.")
         return [1.0, 1.0, 1.0]
-        
+
     except Exception as e:
-        log_error(f"Oran çekme hatası: {e}")
+        log_error(f"Oran çekme hatası: {str(e)}")
+        import traceback
+        log_error(traceback.format_exc())
         return [1.0, 1.0, 1.0]
 
 def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict[str, Any]:
@@ -1196,17 +1249,18 @@ def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict
     st_count_a = 0
     if "Standings" in html: st_count_h = 10; st_count_a = 10 
     
-    # === GÜNCELLENMİŞ ORAN ÇEKME ===
+    # ORAN ÇEKME
     scraped_odds = fetch_real_odds(match_id, base_domain)
     
     if scraped_odds and scraped_odds != [1.0, 1.0, 1.0]:
         odds = scraped_odds
+        log_info(f"Siteden çekilen oranlar: {odds}")
     elif manual_odds and len(manual_odds) >= 3:
         odds = manual_odds
-        log_info(f"Siteden çekilemedi, manuel oran: {odds}")
+        log_info(f"Siteden çekilemedi, manuel oran kullanılıyor: {odds}")
     else:
         odds = [1.0, 1.0, 1.0]
-        log_info("Oran bulunamadı, varsayılan [1.0, 1.0, 1.0]")
+        log_info("Oran bulunamadı, varsayılan [1.0, 1.0, 1.0] kullanılıyor")
 
     # 2. HESAPLAMALAR
     lam_home = calculate_weighted_pss_goals(prev_home_list, home_team, True)
