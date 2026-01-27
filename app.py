@@ -1067,15 +1067,14 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
 
 def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
     """
-    KESİN ÇALIŞAN ORAN ÇEKME FONKSİYONU
-    Artık 1x2 oranlarını çekeceğiz
+    GELİŞMİŞ ORAN ÇEKME SİSTEMİ
+    Birden fazla kaynaktan ve yöntemle oran çeker
     """
     try:
-        # 1. ADIM: Sayfayı çek
+        # 1. ADIM: Oran sayfasını çek
         url = f"{base_url}/oddscomp/{match_id}"
         log_info(f"Oran sayfası açılıyor: {url}")
         
-        # Özel headers ekleyelim
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
@@ -1093,98 +1092,149 @@ def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
         response = requests.get(url, headers=headers, timeout=30)
         html = response.text
         
-        # 2. ADIM: HTML'de oran tablosunu ara
-        # Önce tüm tabloları bul
+        # 2. ADIM: Çoklu yöntemle oran arama
+        found_odds = None
+        
+        # YÖNTEM 1: Bet365 direkt oranları
+        bet365_patterns = [
+            r'bet365[^>]*?>[\s\S]*?(\d+\.\d{2})[\s\S]*?(\d+\.\d{2})[\s\S]*?(\d+\.\d{2})',
+            r'Bet\s*365[^>]*?>[\s\S]*?(\d+\.\d{2})[\s\S]*?(\d+\.\d{2})[\s\S]*?(\d+\.\d{2})',
+        ]
+        
+        for pattern in bet365_patterns:
+            match = re.search(pattern, html, re.IGNORECASE)
+            if match:
+                odds = [float(match.group(1)), float(match.group(2)), float(match.group(3))]
+                if all(1.0 < odd < 20.0 for odd in odds):
+                    log_info(f"YÖNTEM 1: Bet365 oranları bulundu: {odds}")
+                    return odds
+        
+        # YÖNTEM 2: Tablo satırlarını tara (ana oran tablosu)
         tables = extract_tables_html(html)
         log_info(f"Toplam {len(tables)} tablo bulundu")
         
-        # 3. ADIM: Her tabloyu kontrol et
         for i, table in enumerate(tables):
-            # Tabloyu metin olarak al
-            table_text = strip_tags_keep_text(table)
+            table_text = strip_tags_keep_text(table).lower()
             
-            # Tabloda oran olup olmadığını kontrol et
-            if "1x2" in table_text.lower() or "asian" in table_text.lower() or "handicap" in table_text.lower():
-                log_info(f"Tablo {i+1}: Oran tablosu bulundu")
-                
-                # Tablo satırlarını al
+            # Oran tablosu olup olmadığını kontrol et
+            if any(keyword in table_text for keyword in ['1x2', 'asian', 'handicap', 'home', 'draw', 'away']):
                 rows = extract_table_rows_from_html(table)
                 
-                # Bet365 satırını ara
+                # Popüler bahis şirketleri listesi
+                bookmakers = [
+                    'bet365', 'bet 365', 'pinnacle', 'sbobet', '1xbet', 
+                    'william hill', 'betfair', '888sport', '10bet', 'unibet'
+                ]
+                
                 for row in rows:
-                    row_text = " ".join(row).lower()
-                    
-                    # Bet365 satırını bul
-                    if "bet365" in row_text or "bet 365" in row_text:
-                        log_info(f"Bet365 satırı bulundu: {row}")
-                        
-                        # Satırdaki sayıları çıkar
-                        numbers_in_row = []
-                        for cell in row:
-                            # Hücredeki sayıları bul
-                            cell_numbers = re.findall(r'\d+\.\d{2}', cell)
-                            if cell_numbers:
-                                numbers_in_row.extend([float(num) for num in cell_numbers])
-                        
-                        log_info(f"Satırdaki sayılar: {numbers_in_row}")
-                        
-                        # 1.0-20.0 arası sayıları filtrele (oranlar bu aralıkta olur)
-                        odds = [num for num in numbers_in_row if 1.0 < num < 20.0]
-                        
-                        if len(odds) >= 3:
-                            # İlk 3 sayıyı al (Ev, Beraberlik, Deplasman)
-                            home_odd = odds[0]
-                            draw_odd = odds[1]
-                            away_odd = odds[2]
-                            
-                            log_info(f"1x2 Oranları bulundu: {home_odd} - {draw_odd} - {away_odd}")
-                            return [home_odd, draw_odd, away_odd]
+                    if len(row) > 3:
+                        # Satırın ilk hücresindeki şirket adını kontrol et
+                        first_cell = row[0].lower()
+                        for bookmaker in bookmakers:
+                            if bookmaker in first_cell:
+                                # Satırdaki tüm sayıları topla
+                                row_numbers = []
+                                for cell in row:
+                                    cell_numbers = re.findall(r'\d+\.\d{2}', cell)
+                                    row_numbers.extend([float(num) for num in cell_numbers])
+                                
+                                # 1.0-20.0 arasındaki sayıları filtrele
+                                valid_odds = [num for num in row_numbers if 1.0 < num < 20.0]
+                                
+                                if len(valid_odds) >= 3:
+                                    odds = valid_odds[:3]
+                                    log_info(f"YÖNTEM 2: {bookmaker} oranları bulundu (Tablo {i+1}): {odds}")
+                                    return odds
         
-        # 4. ADIM: Eğer tablo bulamazsak, tüm HTML'deki sayıları topla
-        # Tüm HTML'deki sayıları bul (ondalıklı)
-        all_numbers = re.findall(r'\d+\.\d{2}', html)
-        numbers_float = [float(num) for num in all_numbers]
-        
-        # 1.0-20.0 arası sayıları filtrele
-        filtered_odds = [num for num in numbers_float if 1.0 < num < 20.0]
-        
-        log_info(f"Tüm HTML'deki oranlar: {filtered_odds}")
-        
-        # Eğer 3 veya daha fazla oran varsa
-        if len(filtered_odds) >= 3:
-            # İlk 3 sayıyı al
-            home_odd = filtered_odds[0]
-            draw_odd = filtered_odds[1]
-            away_odd = filtered_odds[2]
-            
-            log_info(f"Tüm HTML'den 1x2 Oranları: {home_odd} - {draw_odd} - {away_odd}")
-            return [home_odd, draw_odd, away_odd]
-        
-        # 5. ADIM: Eğer hala bulamazsak, farklı bir yöntem dene
-        # "1x2" veya "1X2" kelimesini ara ve etrafındaki sayıları al
-        for pattern in [r'1[×xX]2', r'1\s*[×xX]\s*2']:
+        # YÖNTEM 3: "1x2" pattern'i etrafında arama
+        for pattern in [r'1[×xX]2', r'1\s*[×xX]\s*2', r'Home/Draw/Away']:
             match = re.search(pattern, html, re.IGNORECASE)
             if match:
-                start = max(0, match.start() - 200)
-                end = min(len(html), match.end() + 200)
+                start = max(0, match.start() - 500)
+                end = min(len(html), match.end() + 500)
                 chunk = html[start:end]
                 
-                # Chunk'taki sayıları bul
-                chunk_numbers = re.findall(r'\d+\.\d{2}', chunk)
-                chunk_numbers_float = [float(num) for num in chunk_numbers]
+                # Chunk'taki tüm sayıları bul
+                numbers = re.findall(r'\d+\.\d{2}', chunk)
+                numbers_float = [float(num) for num in numbers]
                 
                 # 1.0-20.0 arası sayıları filtrele
-                chunk_filtered = [num for num in chunk_numbers_float if 1.0 < num < 20.0]
+                filtered = [num for num in numbers_float if 1.0 < num < 20.0]
                 
-                if len(chunk_filtered) >= 3:
-                    home_odd = chunk_filtered[0]
-                    draw_odd = chunk_filtered[1]
-                    away_odd = chunk_filtered[2]
+                if len(filtered) >= 3:
+                    # Sayıları grupla (benzer olanları birleştir)
+                    grouped_odds = []
+                    for num in filtered:
+                        # Benzer oranları grupla (0.2 farkla)
+                        found = False
+                        for group in grouped_odds:
+                            if abs(num - sum(group)/len(group)) < 0.2:
+                                group.append(num)
+                                found = True
+                                break
+                        if not found:
+                            grouped_odds.append([num])
                     
-                    log_info(f"1X2 pattern ile oranlar: {home_odd} - {draw_odd} - {away_odd}")
-                    return [home_odd, draw_odd, away_odd]
+                    # En büyük 3 grubu bul (en çok tekrarlananlar)
+                    if grouped_odds:
+                        grouped_odds.sort(key=len, reverse=True)
+                        top_groups = grouped_odds[:3]
+                        top_groups.sort(key=lambda x: sum(x)/len(x))
+                        
+                        odds = [sum(group)/len(group) for group in top_groups]
+                        log_info(f"YÖNTEM 3: 1X2 pattern ile oranlar: {odds}")
+                        return odds
         
-        # 6. ADIM: Hiçbir yöntem çalışmazsa, manuel oranları döndür
+        # YÖNTEM 4: Tüm HTML'deki oranları analiz et
+        all_numbers = re.findall(r'\d+\.\d{2}', html)
+        all_float = [float(num) for num in all_numbers]
+        
+        # 1.0-20.0 arasındaki sayıları filtrele
+        filtered = [num for num in all_float if 1.0 < num < 20.0]
+        
+        if filtered:
+            # Frekans analizi
+            freq = Counter(filtered)
+            most_common = freq.most_common(10)
+            
+            log_info(f"YÖNTEM 4: En sık geçen oranlar: {most_common}")
+            
+            # En sık geçen 3 farklı oranı bul
+            seen = set()
+            odds = []
+            for value, count in most_common:
+                if len(odds) >= 3:
+                    break
+                # Benzer oranları birleştir
+                similar_exists = False
+                for odd in odds:
+                    if abs(value - odd) < 0.1:
+                        similar_exists = True
+                        break
+                if not similar_exists:
+                    odds.append(value)
+            
+            if len(odds) == 3:
+                odds.sort()
+                log_info(f"YÖNTEM 4: Frekans analizi ile oranlar: {odds}")
+                return odds
+        
+        # YÖNTEM 5: Mobil/API benzeri yapıyı ara
+        # JSON formatında oranları ara
+        json_patterns = [
+            r'"1x2"[^}]*?"home"[^:]*?:\s*(\d+\.\d{2})[^}]*?"draw"[^:]*?:\s*(\d+\.\d{2})[^}]*?"away"[^:]*?:\s*(\d+\.\d{2})',
+            r'"odds"[^}]*?"1"[^:]*?:\s*(\d+\.\d{2})[^}]*?"X"[^:]*?:\s*(\d+\.\d{2})[^}]*?"2"[^:]*?:\s*(\d+\.\d{2})',
+        ]
+        
+        for pattern in json_patterns:
+            match = re.search(pattern, html, re.IGNORECASE)
+            if match:
+                odds = [float(match.group(1)), float(match.group(2)), float(match.group(3))]
+                if all(1.0 < odd < 20.0 for odd in odds):
+                    log_info(f"YÖNTEM 5: JSON pattern ile oranlar: {odds}")
+                    return odds
+        
+        # Hiçbir yöntem çalışmazsa
         log_error("1x2 oranları bulunamadı")
         return [1.0, 1.0, 1.0]
         
