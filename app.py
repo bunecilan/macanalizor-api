@@ -1014,7 +1014,7 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
     lines.append(f"   Lambda_away = {xg['away']:.2f} gol")
     lines.append(f"   xG_toplam = {total_xg:.2f} gol\n")
     
-    lines.append(f"2) Mac Temposu: {tempo}\n")
+    lines.append("2) Mac Temposu: {tempo}\n")
     
     lines.append("3) NET SKOR TAHMINI:")
     for i in range(3):
@@ -1067,120 +1067,107 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
 
 def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
     """
-    Bet365 > Initial satırından sadece 1x2 oranlarını (Ev, Beraberlik, Deplasman) çeker.
-    Asian Handicap oranlarını tamamen atlar.
+    Bet365 Initial 1x2 oranlarını çeker.
+    Asian Handicap oranlarını atlar, sadece 1x2 oranlarını (Ev, Beraberlik, Deplasman) alır.
     """
     try:
         url = f"{base_url}/oddscomp/{match_id}"
         html = safe_get(url, referer=base_url)
         
-        # HTML'yi daha iyi parse etmek için
-        html_lower = html.lower()
+        # HTML'deki tüm tabloları al
+        tables = extract_tables_html(html)
         
-        # 1. Bet365 ve Initial kelimelerinin geçtiği yeri bul
-        start_pos = html_lower.find("bet365")
-        if start_pos == -1:
-            log_error("Bet365 bulunamadı.")
-            return [1.0, 1.0, 1.0]
-            
-        # 2. "Initial" kelimesini Bet365'ten sonra ara
-        initial_pos = html_lower.find("initial", start_pos)
-        if initial_pos == -1:
-            log_error("Bet365 içinde Initial satırı bulunamadı.")
-            return [1.0, 1.0, 1.0]
-        
-        # 3. "Initial" kelimesinden sonraki tablo hücrelerini bul
-        # Tablo yapısı: Initial'dan sonra 3 Asian Handicap hücresi, sonra 3 tane 1x2 hücresi
-        # Bu nedenle 6 hücreyi de çekip ilk 3'ü atlayacağız
-        
-        # HTML'yi daha kolay parse etmek için tablo satırını bulalım
-        # "Initial" kelimesini içeren <tr> satırını bul
-        tr_start = html.rfind("<tr", 0, initial_pos)
-        if tr_start == -1:
-            tr_start = html.rfind("<TR", 0, initial_pos)
-        
-        if tr_start == -1:
-            log_error("TR başlangıcı bulunamadı.")
-            return [1.0, 1.0, 1.0]
-            
-        tr_end = html.find("</tr>", tr_start)
-        if tr_end == -1:
-            tr_end = html.find("</TR>", tr_start)
-            
-        if tr_end == -1:
-            log_error("TR bitişi bulunamadı.")
-            return [1.0, 1.0, 1.0]
-            
-        row_html = html[tr_start:tr_end+5]
-        
-        # 4. Bu satırdaki tüm <td> hücrelerini çek
-        cells = re.findall(r'<td[^>]*>(.*?)</td>', row_html, re.IGNORECASE | re.DOTALL)
-        
-        # 5. Hücreleri temizle ve sayısal değerleri çıkar
-        def clean_odds_value(cell):
-            # HTML taglerini temizle
-            clean = re.sub(r'<.*?>', '', cell)
-            # &nbsp; gibi HTML entity'leri temizle
-            clean = clean.replace('&nbsp;', ' ')
-            # Boşlukları temizle
-            clean = clean.strip()
-            
-            # Sayısal değeri bul (örn: 3.10, 3.25 gibi)
-            match = re.search(r'(\d+\.\d{2})', clean)
-            if match:
-                return float(match.group(1))
-            
-            # Eğer 2 haneli sayı bulamazsak, başka format dene
-            match = re.search(r'(\d+\.\d)', clean)
-            if match:
-                return float(match.group(1))
+        for table in tables:
+            # Tablo içinde "Bet365" ve "Initial" kelimelerini ara
+            table_text = strip_tags_keep_text(table).lower()
+            if "bet365" not in table_text or "initial" not in table_text:
+                continue
                 
-            return 1.0
-        
-        # 6. Hücreleri temizle
-        cleaned_cells = [clean_odds_value(cell) for cell in cells]
-        
-        # 7. Hücre sayısını kontrol et ve 1x2 oranlarını al
-        # Fotoğraftaki tablo yapısına göre:
-        # İlk hücre: "Initial"
-        # Sonraki 3 hücre: Asian Handicap (0.95, 0.90, 2.20) - BUNLARI ATLIYORUZ
-        # Sonraki 3 hücre: 1x2 oranları (3.10, 3.25, 3.10) - BUNLARI ALIYORUZ
-        
-        if len(cleaned_cells) >= 7:  # En az 7 hücre olmalı
-            # İlk hücreyi atla ("Initial"), sonraki 3 Asian Handicap'ı atla
-            # 5., 6., 7. hücreleri al (0-index: 4, 5, 6)
-            odds_1 = cleaned_cells[4] if len(cleaned_cells) > 4 else 1.0
-            odds_X = cleaned_cells[5] if len(cleaned_cells) > 5 else 1.0
-            odds_2 = cleaned_cells[6] if len(cleaned_cells) > 6 else 1.0
+            # Bu tabloyu işle
+            rows = extract_table_rows_from_html(table)
             
-            # Oranları kontrol et (1'den büyük olmalı)
-            if odds_1 > 1.0 and odds_X > 1.0 and odds_2 > 1.0:
-                log_info(f"1x2 Oranları Başarıyla Çekildi: Ev={odds_1}, Beraberlik={odds_X}, Deplasman={odds_2}")
-                return [odds_1, odds_X, odds_2]
-        
-        # 8. Alternatif yaklaşım: Tüm sayıları bul ve belirli bir pattern'e göre al
-        # "Initial" kelimesinden sonraki tüm sayıları bul
-        after_initial = html[initial_pos:initial_pos + 500]  # 500 karakter yeterli
-        
-        # Tüm sayısal değerleri bul (örn: 3.10, 3.25 gibi)
-        all_numbers = re.findall(r'(\d+\.\d{2})', after_initial)
-        
-        if len(all_numbers) >= 6:
-            # İlk 3 sayı Asian Handicap (atla), sonraki 3 sayı 1x2 oranları
-            try:
-                odds_1 = float(all_numbers[3])  # 4. sayı
-                odds_X = float(all_numbers[4])  # 5. sayı
-                odds_2 = float(all_numbers[5])  # 6. sayı
+            # Bet365 satırını bul
+            bet365_row_index = -1
+            for i, row in enumerate(rows):
+                row_text = " ".join(row).lower()
+                if "bet365" in row_text:
+                    bet365_row_index = i
+                    break
+            
+            if bet365_row_index == -1:
+                continue
                 
+            # Bet365 satırından sonraki satırı al (Initial satırı)
+            if bet365_row_index + 1 < len(rows):
+                initial_row = rows[bet365_row_index + 1]
+            else:
+                continue
+                
+            # Initial satırında "Initial" kelimesini ara
+            initial_found = False
+            for cell in initial_row:
+                if "initial" in cell.lower():
+                    initial_found = True
+                    break
+                    
+            if not initial_found:
+                continue
+                
+            # Initial satırındaki sayıları topla
+            numbers = []
+            for cell in initial_row:
+                # Hücredeki tüm sayıları bul
+                cell_numbers = re.findall(r'\d+\.\d{2}', cell)
+                numbers.extend(cell_numbers)
+            
+            # Sayıları temizle ve float'a çevir
+            numbers = [float(num) for num in numbers]
+            
+            # Fotoğraftaki tablo yapısı:
+            # İlk 3 sayı: Asian Handicap (0.95, 0.90, 2.20) - Bunları atla
+            # Sonraki 3 sayı: 1x2 oranları (3.10, 3.25, 3.10) - Bunları al
+            
+            if len(numbers) >= 6:
+                # İlk 3'ü atla, son 3'ü al
+                odds_1 = numbers[3] if len(numbers) > 3 else 1.0
+                odds_X = numbers[4] if len(numbers) > 4 else 1.0
+                odds_2 = numbers[5] if len(numbers) > 5 else 1.0
+                
+                # Oranları kontrol et
                 if odds_1 > 1.0 and odds_X > 1.0 and odds_2 > 1.0:
-                    log_info(f"Alternatif yöntemle 1x2 Oranları Çekildi: {odds_1} - {odds_X} - {odds_2}")
+                    log_info(f"1x2 Oranları Başarıyla Çekildi: {odds_1} - {odds_X} - {odds_2}")
                     return [odds_1, odds_X, odds_2]
-            except (IndexError, ValueError):
-                pass
         
-        log_error("1x2 oranları bulunamadı veya geçersiz format.")
+        # Eğer yukarıdaki yöntem işe yaramazsa, alternatif bir yöntem dene
+        # "Bet365" ve "Initial" kelimelerinin geçtiği bölgeyi bul
+        html_lower = html.lower()
+        bet365_pos = html_lower.find("bet365")
+        if bet365_pos != -1:
+            # Bet365'ten sonraki 2000 karakteri al
+            snippet = html[bet365_pos:bet365_pos + 2000]
+            
+            # "Initial" kelimesini ara
+            initial_pos = snippet.lower().find("initial")
+            if initial_pos != -1:
+                # Initial'dan sonraki 500 karakteri al
+                after_initial = snippet[initial_pos:initial_pos + 500]
+                
+                # Tüm sayıları bul
+                numbers = re.findall(r'\d+\.\d{2}', after_initial)
+                numbers = [float(num) for num in numbers]
+                
+                if len(numbers) >= 6:
+                    odds_1 = numbers[3] if len(numbers) > 3 else 1.0
+                    odds_X = numbers[4] if len(numbers) > 4 else 1.0
+                    odds_2 = numbers[5] if len(numbers) > 5 else 1.0
+                    
+                    if odds_1 > 1.0 and odds_X > 1.0 and odds_2 > 1.0:
+                        log_info(f"Alternatif yöntemle 1x2 Oranları Çekildi: {odds_1} - {odds_X} - {odds_2}")
+                        return [odds_1, odds_X, odds_2]
+        
+        log_error("1x2 oranları bulunamadı.")
         return [1.0, 1.0, 1.0]
-
+        
     except Exception as e:
         log_error(f"Oran çekme hatası: {e}")
         return [1.0, 1.0, 1.0]
@@ -1210,7 +1197,6 @@ def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict
     if "Standings" in html: st_count_h = 10; st_count_a = 10 
     
     # === GÜNCELLENMİŞ ORAN ÇEKME ===
-    # Sadece 1x2 oranlarını çeker (Asian Handicap'ı atlar)
     scraped_odds = fetch_real_odds(match_id, base_domain)
     
     if scraped_odds and scraped_odds != [1.0, 1.0, 1.0]:
