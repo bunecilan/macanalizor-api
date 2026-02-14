@@ -1067,8 +1067,33 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
 
 def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
     """
-    NowGoal 1X2 oran çekici - DEBUG v7
-    JS data dosyasının GERÇEK formatını loglar.
+    NowGoal 1X2 oran çekici - v8 FINAL
+
+    NowGoal JS data formatı:
+    var game=Array(
+      "281|149911424|Bet 365|2.35|3.2|3|39.72|29.17|31.11|93.34|2.4|3.2|3.1|...",
+      "80|150196906|Macauslot|2.24|3.18|2.85|...",
+      ...
+    );
+
+    Her eleman pipe-separated:
+      [0] Company ID
+      [1] Record ID
+      [2] Company Name
+      [3] Initial Home odds  ← HEDEF
+      [4] Initial Draw odds  ← HEDEF
+      [5] Initial Away odds  ← HEDEF
+      [6] Home Win %
+      [7] Draw %
+      [8] Away %
+      [9] Return %
+      [10] Live Home odds
+      [11] Live Draw odds
+      [12] Live Away odds
+      ...
+
+    Bet 365 company ID = 281 (NOT 8!)
+    İsim = "Bet 365" (boşluklu!)
     """
 
     def validate_odds(o1, oX, o2):
@@ -1085,144 +1110,103 @@ def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
         else:
             return fallback_base + '/' + src
 
-    def debug_and_parse_js(text):
-        """JS dosyasının yapısını logla VE parse et"""
-        if not text or len(text) < 50:
+    def parse_nowgoal_js(text):
+        """
+        var game=Array("...", "...", ...) formatını parse eder.
+        Bet 365 initial 1X2 oranlarını döndürür.
+        """
+        if not text or len(text) < 100:
             return None
 
-        log_info(f"=== JS DEBUG BASLIYOR ({len(text)} chars) ===")
+        # game=Array(...) içindeki tüm string elemanları çek
+        # Format: var game=Array("str1","str2",...);
+        game_match = re.search(r'var\s+game\s*=\s*Array\s*\((.*?)\)\s*;', text, re.DOTALL)
+        if not game_match:
+            log_error("'var game=Array(...)' bulunamadi")
+            return None
 
-        # 1) İlk 1000 char (variable declarations)
-        log_info(f"ILK 1000: {text[:1000]}")
+        game_content = game_match.group(1)
+        log_info(f"game=Array bulundu, boyut: {len(game_content)}")
 
-        # 2) Bet365 kelimesini ara (case insensitive)
-        text_lower = text.lower()
-        b365_pos = text_lower.find('bet365')
-        log_info(f"'bet365' pozisyon: {b365_pos}")
-        if b365_pos != -1:
-            log_info(f"bet365 context: {text[max(0,b365_pos-100):b365_pos+300]}")
+        # Tüm "..." string elemanlarını çek
+        entries = re.findall(r'"([^"]+)"', game_content)
+        log_info(f"Toplam bahis sirketi sayisi: {len(entries)}")
 
-        # 3) "game[" pattern'ini ara
-        game_pos = text.find('game[')
-        log_info(f"'game[' pozisyon: {game_pos}")
-        if game_pos != -1:
-            log_info(f"game[ context: {text[game_pos:game_pos+500]}")
+        bet365_odds = None
+        bet365_live = None
 
-        # 4) Bilinen doğru oran 2.35'i ara ve çevresini göster
-        search_val = "2.35"
-        val_positions = []
-        start = 0
-        while len(val_positions) < 10:
-            pos = text.find(search_val, start)
-            if pos == -1:
-                break
-            val_positions.append(pos)
-            start = pos + 1
-        log_info(f"'{search_val}' pozisyonlari: {val_positions}")
-
-        for pos in val_positions[:3]:
-            context = text[max(0, pos-200):pos+300]
-            # Multiline temizle
-            context_clean = context.replace('\r\n', '\\n').replace('\n', '\\n')
-            log_info(f"2.35 context (pos {pos}): {context_clean[:400]}")
-
-        # 5) "3.20" (bilinen draw oranı) ara
-        draw_positions = []
-        start = 0
-        while len(draw_positions) < 10:
-            pos = text.find("3.20", start)
-            if pos == -1:
-                break
-            draw_positions.append(pos)
-            start = pos + 1
-        log_info(f"'3.20' pozisyonlari: {draw_positions[:10]}")
-
-        # 6) Dosya yapısı analizi - hangi JS patternler var
-        patterns_found = {
-            'game[': len(re.findall(r'game\[', text)),
-            'new Array': len(re.findall(r'new Array', text)),
-            'var ': len(re.findall(r'\bvar\s', text)),
-            'function': len(re.findall(r'\bfunction\s', text)),
-            'Bet365': len(re.findall(r'Bet365', text, re.IGNORECASE)),
-            'company': len(re.findall(r'company', text, re.IGNORECASE)),
-            'odds': len(re.findall(r'odds', text, re.IGNORECASE)),
-            '=[': len(re.findall(r'=\s*\[', text)),
-            'pipe |': text.count('|'),
-        }
-        log_info(f"Pattern sayilari: {patterns_found}")
-
-        # 7) var ile başlayan satırları listele (değişken adları)
-        var_names = re.findall(r'\bvar\s+(\w+)\s*=', text)
-        log_info(f"Degisken adlari ({len(var_names)}): {var_names[:30]}")
-
-        # 8) 10000. karakterden sonraki 2000 char (data bölümü muhtemelen burada)
-        if len(text) > 10000:
-            log_info(f"CHARS 10000-12000: {text[10000:12000]}")
-
-        # 9) 50000. karakterden sonraki 2000 char 
-        if len(text) > 50000:
-            log_info(f"CHARS 50000-52000: {text[50000:52000]}")
-
-        # 10) Son 2000 char
-        log_info(f"SON 2000: {text[-2000:]}")
-
-        # ==========================================
-        # PARSE ETMEYE ÇALIŞ - çok permissive
-        # ==========================================
-
-        # Tüm satırları tara - "8" ID'li company
-        for line in text.split('\n'):
-            line = line.strip()
-            if not line:
+        for entry in entries:
+            parts = entry.split('|')
+            if len(parts) < 6:
                 continue
-            # Tam olarak ",8," veya "[8," veya "(8," veya "=8," pattern
-            if re.search(r'[,\[\(=]\s*8\s*,', line):
-                floats = re.findall(r'(\d+\.\d{1,2})', line)
-                valid = [float(f) for f in floats if 1.01 < float(f) < 15.0]
-                if len(valid) >= 3:
-                    log_info(f"ID-8 satiri: valid={valid[:10]} | line={line[:200]}")
-                    for i in range(len(valid) - 2):
-                        a, b, c = valid[i], valid[i+1], valid[i+2]
-                        if validate_odds(a, b, c) and b > a and b > c:
-                            log_info(f"ORAN BULUNDU: {a} {b} {c}")
-                            return [a, b, c]
-                    return [valid[0], valid[1], valid[2]]
 
-        # Tüm var assignments'ları tara
-        var_blocks = re.findall(r'var\s+(\w+)\s*=\s*"([^"]+)"', text)
-        for name, val in var_blocks:
-            floats = re.findall(r'(\d+\.\d{1,2})', val)
-            valid = [float(f) for f in floats if 1.01 < float(f) < 15.0]
-            if len(valid) >= 3:
-                log_info(f"var {name} valid odds: {valid[:10]}")
-                # Bet365 = company 8
-                if ',8,' in val or val.startswith('8,'):
-                    for i in range(len(valid) - 2):
-                        a, b, c = valid[i], valid[i+1], valid[i+2]
-                        if validate_odds(a, b, c) and b > a and b > c:
-                            log_info(f"ORAN BULUNDU (var): {a} {b} {c}")
-                            return [a, b, c]
+            company_name = parts[2].strip()
 
-        # var X = new Array(...) format
-        var_arrays = re.findall(r'var\s+(\w+)\s*=\s*new\s+Array\((.*?)\)', text, re.DOTALL)
-        for name, content in var_arrays:
-            if '8' in content[:20]:  # İlk 20 char'da 8 varsa
-                floats = re.findall(r'(\d+\.\d{1,2})', content)
-                valid = [float(f) for f in floats if 1.01 < float(f) < 15.0]
-                if len(valid) >= 3:
-                    log_info(f"Array {name} valid odds: {valid[:10]}")
-                    for i in range(len(valid) - 2):
-                        a, b, c = valid[i], valid[i+1], valid[i+2]
-                        if validate_odds(a, b, c) and b > a and b > c:
-                            return [a, b, c]
+            # Bet 365 bul (boşluklu veya boşluksuz)
+            is_bet365 = ('bet' in company_name.lower() and '365' in company_name)
 
-        log_error("Parse basarisiz - debug loglara bak")
+            if is_bet365:
+                log_info(f"Bet365 bulundu: ID={parts[0]}, Name={company_name}")
+                log_info(f"Bet365 tum veriler: {parts[:15]}")
+
+                try:
+                    # Initial odds: parts[3], parts[4], parts[5]
+                    init_home = float(parts[3])
+                    init_draw = float(parts[4])
+                    init_away = float(parts[5])
+
+                    log_info(f"Bet365 Initial: Home={init_home}, Draw={init_draw}, Away={init_away}")
+
+                    if validate_odds(init_home, init_draw, init_away):
+                        bet365_odds = [init_home, init_draw, init_away]
+
+                    # Live odds: parts[10], parts[11], parts[12]
+                    if len(parts) >= 13:
+                        live_home = float(parts[10])
+                        live_draw = float(parts[11])
+                        live_away = float(parts[12])
+                        log_info(f"Bet365 Live: Home={live_home}, Draw={live_draw}, Away={live_away}")
+                        if validate_odds(live_home, live_draw, live_away):
+                            bet365_live = [live_home, live_draw, live_away]
+
+                except (ValueError, IndexError) as e:
+                    log_error(f"Bet365 parse hatasi: {e}")
+
+                break  # Bet365 bulundu, döngüden çık
+
+        # Bet365 Live > Initial tercih et (maç öncesi en güncel)
+        if bet365_live:
+            log_info(f"ORAN BULUNDU (Bet365 Live): {bet365_live}")
+            return bet365_live
+        if bet365_odds:
+            log_info(f"ORAN BULUNDU (Bet365 Initial): {bet365_odds}")
+            return bet365_odds
+
+        # Bet365 bulunamadıysa, ilk geçerli şirketin oranlarını al
+        log_info("Bet365 bulunamadi, ilk gecerli sirket deneniyor...")
+        for entry in entries:
+            parts = entry.split('|')
+            if len(parts) < 6:
+                continue
+            try:
+                o1 = float(parts[3])
+                oX = float(parts[4])
+                o2 = float(parts[5])
+                if validate_odds(o1, oX, o2):
+                    log_info(f"Yedek sirket: {parts[2]} -> {o1} {oX} {o2}")
+                    return [o1, oX, o2]
+            except (ValueError, IndexError):
+                continue
+
+        log_error("Hicbir sirketten gecerli oran bulunamadi")
         return None
 
     try:
         log_info(f"=== ORAN CEKME BASLIYOR: match_id={match_id} ===")
 
-        # ADIM 1: Bilinen data domain
+        # =========================================
+        # ADIM 1: Bilinen data domain'i doğrudan dene
+        # =========================================
         data_url = f"https://1x2.nowgoal29.com/{match_id}.js"
         try:
             log_info(f"Data URL: {data_url}")
@@ -1230,25 +1214,29 @@ def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
             headers['Referer'] = f"{base_url}/1x2-odds/{match_id}"
             r = requests.get(data_url, headers=headers, timeout=12)
             if r.status_code == 200 and len(r.text) > 100:
-                result = debug_and_parse_js(r.text)
+                result = parse_nowgoal_js(r.text)
                 if result:
                     return result
         except Exception as e:
             log_error(f"Data URL hata: {e}")
 
-        # ADIM 2: 1x2-odds sayfasından JS bul
+        # =========================================
+        # ADIM 2: 1x2-odds sayfasından JS URL bul
+        # =========================================
         try:
             url_1x2 = f"{base_url}/1x2-odds/{match_id}"
+            log_info(f"1x2-odds: {url_1x2}")
             html_1x2 = safe_get(url_1x2, referer=base_url)
+
             script_srcs = re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html_1x2, re.IGNORECASE)
             for src in script_srcs:
                 if match_id in src:
                     full_url = resolve_url(src, base_url)
-                    log_info(f"VERI JS: {full_url}")
+                    log_info(f"Veri JS: {full_url}")
                     try:
                         r = requests.get(full_url, headers=HEADERS, timeout=12)
                         if r.status_code == 200 and len(r.text) > 100:
-                            result = debug_and_parse_js(r.text)
+                            result = parse_nowgoal_js(r.text)
                             if result:
                                 return result
                     except Exception as e:
@@ -1256,7 +1244,26 @@ def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
         except Exception as e:
             log_error(f"1x2-odds hatasi: {e}")
 
-        log_error("TUM YONTEMLER BASARISIZ")
+        # =========================================
+        # ADIM 3: Alternatif data domain'leri dene
+        # =========================================
+        alt_domains = [
+            f"https://1x2.nowgoal26.com/{match_id}.js",
+            f"https://1x2.nowgoal28.com/{match_id}.js",
+            f"https://1x2.nowgoal25.com/{match_id}.js",
+        ]
+        for alt_url in alt_domains:
+            try:
+                log_info(f"Alt domain: {alt_url}")
+                r = requests.get(alt_url, headers=HEADERS, timeout=10)
+                if r.status_code == 200 and len(r.text) > 100:
+                    result = parse_nowgoal_js(r.text)
+                    if result:
+                        return result
+            except Exception:
+                continue
+
+        log_error("TUM YONTEMLER BASARISIZ - Oran cekilemedi.")
         return [1.0, 1.0, 1.0]
 
     except Exception as e:
