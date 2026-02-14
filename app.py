@@ -1069,31 +1069,23 @@ def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
     """
     NowGoal 1X2 oran çekici - v8 FINAL
 
-    NowGoal JS data formatı:
+    JS data formatı:
     var game=Array(
-      "281|149911424|Bet 365|2.35|3.2|3|39.72|29.17|31.11|93.34|2.4|3.2|3.1|...",
-      "80|150196906|Macauslot|2.24|3.18|2.85|...",
+      "281|149911424|Bet 365|2.35|3.2|3|...|2.4|3.2|3.1|...",
       ...
     );
 
-    Her eleman pipe-separated:
+    Pipe-separated:
       [0] Company ID
       [1] Record ID
       [2] Company Name
-      [3] Initial Home odds  ← HEDEF
-      [4] Initial Draw odds  ← HEDEF
-      [5] Initial Away odds  ← HEDEF
-      [6] Home Win %
-      [7] Draw %
-      [8] Away %
-      [9] Return %
-      [10] Live Home odds
-      [11] Live Draw odds
-      [12] Live Away odds
-      ...
-
-    Bet 365 company ID = 281 (NOT 8!)
-    İsim = "Bet 365" (boşluklu!)
+      [3] Initial Home  ← BU LAZIM
+      [4] Initial Draw  ← BU LAZIM
+      [5] Initial Away  ← BU LAZIM
+      [6-9] Yüzdeler ve return
+      [10] Live Home
+      [11] Live Draw
+      [12] Live Away
     """
 
     def validate_odds(o1, oX, o2):
@@ -1111,15 +1103,10 @@ def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
             return fallback_base + '/' + src
 
     def parse_nowgoal_js(text):
-        """
-        var game=Array("...", "...", ...) formatını parse eder.
-        Bet 365 initial 1X2 oranlarını döndürür.
-        """
+        """var game=Array("...", "...") formatini parse eder."""
         if not text or len(text) < 100:
             return None
 
-        # game=Array(...) içindeki tüm string elemanları çek
-        # Format: var game=Array("str1","str2",...);
         game_match = re.search(r'var\s+game\s*=\s*Array\s*\((.*?)\)\s*;', text, re.DOTALL)
         if not game_match:
             log_error("'var game=Array(...)' bulunamadi")
@@ -1128,11 +1115,10 @@ def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
         game_content = game_match.group(1)
         log_info(f"game=Array bulundu, boyut: {len(game_content)}")
 
-        # Tüm "..." string elemanlarını çek
         entries = re.findall(r'"([^"]+)"', game_content)
         log_info(f"Toplam bahis sirketi sayisi: {len(entries)}")
 
-        bet365_odds = None
+        bet365_initial = None
         bet365_live = None
 
         for entry in entries:
@@ -1141,48 +1127,44 @@ def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
                 continue
 
             company_name = parts[2].strip()
-
-            # Bet 365 bul (boşluklu veya boşluksuz)
             is_bet365 = ('bet' in company_name.lower() and '365' in company_name)
 
             if is_bet365:
                 log_info(f"Bet365 bulundu: ID={parts[0]}, Name={company_name}")
-                log_info(f"Bet365 tum veriler: {parts[:15]}")
+                log_info(f"Bet365 veriler: {parts[:15]}")
 
                 try:
-                    # Initial odds: parts[3], parts[4], parts[5]
                     init_home = float(parts[3])
                     init_draw = float(parts[4])
                     init_away = float(parts[5])
-
-                    log_info(f"Bet365 Initial: Home={init_home}, Draw={init_draw}, Away={init_away}")
-
+                    log_info(f"Bet365 Initial: H={init_home}, D={init_draw}, A={init_away}")
                     if validate_odds(init_home, init_draw, init_away):
-                        bet365_odds = [init_home, init_draw, init_away]
+                        bet365_initial = [init_home, init_draw, init_away]
+                except (ValueError, IndexError) as e:
+                    log_error(f"Bet365 initial parse hatasi: {e}")
 
-                    # Live odds: parts[10], parts[11], parts[12]
+                try:
                     if len(parts) >= 13:
                         live_home = float(parts[10])
                         live_draw = float(parts[11])
                         live_away = float(parts[12])
-                        log_info(f"Bet365 Live: Home={live_home}, Draw={live_draw}, Away={live_away}")
+                        log_info(f"Bet365 Live: H={live_home}, D={live_draw}, A={live_away}")
                         if validate_odds(live_home, live_draw, live_away):
                             bet365_live = [live_home, live_draw, live_away]
-
                 except (ValueError, IndexError) as e:
-                    log_error(f"Bet365 parse hatasi: {e}")
+                    log_error(f"Bet365 live parse hatasi: {e}")
 
-                break  # Bet365 bulundu, döngüden çık
+                break
 
-        # Bet365 Live > Initial tercih et (maç öncesi en güncel)
+        # Initial oranları tercih et (açılış oranları)
+        if bet365_initial:
+            log_info(f"ORAN BULUNDU (Bet365 Initial): {bet365_initial}")
+            return bet365_initial
         if bet365_live:
-            log_info(f"ORAN BULUNDU (Bet365 Live): {bet365_live}")
+            log_info(f"ORAN BULUNDU (Bet365 Live - yedek): {bet365_live}")
             return bet365_live
-        if bet365_odds:
-            log_info(f"ORAN BULUNDU (Bet365 Initial): {bet365_odds}")
-            return bet365_odds
 
-        # Bet365 bulunamadıysa, ilk geçerli şirketin oranlarını al
+        # Bet365 yoksa ilk geçerli şirket
         log_info("Bet365 bulunamadi, ilk gecerli sirket deneniyor...")
         for entry in entries:
             parts = entry.split('|')
@@ -1204,9 +1186,7 @@ def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
     try:
         log_info(f"=== ORAN CEKME BASLIYOR: match_id={match_id} ===")
 
-        # =========================================
-        # ADIM 1: Bilinen data domain'i doğrudan dene
-        # =========================================
+        # ADIM 1: Bilinen data domain
         data_url = f"https://1x2.nowgoal29.com/{match_id}.js"
         try:
             log_info(f"Data URL: {data_url}")
@@ -1220,14 +1200,11 @@ def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
         except Exception as e:
             log_error(f"Data URL hata: {e}")
 
-        # =========================================
         # ADIM 2: 1x2-odds sayfasından JS URL bul
-        # =========================================
         try:
             url_1x2 = f"{base_url}/1x2-odds/{match_id}"
             log_info(f"1x2-odds: {url_1x2}")
             html_1x2 = safe_get(url_1x2, referer=base_url)
-
             script_srcs = re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html_1x2, re.IGNORECASE)
             for src in script_srcs:
                 if match_id in src:
@@ -1244,17 +1221,10 @@ def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
         except Exception as e:
             log_error(f"1x2-odds hatasi: {e}")
 
-        # =========================================
-        # ADIM 3: Alternatif data domain'leri dene
-        # =========================================
-        alt_domains = [
-            f"https://1x2.nowgoal26.com/{match_id}.js",
-            f"https://1x2.nowgoal28.com/{match_id}.js",
-            f"https://1x2.nowgoal25.com/{match_id}.js",
-        ]
-        for alt_url in alt_domains:
+        # ADIM 3: Alternatif domain'ler
+        for alt in ["26", "28", "25"]:
+            alt_url = f"https://1x2.nowgoal{alt}.com/{match_id}.js"
             try:
-                log_info(f"Alt domain: {alt_url}")
                 r = requests.get(alt_url, headers=HEADERS, timeout=10)
                 if r.status_code == 200 and len(r.text) > 100:
                     result = parse_nowgoal_js(r.text)
@@ -1263,7 +1233,7 @@ def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
             except Exception:
                 continue
 
-        log_error("TUM YONTEMLER BASARISIZ - Oran cekilemedi.")
+        log_error("TUM YONTEMLER BASARISIZ")
         return [1.0, 1.0, 1.0]
 
     except Exception as e:
