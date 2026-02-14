@@ -1067,380 +1067,400 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
 
 def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
     """
-    NowGoal'dan 1X2 oranları çeker.
-    NowGoal oranları AJAX ile yüklüyor - bu fonksiyon:
-    1) Bilinen AJAX endpoint'lerini dener
-    2) Sayfa içindeki <script src=""> JS dosyalarını tarar
-    3) Inline script'lerdeki AJAX URL'lerini bulup çağırır
-    4) Son çare: HTML'de agresif float tarama yapar
+    NowGoal'dan 1X2 oranlarını çeker.
+
+    NowGoal oranları JavaScript ile AJAX üzerinden yüklüyor.
+    Statik HTML'de hücreler boş geliyor (|-|).
+
+    Strateji:
+    1) oddscomp sayfasından oddsComp.js dosyasını bul
+    2) JS dosyası içindeki AJAX endpoint URL'sini keşfet
+    3) O endpoint'i match_id ile çağır
+    4) Dönen veriyi parse et → Bet365 1X2 oranlarını çıkar
     """
 
     def validate_odds(o1, oX, o2):
         return (1.01 < o1 < 50.0 and 1.01 < oX < 50.0 and 1.01 < o2 < 50.0)
 
-    def extract_odds_from_text(text, label=""):
-        """Herhangi bir text içinden Bet365 1X2 oranlarını çıkarmaya çalışır"""
-        if not text:
+    def parse_odds_response(text, label=""):
+        """AJAX response'undan 1X2 oranlarını çıkar - tüm formatlar"""
+        if not text or len(text) < 10:
             return None
 
-        # --- A) pipe-separated: 8|Bet365|2.50|3.20|2.80 ---
-        pipe_blocks = re.findall(r'8\|[^|]*[Bb]et365\|([^;]+)', text)
-        for block in pipe_blocks:
-            floats = re.findall(r'(\d+\.\d{1,2})', block)
-            if len(floats) >= 3:
-                vals = [float(f) for f in floats if 1.01 < float(f) < 50.0]
-                if len(vals) >= 3:
-                    log_info(f"{label} pipe-Bet365: {vals[0]} {vals[1]} {vals[2]}")
-                    return [vals[0], vals[1], vals[2]]
+        log_info(f"{label} response ilk 500 char: {text[:500]}")
 
-        # --- B) comma-separated arrays: [8,"Bet365",2.50,3.20,...] ---
-        arr_matches = re.findall(r'[\[,(]8\s*,\s*["\']Bet365["\'][,\s]+([\d.,\s]+)', text, re.IGNORECASE)
-        for arr in arr_matches:
-            floats = re.findall(r'(\d+\.\d{1,2})', arr)
+        # --- FORMAT A: Pipe-separated ---
+        # "8|Bet365|0.86|-0.25|1.00|2.35|3.20|3.00|..." veya benzeri
+        pipe_lines = text.replace('\r\n', '\n').split(';')
+        if len(pipe_lines) < 2:
+            pipe_lines = text.split('\n')
+
+        for line in pipe_lines:
+            parts = line.split('|')
+            if len(parts) < 4:
+                continue
+            # Bet365 = company ID 8
+            is_bet365 = False
+            if parts[0].strip() == '8':
+                is_bet365 = True
+            elif len(parts) > 1 and 'bet365' in parts[1].lower():
+                is_bet365 = True
+
+            if is_bet365:
+                log_info(f"{label} Bet365 pipe satiri: {line[:200]}")
+                # Tüm float değerleri çek
+                floats = []
+                for p in parts:
+                    try:
+                        v = float(p.strip())
+                        if 1.01 < v < 50.0:
+                            floats.append(v)
+                    except ValueError:
+                        pass
+                log_info(f"{label} Bet365 valid floats: {floats}")
+
+                # İlk 3 valid float genelde AH, sonraki 3 1X2
+                # Ama formatı bilmiyoruz, hepsini deneyelim
+                if len(floats) >= 6:
+                    # İlk 3 atla (AH), sonraki 3 al (1X2)
+                    o1, oX, o2 = floats[3], floats[4], floats[5]
+                    if validate_odds(o1, oX, o2) and oX > o1 and oX > o2:
+                        log_info(f"{label} Bet365 skip3: {o1} {oX} {o2}")
+                        return [o1, oX, o2]
+                    # Beraberlik ortada olmalı (genelde en yüksek)
+                    # Tüm 3'lü kombinasyonları dene
+                    for i in range(len(floats) - 2):
+                        a, b, c = floats[i], floats[i+1], floats[i+2]
+                        if validate_odds(a, b, c) and b > a and b > c:
+                            log_info(f"{label} Bet365 combo[{i}]: {a} {b} {c}")
+                            return [a, b, c]
+
+                if len(floats) >= 3:
+                    o1, oX, o2 = floats[0], floats[1], floats[2]
+                    if validate_odds(o1, oX, o2):
+                        log_info(f"{label} Bet365 first3: {o1} {oX} {o2}")
+                        return [o1, oX, o2]
+
+        # --- FORMAT B: Comma-separated array ---
+        # [[8,"Bet365",0.86,-0.25,1.00,2.35,3.20,3.00,...], ...]
+        bracket_arrays = re.findall(r'\[([^\[\]]{10,500})\]', text)
+        for arr in bracket_arrays:
+            items = [x.strip().strip('"').strip("'") for x in arr.split(',')]
+            is_bet365 = False
+            if items and items[0] == '8':
+                is_bet365 = True
+            if len(items) > 1 and 'bet365' in items[1].lower():
+                is_bet365 = True
+
+            if is_bet365:
+                log_info(f"{label} Bet365 array: {items[:12]}")
+                floats = []
+                for item in items:
+                    try:
+                        v = float(item)
+                        if 1.01 < v < 50.0:
+                            floats.append(v)
+                    except ValueError:
+                        pass
+
+                if len(floats) >= 3:
+                    # Beraberlik oranı genelde en yüksek - doğru 3'lüyü bul
+                    for i in range(len(floats) - 2):
+                        a, b, c = floats[i], floats[i+1], floats[i+2]
+                        if validate_odds(a, b, c) and b > a and b > c:
+                            log_info(f"{label} Bet365 arr combo[{i}]: {a} {b} {c}")
+                            return [a, b, c]
+                    # Fallback
+                    o1, oX, o2 = floats[0], floats[1], floats[2]
+                    if validate_odds(o1, oX, o2):
+                        log_info(f"{label} Bet365 arr first3: {o1} {oX} {o2}")
+                        return [o1, oX, o2]
+
+        # --- FORMAT C: JSON ---
+        # {"CompanyID":8,"Home":2.35,"Draw":3.20,"Away":3.00,...}
+        try:
+            import json
+            data = json.loads(text)
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        cid = item.get('CompanyID', item.get('cId', item.get('companyId', item.get('cid', ''))))
+                        if str(cid) == '8':
+                            h = float(item.get('Home', item.get('h', item.get('home', item.get('HomeOdds', 0)))))
+                            d = float(item.get('Draw', item.get('d', item.get('draw', item.get('DrawOdds', 0)))))
+                            a = float(item.get('Away', item.get('a', item.get('away', item.get('AwayOdds', 0)))))
+                            if validate_odds(h, d, a):
+                                log_info(f"{label} JSON Bet365: {h} {d} {a}")
+                                return [h, d, a]
+            elif isinstance(data, dict):
+                for key, val in data.items():
+                    if isinstance(val, list):
+                        for item in val:
+                            if isinstance(item, dict):
+                                cid = item.get('CompanyID', item.get('cId', item.get('companyId', '')))
+                                if str(cid) == '8':
+                                    h = float(item.get('Home', item.get('h', item.get('home', 0))))
+                                    d = float(item.get('Draw', item.get('d', item.get('draw', 0))))
+                                    a = float(item.get('Away', item.get('a', item.get('away', 0))))
+                                    if validate_odds(h, d, a):
+                                        log_info(f"{label} JSON-nested Bet365: {h} {d} {a}")
+                                        return [h, d, a]
+        except (json.JSONDecodeError, ValueError, TypeError, KeyError):
+            pass
+
+        # --- FORMAT D: JavaScript variable assignment ---
+        # var oddsData = "8|Bet365|...";
+        js_vars = re.findall(r'var\s+\w+\s*=\s*["\']([^"\']+)["\']', text)
+        for var_val in js_vars:
+            result = parse_odds_response(var_val, f"{label}-jsvar")
+            if result:
+                return result
+
+        # --- FORMAT E: Genel float tarama (Bet365 yakınında) ---
+        text_lower = text.lower()
+        b365_pos = text_lower.find('bet365')
+        if b365_pos == -1:
+            b365_pos = text_lower.find('"8"')
+        if b365_pos == -1:
+            b365_pos = text_lower.find("'8'")
+
+        if b365_pos != -1:
+            chunk = text[b365_pos:b365_pos+500]
+            floats = re.findall(r'(\d+\.\d{1,2})', chunk)
             vals = [float(f) for f in floats if 1.01 < float(f) < 50.0]
+            log_info(f"{label} Bet365-chunk floats: {vals}")
+            for i in range(len(vals) - 2):
+                a, b, c = vals[i], vals[i+1], vals[i+2]
+                if validate_odds(a, b, c) and b > a and b > c:
+                    log_info(f"{label} chunk combo[{i}]: {a} {b} {c}")
+                    return [a, b, c]
             if len(vals) >= 3:
-                log_info(f"{label} array-Bet365: {vals[0]} {vals[1]} {vals[2]}")
                 return [vals[0], vals[1], vals[2]]
 
-        # --- C) JSON: "cId":8 veya "CompanyId":8 ---
-        json_blocks = re.findall(r'\{[^{}]{10,500}?\}', text)
-        for block in json_blocks:
-            if ('"8"' in block or ':8' in block) and ('bet365' in block.lower() or '"8"' in block):
-                floats = re.findall(r'(\d+\.\d{1,2})', block)
-                vals = [float(f) for f in floats if 1.01 < float(f) < 50.0]
-                if len(vals) >= 3:
-                    log_info(f"{label} json-Bet365: {vals[0]} {vals[1]} {vals[2]}")
-                    return [vals[0], vals[1], vals[2]]
-
-        # --- D) Satır bazlı: "Bet365" geçen satırda float ara ---
-        for line in text.split('\n'):
-            if 'bet365' in line.lower() or "'8'" in line or '"8"' in line:
-                floats = re.findall(r'(\d+\.\d{1,2})', line)
-                vals = [float(f) for f in floats if 1.01 < float(f) < 50.0]
-                # 6+ val: ilk 3 AH, sonraki 3 = 1X2
-                if len(vals) >= 6:
-                    o1, oX, o2 = vals[3], vals[4], vals[5]
-                    if validate_odds(o1, oX, o2):
-                        log_info(f"{label} line-skip3: {o1} {oX} {o2}")
-                        return [o1, oX, o2]
-                if len(vals) >= 3:
-                    o1, oX, o2 = vals[0], vals[1], vals[2]
-                    if validate_odds(o1, oX, o2):
-                        log_info(f"{label} line-direct: {o1} {oX} {o2}")
-                        return [o1, oX, o2]
-
         return None
 
-    def extract_any_bookmaker_odds_from_text(text, label=""):
-        """Bet365 bulunamazsa herhangi bir bahis şirketinin oranlarını çek"""
-        if not text:
-            return None
+    def discover_ajax_urls_from_js(js_content, match_id, base_url):
+        """
+        oddsComp.js dosyasının içinden AJAX endpoint URL'lerini keşfeder.
+        Bulunan URL'leri match_id ile birleştirip döndürür.
+        """
+        discovered = []
 
-        # Pipe-separated herhangi bir şirket
-        pipe_blocks = re.findall(r'\d+\|[^|]+\|([\d.]+)\|([\d.]+)\|([\d.]+)', text)
-        for m in pipe_blocks:
-            try:
-                o1, oX, o2 = float(m[0]), float(m[1]), float(m[2])
-                if validate_odds(o1, oX, o2):
-                    log_info(f"{label} any-pipe: {o1} {oX} {o2}")
-                    return [o1, oX, o2]
-            except ValueError:
-                pass
-
-        return None
-
-    def try_parse_html_aggressive(html_content, label=""):
-        """HTML'de <tr> satırlarını tarayarak oran bul"""
-        if not html_content:
-            return None
-
-        # TR satırlarını çek
-        trs = re.findall(r'<tr[^>]*>(.*?)</tr>', html_content, re.DOTALL | re.IGNORECASE)
-        log_info(f"{label} Toplam TR sayisi: {len(trs)}")
-
-        bet365_found = False
-        for tr in trs:
-            tr_text = re.sub(r'<[^>]+>', ' ', tr).strip()
-            tr_lower = tr_text.lower()
-
-            # Bet365 satırı mı?
-            is_bet365 = 'bet365' in tr_lower
-            if is_bet365:
-                bet365_found = True
-                log_info(f"{label} Bet365 TR bulundu, text: {tr_text[:200]}")
-
-            if not is_bet365:
-                continue
-
-            # Bu TR'deki tüm float değerleri
-            floats = re.findall(r'(\d+\.\d{1,2})', tr_text)
-            vals = [float(f) for f in floats if 1.01 < float(f) < 50.0]
-            log_info(f"{label} Bet365 TR float vals: {vals}")
-
-            if len(vals) >= 6:
-                o1, oX, o2 = vals[3], vals[4], vals[5]
-                if validate_odds(o1, oX, o2):
-                    log_info(f"{label} TR-skip3: {o1} {oX} {o2}")
-                    return [o1, oX, o2]
-            if len(vals) >= 3:
-                o1, oX, o2 = vals[0], vals[1], vals[2]
-                if validate_odds(o1, oX, o2):
-                    log_info(f"{label} TR-direct: {o1} {oX} {o2}")
-                    return [o1, oX, o2]
-
-            # TD hücrelerini ayrı ayrı oku
-            cells = re.findall(r'<td[^>]*>(.*?)</td>', tr, re.DOTALL | re.IGNORECASE)
-            cell_texts = [re.sub(r'<[^>]+>', '', c).strip() for c in cells]
-            log_info(f"{label} Bet365 TR hucreleri ({len(cell_texts)}): {cell_texts[:12]}")
-
-            cell_floats = []
-            for ct in cell_texts:
-                fm = re.search(r'(\d+\.\d{1,2})', ct)
-                if fm:
-                    cell_floats.append(float(fm.group(1)))
-
-            log_info(f"{label} Bet365 TR cell floats: {cell_floats}")
-
-            valid_odds = [f for f in cell_floats if 1.01 < f < 50.0]
-            if len(valid_odds) >= 6:
-                o1, oX, o2 = valid_odds[3], valid_odds[4], valid_odds[5]
-                if validate_odds(o1, oX, o2):
-                    log_info(f"{label} cell-skip3: {o1} {oX} {o2}")
-                    return [o1, oX, o2]
-            if len(valid_odds) >= 3:
-                o1, oX, o2 = valid_odds[0], valid_odds[1], valid_odds[2]
-                if validate_odds(o1, oX, o2):
-                    log_info(f"{label} cell-direct: {o1} {oX} {o2}")
-                    return [o1, oX, o2]
-
-        if not bet365_found:
-            log_info(f"{label} HICBIR TR'de Bet365 BULUNAMADI")
-            # Bet365 yoksa, herhangi bir TR'de 3+ geçerli oran bul
-            for tr in trs:
-                tr_text = re.sub(r'<[^>]+>', ' ', tr).strip()
-                if 'initial' in tr_text.lower():
-                    floats = re.findall(r'(\d+\.\d{1,2})', tr_text)
-                    vals = [float(f) for f in floats if 1.01 < float(f) < 50.0]
-                    if len(vals) >= 3:
-                        log_info(f"{label} Initial-TR fallback: {vals[:6]}")
-                        if len(vals) >= 6:
-                            return [vals[3], vals[4], vals[5]]
-                        return [vals[0], vals[1], vals[2]]
-
-        return None
-
-    def try_fetch_ajax_endpoints(match_id, base_url):
-        """NowGoal'un bilinen AJAX endpoint'lerini dene"""
-        ajax_urls = [
-            f"{base_url}/1x2/data/{match_id}",
-            f"{base_url}/ajax/1x2/{match_id}",
-            f"{base_url}/data/1x2/{match_id}.js",
-            f"{base_url}/1x2/oddsdata/{match_id}",
-            f"{base_url}/oddsdata.aspx?MatchId={match_id}&OddsType=1x2",
-            f"{base_url}/OddsData.aspx?id={match_id}&type=europe",
-            f"{base_url}/odds/1x2data/{match_id}",
-            f"{base_url}/1x2/bet365/{match_id}",
+        # 1. $.ajax({url: "..."}) veya $.get("...") patternleri
+        ajax_url_patterns = [
+            r'\$\.(?:ajax|get|post|getJSON)\s*\(\s*["\']([^"\']+)["\']',
+            r'\$\.(?:ajax|get|post|getJSON)\s*\(\s*\{[^}]*url\s*:\s*["\']([^"\']+)["\']',
+            r'url\s*:\s*["\']([^"\']+)["\']',
+            r'fetch\s*\(\s*["\']([^"\']+)["\']',
+            r'\.open\s*\(\s*["\'][A-Z]+["\']\s*,\s*["\']([^"\']+)["\']',
         ]
+        for pat in ajax_url_patterns:
+            matches = re.findall(pat, js_content)
+            for url in matches:
+                if any(kw in url.lower() for kw in ['odds', '1x2', 'data', 'comp', 'handler', 'ashx', 'aspx', 'api']):
+                    discovered.append(url)
 
-        for ajax_url in ajax_urls:
-            try:
-                headers = dict(HEADERS)
-                headers['Referer'] = f"{base_url}/1x2-odds/{match_id}"
-                headers['X-Requested-With'] = 'XMLHttpRequest'
-                headers['Accept'] = 'application/json, text/javascript, */*; q=0.01'
+        # 2. String concatenation: prefix + "/path/" + _scheduleID
+        # Pattern: "..." + variable + "..." → extract the fixed string parts
+        concat_patterns = re.findall(
+            r'["\']([^"\']*(?:odds|1x2|data|comp|handler)[^"\']*)["\']\s*\+',
+            js_content, re.IGNORECASE
+        )
+        discovered.extend(concat_patterns)
 
-                log_info(f"AJAX deneniyor: {ajax_url}")
-                r = requests.get(ajax_url, headers=headers, timeout=8)
-                if r.status_code == 200 and len(r.text) > 20:
-                    log_info(f"AJAX cevap ({len(r.text)} chars): {r.text[:300]}")
-                    result = extract_odds_from_text(r.text, f"AJAX({ajax_url.split('/')[-1]})")
-                    if result:
-                        return result
-                    result = extract_any_bookmaker_odds_from_text(r.text, f"AJAX-ANY({ajax_url.split('/')[-1]})")
-                    if result:
-                        return result
-            except Exception as e:
-                continue
+        # 3. Plus-concat with scheduleID
+        concat_patterns2 = re.findall(
+            r'\+\s*["\']([^"\']*(?:odds|1x2|data|comp|handler)[^"\']*)["\']',
+            js_content, re.IGNORECASE
+        )
+        discovered.extend(concat_patterns2)
 
-        return None
+        # 4. URL builder patterns: "/path" + someId veya "/path/" + id
+        path_patterns = re.findall(
+            r'["\'](/[^"\']{5,80})["\']',
+            js_content
+        )
+        for p in path_patterns:
+            p_lower = p.lower()
+            if any(kw in p_lower for kw in ['odds', '1x2', 'data', 'comp', 'handler', '.ashx', '.aspx']):
+                discovered.append(p)
 
-    def try_find_and_fetch_js_files(html_content, base_url, match_id):
-        """Sayfadaki <script src="..."> dosyalarını bulup odds verisini ara"""
-        script_srcs = re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html_content, re.IGNORECASE)
-        log_info(f"Sayfadaki JS dosyalari: {len(script_srcs)}")
+        # Duplicate temizle
+        discovered = list(set(discovered))
 
-        for src in script_srcs:
-            src_lower = src.lower()
-            # Odds/data ile ilgili JS dosyalarını filtrele
-            if any(kw in src_lower for kw in ['odds', '1x2', 'data', 'match', 'comp']):
-                full_url = src if src.startswith('http') else f"{base_url}{src}"
+        log_info(f"JS icinden bulunan AJAX URL'leri ({len(discovered)}): {discovered}")
+
+        # URL'leri tam hale getir ve match_id ekle
+        full_urls = []
+        for url in discovered:
+            # Relative URL → absolute
+            if url.startswith('/'):
+                full_url = f"{base_url}{url}"
+            elif url.startswith('http'):
+                full_url = url
+            else:
+                full_url = f"{base_url}/{url}"
+
+            # match_id'yi URL'ye ekle (farklı yöntemlerle)
+            if match_id not in full_url:
+                # URL sonuna ekle
+                if full_url.endswith('/'):
+                    full_urls.append(f"{full_url}{match_id}")
+                elif '?' in full_url:
+                    full_urls.append(f"{full_url}&id={match_id}")
+                    full_urls.append(f"{full_url}&matchId={match_id}")
+                    full_urls.append(f"{full_url}&scheduleId={match_id}")
+                else:
+                    full_urls.append(f"{full_url}/{match_id}")
+                    full_urls.append(f"{full_url}?id={match_id}")
+                    full_urls.append(f"{full_url}?matchId={match_id}")
+            else:
+                full_urls.append(full_url)
+
+        return full_urls
+
+    try:
+        log_info(f"=== ORAN CEKME BASLIYOR: match_id={match_id} ===")
+
+        # =========================================
+        # ADIM 1: oddscomp sayfasını çek
+        # =========================================
+        oddscomp_html = ""
+        js_file_url = ""
+        try:
+            url_comp = f"{base_url}/oddscomp/{match_id}"
+            log_info(f"Oddscomp: {url_comp}")
+            oddscomp_html = safe_get(url_comp, referer=base_url)
+            log_info(f"Oddscomp boyutu: {len(oddscomp_html)}")
+        except Exception as e:
+            log_error(f"Oddscomp fetch hatasi: {e}")
+
+        # =========================================
+        # ADIM 2: oddsComp.js dosyasını bul ve indir
+        # =========================================
+        js_content = ""
+        if oddscomp_html:
+            script_srcs = re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', oddscomp_html, re.IGNORECASE)
+            for src in script_srcs:
+                if 'oddscomp' in src.lower() or 'odds_comp' in src.lower() or 'oddsComp' in src:
+                    js_file_url = src if src.startswith('http') else f"{base_url}{src}"
+                    break
+
+            if js_file_url:
                 try:
-                    log_info(f"JS dosyasi indiriliyor: {full_url}")
-                    r = requests.get(full_url, headers=HEADERS, timeout=8)
-                    if r.status_code == 200 and len(r.text) > 50:
-                        log_info(f"JS dosyasi ({len(r.text)} chars): {r.text[:200]}")
-                        result = extract_odds_from_text(r.text, f"JS({src.split('/')[-1]})")
+                    log_info(f"oddsComp.js indiriliyor: {js_file_url}")
+                    js_content = safe_get(js_file_url, referer=url_comp, timeout=10, retries=1)
+                    log_info(f"oddsComp.js boyutu: {len(js_content)}")
+                except Exception as e:
+                    log_error(f"JS dosyasi indirme hatasi: {e}")
+
+        # =========================================
+        # ADIM 3: JS'den AJAX endpoint'lerini keşfet ve çağır
+        # =========================================
+        if js_content:
+            ajax_urls = discover_ajax_urls_from_js(js_content, match_id, base_url)
+            log_info(f"Denenecek AJAX URL sayisi: {len(ajax_urls)}")
+
+            for ajax_url in ajax_urls:
+                try:
+                    headers = dict(HEADERS)
+                    headers['Referer'] = f"{base_url}/oddscomp/{match_id}"
+                    headers['X-Requested-With'] = 'XMLHttpRequest'
+                    headers['Accept'] = '*/*'
+
+                    log_info(f"AJAX deneniyor: {ajax_url}")
+                    r = requests.get(ajax_url, headers=headers, timeout=10)
+                    if r.status_code == 200 and len(r.text) > 30:
+                        log_info(f"AJAX basarili ({r.status_code}, {len(r.text)} chars)")
+                        result = parse_odds_response(r.text, "AJAX")
                         if result:
+                            log_info(f"ORAN BULUNDU: {result}")
                             return result
-                        result = extract_any_bookmaker_odds_from_text(r.text, f"JS-ANY({src.split('/')[-1]})")
-                        if result:
-                            return result
-                except Exception:
+                    else:
+                        log_info(f"AJAX bos/hata: status={r.status_code}, len={len(r.text)}")
+                except Exception as e:
+                    log_info(f"AJAX hata: {ajax_url} -> {e}")
                     continue
 
-        # Script tag'ların icindeki AJAX URL'lerini bul ve çağır
-        scripts = re.findall(r'<script[^>]*>(.*?)</script>', html_content, re.DOTALL | re.IGNORECASE)
-        found_urls = set()
-        for script in scripts:
-            if len(script.strip()) < 20:
-                continue
-            # AJAX URL patternleri
-            urls = re.findall(r'["\'](/[^"\']*(?:odds|1x2|data)[^"\']*)["\']', script, re.IGNORECASE)
-            urls += re.findall(r'["\']([^"\']*\.ashx[^"\']*)["\']', script, re.IGNORECASE)
-            urls += re.findall(r'["\']([^"\']*\.aspx[^"\']*)["\']', script, re.IGNORECASE)
-            urls += re.findall(r'url\s*[:=]\s*["\']([^"\']+)["\']', script, re.IGNORECASE)
-            for u in urls:
-                if match_id in u or '{' in u:
-                    resolved = u.replace('{matchId}', match_id).replace('{id}', match_id)
-                    if not resolved.startswith('http'):
-                        resolved = f"{base_url}{resolved}"
-                    found_urls.add(resolved)
+        # =========================================
+        # ADIM 4: Bilinen NowGoal endpoint pattern'lerini dene
+        # =========================================
+        known_patterns = [
+            f"{base_url}/oddscomp/data/{match_id}",
+            f"{base_url}/oddscomp/loaddata/{match_id}",
+            f"{base_url}/oddscomp/getData?scheduleId={match_id}",
+            f"{base_url}/OddsComp/Data?scheduleId={match_id}",
+            f"{base_url}/handler/OddsCompData.ashx?id={match_id}",
+            f"{base_url}/handler/oddsdata.ashx?id={match_id}&type=1x2",
+            f"{base_url}/handler/LiveOdds.ashx?id={match_id}",
+            f"{base_url}/1x2/data/{match_id}",
+            f"{base_url}/1x2/loaddata?id={match_id}",
+            f"{base_url}/1x2/getData?scheduleId={match_id}",
+            f"{base_url}/ajax/soccerodds?id={match_id}",
+            f"{base_url}/ajax/oddsdata?id={match_id}&type=europe",
+            f"{base_url}/data/oddscomp/{match_id}",
+            f"{base_url}/api/odds/{match_id}",
+            f"{base_url}/api/1x2/{match_id}",
+        ]
 
-        for u in found_urls:
+        for pattern_url in known_patterns:
             try:
                 headers = dict(HEADERS)
+                headers['Referer'] = f"{base_url}/oddscomp/{match_id}"
                 headers['X-Requested-With'] = 'XMLHttpRequest'
-                log_info(f"Script-URL deneniyor: {u}")
-                r = requests.get(u, headers=headers, timeout=8)
-                if r.status_code == 200 and len(r.text) > 20:
-                    log_info(f"Script-URL cevap ({len(r.text)} chars): {r.text[:200]}")
-                    result = extract_odds_from_text(r.text, "ScriptURL")
-                    if result:
-                        return result
+
+                log_info(f"Pattern deneniyor: {pattern_url}")
+                r = requests.get(pattern_url, headers=headers, timeout=8)
+                if r.status_code == 200 and len(r.text) > 30:
+                    # Statik JS dosyası DEĞİLSE parse et
+                    if not r.text.strip().startswith('let ') and not r.text.strip().startswith('var _OddsComp'):
+                        log_info(f"Pattern cevap ({len(r.text)} chars): {r.text[:300]}")
+                        result = parse_odds_response(r.text, "PATTERN")
+                        if result:
+                            log_info(f"ORAN BULUNDU: {result}")
+                            return result
             except Exception:
                 continue
 
-        return None
-
-    def debug_dump_html(html_content, label):
-        """HTML içeriğinden debug bilgisi logla"""
-        # Bet365 kelimesini ara
-        positions = [m.start() for m in re.finditer(r'bet365', html_content, re.IGNORECASE)]
-        log_info(f"{label} 'Bet365' pozisyonlari: {positions[:10]}")
-
-        for pos in positions[:3]:
-            chunk = html_content[max(0, pos - 100): pos + 500]
-            clean = re.sub(r'<[^>]+>', '|', chunk).strip()
-            log_info(f"{label} Bet365 context: ...{clean[:400]}...")
-
-        # Script tag sayısı ve inline data
-        scripts = re.findall(r'<script[^>]*>(.*?)</script>', html_content, re.DOTALL | re.IGNORECASE)
-        inline_scripts = [s for s in scripts if len(s.strip()) > 50]
-        log_info(f"{label} Inline script sayisi: {len(inline_scripts)}")
-
-        for i, s in enumerate(inline_scripts[:5]):
-            # Her scriptin ilk 200 karakterini logla
-            log_info(f"{label} Script[{i}] ({len(s)} chars): {s[:200].strip()}")
-
-            # Odds benzeri float sayılar var mı?
-            floats = re.findall(r'(\d+\.\d{2})', s[:5000])
-            valid = [f for f in floats if 1.01 < float(f) < 50.0]
-            if valid:
-                log_info(f"{label} Script[{i}] valid odds floats: {valid[:20]}")
-
-    try:
         # =========================================
-        # ADIM 1: AJAX endpoint'lerini dene
-        # =========================================
-        log_info(f"=== ORAN CEKME BASLIYOR: match_id={match_id} ===")
-        result = try_fetch_ajax_endpoints(match_id, base_url)
-        if result:
-            log_info(f"AJAX BASARILI: {result}")
-            return result
-
-        # =========================================
-        # ADIM 2: oddscomp sayfasını çek ve analiz et
-        # =========================================
-        try:
-            url_comp = f"{base_url}/oddscomp/{match_id}"
-            log_info(f"Oddscomp sayfasi: {url_comp}")
-            html_comp = safe_get(url_comp, referer=base_url)
-            log_info(f"Oddscomp HTML boyutu: {len(html_comp)} karakter")
-
-            # Debug dump
-            debug_dump_html(html_comp, "ODDSCOMP")
-
-            # Inline scriptlerden odds
-            result = extract_odds_from_text(html_comp, "ODDSCOMP-full")
-            if result:
-                return result
-
-            # JS dosyalarını bul ve indir
-            result = try_find_and_fetch_js_files(html_comp, base_url, match_id)
-            if result:
-                return result
-
-            # Agresif HTML TR tarama
-            result = try_parse_html_aggressive(html_comp, "ODDSCOMP")
-            if result:
-                return result
-
-        except Exception as e:
-            log_error(f"Oddscomp hatasi: {e}")
-
-        # =========================================
-        # ADIM 3: 1x2-odds sayfasını çek ve analiz et
+        # ADIM 5: 1x2-odds sayfasından aynı yöntemi uygula
         # =========================================
         try:
             url_1x2 = f"{base_url}/1x2-odds/{match_id}"
             log_info(f"1x2-odds sayfasi: {url_1x2}")
             html_1x2 = safe_get(url_1x2, referer=base_url)
-            log_info(f"1x2-odds HTML boyutu: {len(html_1x2)} karakter")
+            log_info(f"1x2-odds boyutu: {len(html_1x2)}")
 
-            # Debug dump
-            debug_dump_html(html_1x2, "1X2ODDS")
-
-            # Inline scriptlerden
-            result = extract_odds_from_text(html_1x2, "1X2-full")
-            if result:
-                return result
-
-            # JS dosyalarını bul ve indir
-            result = try_find_and_fetch_js_files(html_1x2, base_url, match_id)
-            if result:
-                return result
-
-            # Agresif HTML TR tarama
-            result = try_parse_html_aggressive(html_1x2, "1X2ODDS")
-            if result:
-                return result
-
+            # Bu sayfadaki JS dosyalarını da tara
+            script_srcs = re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html_1x2, re.IGNORECASE)
+            for src in script_srcs:
+                if '1x2' in src.lower() or 'odds' in src.lower():
+                    full_js_url = src if src.startswith('http') else f"{base_url}{src}"
+                    try:
+                        log_info(f"1x2 JS indiriliyor: {full_js_url}")
+                        js_1x2 = safe_get(full_js_url, referer=url_1x2, timeout=10, retries=1)
+                        if js_1x2 and len(js_1x2) > 100:
+                            ajax_urls_1x2 = discover_ajax_urls_from_js(js_1x2, match_id, base_url)
+                            for ajax_url in ajax_urls_1x2:
+                                try:
+                                    headers = dict(HEADERS)
+                                    headers['Referer'] = url_1x2
+                                    headers['X-Requested-With'] = 'XMLHttpRequest'
+                                    r = requests.get(ajax_url, headers=headers, timeout=8)
+                                    if r.status_code == 200 and len(r.text) > 30:
+                                        if not r.text.strip().startswith('let ') and not r.text.strip().startswith('var _'):
+                                            result = parse_odds_response(r.text, "1X2-AJAX")
+                                            if result:
+                                                log_info(f"ORAN BULUNDU (1x2): {result}")
+                                                return result
+                                except Exception:
+                                    continue
+                    except Exception:
+                        pass
         except Exception as e:
             log_error(f"1x2-odds hatasi: {e}")
 
-        # =========================================
-        # ADIM 4: h2h sayfasında gömülü odds ara
-        # =========================================
-        try:
-            url_h2h = f"{base_url}/match/h2h-{match_id}"
-            log_info(f"H2H sayfasi (odds): {url_h2h}")
-            html_h2h = safe_get(url_h2h, referer=base_url)
-            log_info(f"H2H HTML boyutu: {len(html_h2h)} karakter")
-
-            # Script verilerinden
-            result = extract_odds_from_text(html_h2h, "H2H-full")
-            if result:
-                return result
-
-            # JS dosyalarını bul ve indir
-            result = try_find_and_fetch_js_files(html_h2h, base_url, match_id)
-            if result:
-                return result
-
-        except Exception as e:
-            log_error(f"H2H odds hatasi: {e}")
-
-        log_error("TUM YONTEMLER BASARISIZ - Oran cekilemedi. Manual odds kullanin.")
+        log_error("TUM YONTEMLER BASARISIZ - Oran cekilemedi.")
         return [1.0, 1.0, 1.0]
 
     except Exception as e:
