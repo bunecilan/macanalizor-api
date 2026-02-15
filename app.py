@@ -632,11 +632,15 @@ def vba_poisson_random(lam: float) -> int:
     """
     VBA kodundaki 'PoissonRastgele' fonksiyonunun Python karşılığı.
     VBA'daki Rnd() yerine random.random() kullanılır.
+    Büyük lambda değerlerinde (>30) numpy fallback kullanılır.
     """
     if lam <= 0: lam = 0.1
-    if lam > 30: return int(np.random.poisson(lam))
+    # Büyük lambda değerlerinde math.exp(-lam) → 0 olur, sonsuz döngü riski
+    if lam > 30:
+        return int(np.random.poisson(lam))
     L = math.exp(-lam)
-    if L <= 0: return int(np.random.poisson(lam))
+    if L <= 0:  # float underflow koruması
+        return int(np.random.poisson(lam))
     p = 1.0
     k = 0
     # Do...Loop equivalent
@@ -1002,36 +1006,6 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
             lines.append(f"      Kelly: %{kelly*100:.1f} (maks %2-5 onerilir)")
     lines.append("")
     
-    # --- ALT/UST + KG VALUE ---
-    if data.get('extra_value'):
-        ev = data['extra_value']
-        if ev.get('ou'):
-            lines.append("Alt/Ust 2.5 Marketleri:")
-            lines.append(f"   [Kaynak: {ev['ou'].get('source', 'N/A')}]")
-            for sk, sl in [('over', '2.5 UST'), ('under', '2.5 ALT')]:
-                d = ev['ou'][sk]
-                if d['value'] is not None:
-                    lines.append(f"   {sl}: Oran {d['odds']:.2f} | Olasilik %{d['prob']*100:.1f} | Value: {d['value']*100:.1f}% {d['tag']}")
-                    if d['kelly'] > 0:
-                        lines.append(f"      Kelly: %{d['kelly']*100:.1f} (maks %2-5 onerilir)")
-            lines.append("")
-        if ev.get('btts'):
-            lines.append("KG Var/Yok Marketleri:")
-            lines.append(f"   [Kaynak: {ev['btts'].get('source', 'N/A')}]")
-            for sk, sl in [('yes', 'KG VAR'), ('no', 'KG YOK')]:
-                d = ev['btts'][sk]
-                if d['value'] is not None:
-                    lines.append(f"   {sl}: Oran {d['odds']:.2f} | Olasilik %{d['prob']*100:.1f} | Value: {d['value']*100:.1f}% {d['tag']}")
-                    if d['kelly'] > 0:
-                        lines.append(f"      Kelly: %{d['kelly']*100:.1f} (maks %2-5 onerilir)")
-            lines.append("")
-        if ev.get('best_bets'):
-            lines.append("Ek Value Bahis Adaylari:")
-            for bname, bodds, bval, bkelly in ev['best_bets']:
-                lines.append(f"   >> {bname}: Oran {bodds:.2f} | Value: +{bval*100:.1f}% | Kelly: %{bkelly*100:.1f}")
-            lines.append("")
-            has_value = True
-            best_value = max(best_value, max(v for _, _, v, _ in ev['best_bets']))
     lines.append("="*55)
     lines.append("G) NET SONUC VE ONERILER")
     lines.append("="*55 + "\n")
@@ -1273,194 +1247,7 @@ def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
         return [1.0, 1.0, 1.0]
 
 
-
-# ============================================================================
-# NESINE ORAN CEKME + VALUE BET HESAPLAMA
-# ============================================================================
-
-def fetch_nesine_odds(home_team, away_team):
-    """Nesine.com iddaa bulteninden Alt/Ust 2.5 ve KG oranlarini ceker.
-    Bulunamazsa None doner. Timeout 4s - worker oldurmez."""
-    try:
-        log_info(f"=== NESINE ORAN CEKME: {home_team} vs {away_team} ===")
-        hdr = {
-            "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36",
-            "Accept": "application/json, text/html, */*",
-            "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8",
-            "Referer": "https://www.nesine.com/iddaa",
-        }
-        bulten_urls = [
-            "https://bulten.nesine.com/w/program.json",
-            "https://www.nesine.com/iddaa/futbol/tum-maclar",
-        ]
-        for url in bulten_urls:
-            try:
-                r = requests.get(url, headers=hdr, timeout=4)
-                if r.status_code != 200:
-                    continue
-                text = r.text
-                if text.strip().startswith('{') or text.strip().startswith('['):
-                    try:
-                        import json as _json
-                        data = _json.loads(text)
-                        result = _search_nesine_json(data, home_team, away_team)
-                        if result:
-                            return result
-                    except Exception:
-                        pass
-                hk = norm_key(home_team)
-                ak = norm_key(away_team)
-                if hk in norm_key(text) or ak in norm_key(text):
-                    log_info("Nesine sayfasinda takim bulundu")
-                    result = _parse_nesine_html(text, home_team, away_team)
-                    if result:
-                        return result
-            except requests.exceptions.Timeout:
-                log_info(f"Nesine timeout: {url}")
-            except Exception as e:
-                log_info(f"Nesine hata: {e}")
-        log_info("Nesine oranlari bulunamadi - manuel giris kullanilacak")
-        return None
-    except Exception as e:
-        log_error(f"fetch_nesine_odds hata: {e}")
-        return None
-
-
-def _search_nesine_json(data, home_team, away_team):
-    """Nesine JSON verisinde mac bul, oranlarini don."""
-    hk = norm_key(home_team)
-    ak = norm_key(away_team)
-    events = []
-    if isinstance(data, dict):
-        for key, val in data.items():
-            if isinstance(val, list):
-                events.extend(val)
-            elif isinstance(val, dict):
-                sub = _search_nesine_json(val, home_team, away_team)
-                if sub:
-                    return sub
-    elif isinstance(data, list):
-        events = data
-    for ev in events:
-        if not isinstance(ev, dict):
-            continue
-        ev_str = str(ev).lower()
-        if hk[:6] not in ev_str and ak[:6] not in ev_str:
-            continue
-        result = {}
-        for key in ['au', 'ou', 'overUnder', 'altUst', 'totalGoals']:
-            if key in ev and isinstance(ev[key], dict):
-                ov = ev[key].get('over') or ev[key].get('ust') or ev[key].get('o')
-                un = ev[key].get('under') or ev[key].get('alt') or ev[key].get('u')
-                if ov and un:
-                    try:
-                        result['over25'] = float(ov)
-                        result['under25'] = float(un)
-                        result['ou_company'] = 'Nesine'
-                    except (ValueError, TypeError):
-                        pass
-        for key in ['kg', 'btts', 'bothToScore', 'karpilikliGol']:
-            if key in ev and isinstance(ev[key], dict):
-                y = ev[key].get('yes') or ev[key].get('var') or ev[key].get('y')
-                n = ev[key].get('no') or ev[key].get('yok') or ev[key].get('n')
-                if y and n:
-                    try:
-                        result['btts_yes'] = float(y)
-                        result['btts_no'] = float(n)
-                        result['btts_company'] = 'Nesine'
-                    except (ValueError, TypeError):
-                        pass
-        markets = ev.get('markets') or ev.get('odds') or ev.get('oranlar') or []
-        if isinstance(markets, list):
-            for mkt in markets:
-                if not isinstance(mkt, dict):
-                    continue
-                mtype = str(mkt.get('type', '') or mkt.get('name', '') or mkt.get('tip', '')).lower()
-                outcomes = mkt.get('outcomes') or mkt.get('selections') or mkt.get('secenekler') or []
-                if not isinstance(outcomes, list) or len(outcomes) < 2:
-                    continue
-                try:
-                    if 'alt' in mtype or 'over' in mtype or 'total' in mtype:
-                        result['over25'] = float(outcomes[0].get('odds') or outcomes[0].get('oran', 0))
-                        result['under25'] = float(outcomes[1].get('odds') or outcomes[1].get('oran', 0))
-                        result['ou_company'] = 'Nesine'
-                    if 'kg' in mtype or 'btts' in mtype or 'karsi' in mtype:
-                        result['btts_yes'] = float(outcomes[0].get('odds') or outcomes[0].get('oran', 0))
-                        result['btts_no'] = float(outcomes[1].get('odds') or outcomes[1].get('oran', 0))
-                        result['btts_company'] = 'Nesine'
-                except (ValueError, TypeError, IndexError):
-                    pass
-        if result.get('over25') or result.get('btts_yes'):
-            log_info(f"Nesine JSON oran bulundu: {result}")
-            return result
-    return None
-
-
-def _parse_nesine_html(html, home_team, away_team):
-    """Nesine HTML sayfasindan oran cikarmaya calis."""
-    json_blobs = re.findall(r'(?:var\s+\w+\s*=\s*|data-config=["\']\s*)(\{.*?\}|\[.*?\])', html[:50000])
-    for blob in json_blobs:
-        try:
-            import json as _json
-            data = _json.loads(blob)
-            result = _search_nesine_json(data, home_team, away_team)
-            if result:
-                return result
-        except Exception:
-            continue
-    return None
-
-
-def calculate_extra_value_bets(model_probs, market_odds):
-    """Alt/Ust 2.5 ve KG Var/Yok value bet hesaplama."""
-    def _ev(odds, prob):
-        if not odds or not prob or odds <= 1:
-            return None, "N/A"
-        v = (odds * prob) - 1
-        return v, "TICK DEGER VAR" if v >= 0.05 else "CROSS"
-    def _kelly(odds, prob):
-        if not odds or not prob or odds <= 1:
-            return 0.0
-        k = ((odds - 1) * prob - (1 - prob)) / (odds - 1)
-        return max(0.0, k * 0.25)
-    results = {"ou": None, "btts": None, "best_bets": []}
-    o25 = market_odds.get('over25')
-    u25 = market_odds.get('under25')
-    if o25 and u25:
-        o25_p = model_probs.get('o25', 0.3)
-        u25_p = 1.0 - o25_p
-        o25_ev, o25_t = _ev(o25, o25_p)
-        u25_ev, u25_t = _ev(u25, u25_p)
-        results['ou'] = {
-            'over': {'odds': o25, 'prob': o25_p, 'value': o25_ev, 'tag': o25_t, 'kelly': _kelly(o25, o25_p)},
-            'under': {'odds': u25, 'prob': u25_p, 'value': u25_ev, 'tag': u25_t, 'kelly': _kelly(u25, u25_p)},
-            'source': market_odds.get('ou_company', 'N/A')
-        }
-        if o25_ev and o25_ev >= 0.05:
-            results['best_bets'].append(("2.5 UST", o25, o25_ev, _kelly(o25, o25_p)))
-        if u25_ev and u25_ev >= 0.05:
-            results['best_bets'].append(("2.5 ALT", u25, u25_ev, _kelly(u25, u25_p)))
-    ky = market_odds.get('btts_yes')
-    kn = market_odds.get('btts_no')
-    if ky and kn:
-        ky_p = model_probs.get('btts', 0.3)
-        kn_p = 1.0 - ky_p
-        ky_ev, ky_t = _ev(ky, ky_p)
-        kn_ev, kn_t = _ev(kn, kn_p)
-        results['btts'] = {
-            'yes': {'odds': ky, 'prob': ky_p, 'value': ky_ev, 'tag': ky_t, 'kelly': _kelly(ky, ky_p)},
-            'no': {'odds': kn, 'prob': kn_p, 'value': kn_ev, 'tag': kn_t, 'kelly': _kelly(kn, kn_p)},
-            'source': market_odds.get('btts_company', 'N/A')
-        }
-        if ky_ev and ky_ev >= 0.05:
-            results['best_bets'].append(("KG VAR", ky, ky_ev, _kelly(ky, ky_p)))
-        if kn_ev and kn_ev >= 0.05:
-            results['best_bets'].append(("KG YOK", kn, kn_ev, _kelly(kn, kn_p)))
-    results['best_bets'].sort(key=lambda x: x[2], reverse=True)
-    return results
-
-
-def analyze_nowgoal(url: str, manual_odds=None) -> Dict[str, Any]:
+def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict[str, Any]:
     log_info(f"Starting PSS analysis for: {url}")
     
     match_id = extract_match_id(url)
@@ -1480,34 +1267,42 @@ def analyze_nowgoal(url: str, manual_odds=None) -> Dict[str, Any]:
     prev_home_list = filter_team_home_only(raw_home_list, home_team)[:RECENT_N]
     prev_away_list = filter_team_away_only(raw_away_list, away_team)[:RECENT_N]
     
-    st_count_h = 0 
+    # Standings sayısını gerçek veriyle hesapla (sadece görüntü amaçlı)
+    st_home = extract_standings_for_team(html, home_team)
+    st_away = extract_standings_for_team(html, away_team)
+    st_count_h = 0
     st_count_a = 0
-    if "Standings" in html: st_count_h = 10; st_count_a = 10 
+    for s in st_home:
+        if s.ft == 'Home' and s.matches is not None:
+            st_count_h = s.matches
+            break
+    if st_count_h == 0:
+        for s in st_home:
+            if s.ft == 'Total' and s.matches is not None:
+                st_count_h = s.matches
+                break
+    for s in st_away:
+        if s.ft == 'Away' and s.matches is not None:
+            st_count_a = s.matches
+            break
+    if st_count_a == 0:
+        for s in st_away:
+            if s.ft == 'Total' and s.matches is not None:
+                st_count_a = s.matches
+                break
     
-    # === ORAN CEKME (1X2 NowGoal + Nesine ALT/UST KG) ===
+    # === [GÜNCELLENDİ] ORAN ÇEKME ===
+    # Görseldeki tablo yapısına (Bet365 -> Initial -> Skip Asian -> Get 1x2) göre çeker
     scraped_odds = fetch_real_odds(match_id, base_domain)
+    
     if scraped_odds and scraped_odds != [1.0, 1.0, 1.0]:
         odds = scraped_odds
-    elif isinstance(manual_odds, list) and len(manual_odds) >= 3:
-        odds = manual_odds[:3]
-        log_info(f"Manuel 1X2 oran: {odds}")
+    elif manual_odds and len(manual_odds) >= 3:
+        odds = manual_odds
+        log_info(f"Siteden çekilemedi, manuel oran: {odds}")
     else:
         odds = [1.0, 1.0, 1.0]
-        log_info("1X2 oran bulunamadi")
-
-    # Nesine Alt/Ust + KG
-    extra_market_odds = {}
-    nesine_odds = fetch_nesine_odds(home_team, away_team)
-    if nesine_odds:
-        extra_market_odds.update(nesine_odds)
-    # Manuel fallback
-    if isinstance(manual_odds, dict):
-        for mk in ['over25', 'under25', 'btts_yes', 'btts_no']:
-            if not extra_market_odds.get(mk) and manual_odds.get(mk):
-                extra_market_odds[mk] = float(manual_odds[mk])
-        if manual_odds.get('over25'): extra_market_odds['ou_company'] = 'Manuel'
-        if manual_odds.get('btts_yes'): extra_market_odds['btts_company'] = 'Manuel'
-    log_info(f"Extra oranlar: {extra_market_odds}")
+        log_info("Oran bulunamadı, varsayılan [1.0, 1.0, 1.0]")
 
     # 2. HESAPLAMALAR
     lam_home = calculate_weighted_pss_goals(prev_home_list, home_team, True)
@@ -1523,20 +1318,21 @@ def analyze_nowgoal(url: str, manual_odds=None) -> Dict[str, Any]:
     if lam_corn_a <= 0: lam_corn_a = 3.5
     
     # Poisson
-    POISSON_MAX = 8
-    h_dist = [poisson_pmf(lam_home, i) for i in range(POISSON_MAX)]
-    a_dist = [poisson_pmf(lam_away, i) for i in range(POISSON_MAX)]
+    # Poisson dağılımı - range(8) ile daha yüksek lambda değerlerinde kayıp minimize edilir
+    POISSON_MAX_GOALS = 8
+    h_dist = [poisson_pmf(lam_home, i) for i in range(POISSON_MAX_GOALS)]
+    a_dist = [poisson_pmf(lam_away, i) for i in range(POISSON_MAX_GOALS)]
     
     scores = []
-    for h in range(POISSON_MAX):
-        for a in range(POISSON_MAX):
+    for h in range(6):
+        for a in range(6):
             scores.append((f"{h}-{a}", h_dist[h] * a_dist[a]))
     scores.sort(key=lambda x: x[1], reverse=True)
     
     # Market Goals
     m_goals = {'o05': 0, 'o15': 0, 'o25': 0, 'o35': 0, 'btts': 0, '1': 0, 'X': 0, '2': 0}
-    for h in range(POISSON_MAX):
-        for a in range(POISSON_MAX):
+    for h in range(6):
+        for a in range(6):
             prob = h_dist[h] * a_dist[a]
             total = h + a
             if total > 0: m_goals['o05'] += prob
@@ -1548,21 +1344,23 @@ def analyze_nowgoal(url: str, manual_odds=None) -> Dict[str, Any]:
             elif h == a: m_goals['X'] += prob
             else: m_goals['2'] += prob
             
-    # Normalize 1X2
-    _tot = m_goals['1'] + m_goals['X'] + m_goals['2']
-    if 0 < _tot < 1.0:
-        _nf = 1.0 / _tot
-        for _k in m_goals: m_goals[_k] *= _nf
+    # Normalizasyon: Poisson truncation kayıplarını telafi et
+    total_1x2 = m_goals['1'] + m_goals['X'] + m_goals['2']
+    if total_1x2 > 0 and total_1x2 < 1.0:
+        norm_factor = 1.0 / total_1x2
+        for key in m_goals:
+            m_goals[key] *= norm_factor
 
-    # Market Corners
-    h_corn_dist_trunc = [poisson_pmf(lam_corn_h, i) for i in range(15)]
-    a_corn_dist_trunc = [poisson_pmf(lam_corn_a, i) for i in range(15)]
+    # Market Corners - genişletilmiş aralık
+    POISSON_MAX_CORNERS = 15
+    h_corn_dist_trunc = [poisson_pmf(lam_corn_h, i) for i in range(POISSON_MAX_CORNERS)]
+    a_corn_dist_trunc = [poisson_pmf(lam_corn_a, i) for i in range(POISSON_MAX_CORNERS)]
     
     m_corn = {'o85': 0, 'o95': 0, 'o105': 0, 'o115': 0, 
               'home_o45': 0, 'home_o55': 0, 'away_o45': 0, 'away_o55': 0}
               
-    for h in range(15): 
-        for a in range(15):
+    for h in range(11): 
+        for a in range(11):
             prob = h_corn_dist_trunc[h] * a_corn_dist_trunc[a]
             tot = h + a
             if tot > 8: m_corn['o85'] += prob
@@ -1570,13 +1368,12 @@ def analyze_nowgoal(url: str, manual_odds=None) -> Dict[str, Any]:
             if tot > 10: m_corn['o105'] += prob
             if tot > 11: m_corn['o115'] += prob
             
+    # 1 - CDF kullanarak truncation kayıplarını engelle
     m_corn['home_o45'] = 1.0 - sum(h_corn_dist_trunc[:5])
     m_corn['home_o55'] = 1.0 - sum(h_corn_dist_trunc[:6])
     m_corn['away_o45'] = 1.0 - sum(a_corn_dist_trunc[:5])
     m_corn['away_o55'] = 1.0 - sum(a_corn_dist_trunc[:6])
     
-    extra_value_data = calculate_extra_value_bets(m_goals, extra_market_odds)
-
     # Simulations
     mc_goals = monte_carlo_simulation_vba(lam_home, lam_away, MC_RUNS_DEFAULT)
     mc_corners = monte_carlo_corners_vba(lam_corn_h, lam_corn_a, MC_RUNS_DEFAULT)
@@ -1600,9 +1397,7 @@ def analyze_nowgoal(url: str, manual_odds=None) -> Dict[str, Any]:
         'market_corners': m_corn,
         'mc_goals': mc_goals,
         'mc_corners': mc_corners,
-        'value': {'odds': odds},
-        'extra_odds': extra_market_odds,
-        'extra_value': extra_value_data
+        'value': {'odds': odds}
     }
     
     report_text = generate_vba_report(full_data)
@@ -1623,7 +1418,7 @@ def root():
     return jsonify({
         "ok": True,
         "service": "nowgoal-analyzer-ultimate",
-        "version": "7.1-nesine-value",
+        "version": "6.4-exact-replica-loop",
         "status": "running"
     })
 
@@ -1646,13 +1441,7 @@ def analizet_route():
             return jsonify({"ok": False, "error": f"JSON hatası: {e}"}), 400
         
         url = (payload.get("url") or '').strip()
-        odds_1x2 = payload.get("odds", [2.50, 3.20, 2.50])
-        extra_manual = {}
-        if payload.get('over25_odds'): extra_manual['over25'] = float(payload['over25_odds'])
-        if payload.get('under25_odds'): extra_manual['under25'] = float(payload['under25_odds'])
-        if payload.get('btts_yes_odds'): extra_manual['btts_yes'] = float(payload['btts_yes_odds'])
-        if payload.get('btts_no_odds'): extra_manual['btts_no'] = float(payload['btts_no_odds'])
-        odds = extra_manual if extra_manual else odds_1x2
+        odds = payload.get("odds", [2.50, 3.20, 2.50])
         
         if not url:
             log_error("URL is empty")
