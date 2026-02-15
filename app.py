@@ -359,18 +359,18 @@ def parse_match_from_cells(cells: List[str]) -> Optional[MatchRow]:
     home2 = None
     away2 = None
     for i in range(score_idx - 1, -1, -1):
-        if cells[i] or ''.strip():
+        if (cells[i] or '').strip():
             home2 = (cells[i] or '').strip()
             break
     for i in range(score_idx + 1, len(cells)):
-        if cells[i] or ''.strip():
+        if (cells[i] or '').strip():
             away2 = (cells[i] or '').strip()
             break
     
     if not home2 or not away2:
         return None
     
-    league2 = cells[0] or ''.strip() or ''
+    league2 = (cells[0] or '').strip()
     dateval2 = ''
     for c in cells:
         d = normalize_date(c)
@@ -632,9 +632,15 @@ def vba_poisson_random(lam: float) -> int:
     """
     VBA kodundaki 'PoissonRastgele' fonksiyonunun Python karşılığı.
     VBA'daki Rnd() yerine random.random() kullanılır.
+    Büyük lambda değerlerinde (>30) numpy fallback kullanılır.
     """
     if lam <= 0: lam = 0.1
+    # Büyük lambda değerlerinde math.exp(-lam) → 0 olur, sonsuz döngü riski
+    if lam > 30:
+        return int(np.random.poisson(lam))
     L = math.exp(-lam)
+    if L <= 0:  # float underflow koruması
+        return int(np.random.poisson(lam))
     p = 1.0
     k = 0
     # Do...Loop equivalent
@@ -1261,9 +1267,29 @@ def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict
     prev_home_list = filter_team_home_only(raw_home_list, home_team)[:RECENT_N]
     prev_away_list = filter_team_away_only(raw_away_list, away_team)[:RECENT_N]
     
-    st_count_h = 0 
+    # Standings sayısını gerçek veriyle hesapla (sadece görüntü amaçlı)
+    st_home = extract_standings_for_team(html, home_team)
+    st_away = extract_standings_for_team(html, away_team)
+    st_count_h = 0
     st_count_a = 0
-    if "Standings" in html: st_count_h = 10; st_count_a = 10 
+    for s in st_home:
+        if s.ft == 'Home' and s.matches is not None:
+            st_count_h = s.matches
+            break
+    if st_count_h == 0:
+        for s in st_home:
+            if s.ft == 'Total' and s.matches is not None:
+                st_count_h = s.matches
+                break
+    for s in st_away:
+        if s.ft == 'Away' and s.matches is not None:
+            st_count_a = s.matches
+            break
+    if st_count_a == 0:
+        for s in st_away:
+            if s.ft == 'Total' and s.matches is not None:
+                st_count_a = s.matches
+                break
     
     # === [GÜNCELLENDİ] ORAN ÇEKME ===
     # Görseldeki tablo yapısına (Bet365 -> Initial -> Skip Asian -> Get 1x2) göre çeker
@@ -1292,8 +1318,10 @@ def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict
     if lam_corn_a <= 0: lam_corn_a = 3.5
     
     # Poisson
-    h_dist = [poisson_pmf(lam_home, i) for i in range(6)]
-    a_dist = [poisson_pmf(lam_away, i) for i in range(6)]
+    # Poisson dağılımı - range(8) ile daha yüksek lambda değerlerinde kayıp minimize edilir
+    POISSON_MAX_GOALS = 8
+    h_dist = [poisson_pmf(lam_home, i) for i in range(POISSON_MAX_GOALS)]
+    a_dist = [poisson_pmf(lam_away, i) for i in range(POISSON_MAX_GOALS)]
     
     scores = []
     for h in range(6):
@@ -1316,9 +1344,17 @@ def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict
             elif h == a: m_goals['X'] += prob
             else: m_goals['2'] += prob
             
-    # Market Corners
-    h_corn_dist_trunc = [poisson_pmf(lam_corn_h, i) for i in range(11)]
-    a_corn_dist_trunc = [poisson_pmf(lam_corn_a, i) for i in range(11)]
+    # Normalizasyon: Poisson truncation kayıplarını telafi et
+    total_1x2 = m_goals['1'] + m_goals['X'] + m_goals['2']
+    if total_1x2 > 0 and total_1x2 < 1.0:
+        norm_factor = 1.0 / total_1x2
+        for key in m_goals:
+            m_goals[key] *= norm_factor
+
+    # Market Corners - genişletilmiş aralık
+    POISSON_MAX_CORNERS = 15
+    h_corn_dist_trunc = [poisson_pmf(lam_corn_h, i) for i in range(POISSON_MAX_CORNERS)]
+    a_corn_dist_trunc = [poisson_pmf(lam_corn_a, i) for i in range(POISSON_MAX_CORNERS)]
     
     m_corn = {'o85': 0, 'o95': 0, 'o105': 0, 'o115': 0, 
               'home_o45': 0, 'home_o55': 0, 'away_o45': 0, 'away_o55': 0}
@@ -1332,10 +1368,11 @@ def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict
             if tot > 10: m_corn['o105'] += prob
             if tot > 11: m_corn['o115'] += prob
             
-    m_corn['home_o45'] = sum(h_corn_dist_trunc[5:])
-    m_corn['home_o55'] = sum(h_corn_dist_trunc[6:])
-    m_corn['away_o45'] = sum(a_corn_dist_trunc[5:])
-    m_corn['away_o55'] = sum(a_corn_dist_trunc[6:])
+    # 1 - CDF kullanarak truncation kayıplarını engelle
+    m_corn['home_o45'] = 1.0 - sum(h_corn_dist_trunc[:5])
+    m_corn['home_o55'] = 1.0 - sum(h_corn_dist_trunc[:6])
+    m_corn['away_o45'] = 1.0 - sum(a_corn_dist_trunc[:5])
+    m_corn['away_o55'] = 1.0 - sum(a_corn_dist_trunc[:6])
     
     # Simulations
     mc_goals = monte_carlo_simulation_vba(lam_home, lam_away, MC_RUNS_DEFAULT)
