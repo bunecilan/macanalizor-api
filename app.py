@@ -639,6 +639,7 @@ def vba_poisson_random(lam: float) -> int:
     if L <= 0: return int(np.random.poisson(lam))
     p = 1.0
     k = 0
+    # Do...Loop equivalent
     while True:
         k += 1
         p *= random.random()
@@ -1001,6 +1002,38 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
             lines.append(f"      Kelly: %{kelly*100:.1f} (maks %2-5 onerilir)")
     lines.append("")
     
+
+    # --- ALT/UST + KG VALUE ---
+    if data.get('extra_value'):
+        ev = data['extra_value']
+        if ev.get('ou'):
+            lines.append("Alt/Ust 2.5 Marketleri:")
+            lines.append(f"   [Kaynak: {ev['ou'].get('source', 'N/A')}]")
+            for sk, sl in [('over', '2.5 UST'), ('under', '2.5 ALT')]:
+                d = ev['ou'][sk]
+                if d['value'] is not None:
+                    lines.append(f"   {sl}: Oran {d['odds']:.2f} | Olasilik %{d['prob']*100:.1f} | Value: {d['value']*100:.1f}% {d['tag']}")
+                    if d['kelly'] > 0:
+                        lines.append(f"      Kelly: %{d['kelly']*100:.1f} (maks %2-5 onerilir)")
+            lines.append("")
+        if ev.get('btts'):
+            lines.append("KG Var/Yok Marketleri:")
+            lines.append(f"   [Kaynak: {ev['btts'].get('source', 'N/A')}]")
+            for sk, sl in [('yes', 'KG VAR'), ('no', 'KG YOK')]:
+                d = ev['btts'][sk]
+                if d['value'] is not None:
+                    lines.append(f"   {sl}: Oran {d['odds']:.2f} | Olasilik %{d['prob']*100:.1f} | Value: {d['value']*100:.1f}% {d['tag']}")
+                    if d['kelly'] > 0:
+                        lines.append(f"      Kelly: %{d['kelly']*100:.1f} (maks %2-5 onerilir)")
+            lines.append("")
+        if ev.get('best_bets'):
+            lines.append("Ek Value Bahis Adaylari:")
+            for bname, bodds, bval, bkelly in ev['best_bets']:
+                lines.append(f"   >> {bname}: Oran {bodds:.2f} | Value: +{bval*100:.1f}% | Kelly: %{bkelly*100:.1f}")
+            lines.append("")
+            has_value = True
+            best_value = max(best_value, max(v for _, _, v, _ in ev['best_bets']))
+
     lines.append("="*55)
     lines.append("G) NET SONUC VE ONERILER")
     lines.append("="*55 + "\n")
@@ -1248,7 +1281,7 @@ def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
 # ============================================================================
 
 def fetch_overunder_odds(match_id: str, base_url: str) -> Optional[Dict[str, float]]:
-    """NowGoal Over/Under sayfasından 2.5 Alt/Üst oranlarını çeker."""
+    """NowGoal Over/Under sayfasindan 2.5 Alt/Ust oranlarini ceker."""
     def parse_ou_js(text):
         if not text or len(text) < 100: return None
         gm = re.search(r'var\s+game\s*=\s*Array\s*\((.*?)\)\s*;', text, re.DOTALL)
@@ -1260,8 +1293,8 @@ def fetch_overunder_odds(match_id: str, base_url: str) -> Optional[Dict[str, flo
             if len(parts) < 6: continue
             company = parts[2].strip() if len(parts) > 2 else ''
             try:
-                line = float(parts[3])
-                if abs(line - 2.5) > 0.01: continue
+                line_val = float(parts[3])
+                if abs(line_val - 2.5) > 0.01: continue
                 over_o = float(parts[4]); under_o = float(parts[5])
                 if not (1.01 < over_o < 15.0 and 1.01 < under_o < 15.0): continue
                 res = {"over25": over_o, "under25": under_o, "company": company}
@@ -1284,15 +1317,13 @@ def fetch_overunder_odds(match_id: str, base_url: str) -> Optional[Dict[str, flo
                         log_info(f"ALT/UST bulundu ({result['company']}): U {result['over25']} / A {result['under25']}")
                         return result
             except Exception: continue
-
-        # Fallback: OU sayfasini dogrudan cek
         try:
             ou_url = f"{base_url}/odds/overunder/{match_id}"
             html_ou = safe_get(ou_url, timeout=12, referer=base_url)
             if html_ou:
                 result = parse_ou_js(html_ou)
                 if result:
-                    log_info(f"ALT/UST (inline) bulundu: U {result['over25']} / A {result['under25']}")
+                    log_info(f"ALT/UST (inline) bulundu")
                     return result
                 srcs = re.findall(r'<script[^>]+src=["\'](.*?)["\'\s]', html_ou, re.IGNORECASE)
                 for src in srcs:
@@ -1308,8 +1339,7 @@ def fetch_overunder_odds(match_id: str, base_url: str) -> Optional[Dict[str, flo
                         except: continue
         except Exception as e:
             log_error(f"OU sayfa hatasi: {e}")
-
-        log_info("ALT/UST oranlari bulunamadi - manuel giris gerekebilir")
+        log_info("ALT/UST oranlari bulunamadi")
         return None
     except Exception as e:
         log_error(f"fetch_overunder_odds hata: {e}", e)
@@ -1317,7 +1347,7 @@ def fetch_overunder_odds(match_id: str, base_url: str) -> Optional[Dict[str, flo
 
 
 def fetch_btts_odds(match_id: str, base_url: str) -> Optional[Dict[str, float]]:
-    """NowGoal BTTS (KG Var/Yok) oranlarını çeker."""
+    """NowGoal BTTS (KG Var/Yok) oranlarini ceker."""
     try:
         log_info(f"=== KG ORAN CEKME: match_id={match_id} ===")
         for suffix in ["29", "26", "28", "25"]:
@@ -1346,7 +1376,7 @@ def fetch_btts_odds(match_id: str, base_url: str) -> Optional[Dict[str, float]]:
                             log_info(f"KG bulundu ({found['company']}): Var {found['btts_yes']} / Yok {found['btts_no']}")
                             return found
             except Exception: continue
-        log_info("KG oranlari bulunamadi - manuel giris gerekebilir")
+        log_info("KG oranlari bulunamadi")
         return None
     except Exception as e:
         log_error(f"fetch_btts_odds hata: {e}", e)
@@ -1418,18 +1448,40 @@ def analyze_nowgoal(url: str, manual_odds=None) -> Dict[str, Any]:
     st_count_a = 0
     if "Standings" in html: st_count_h = 10; st_count_a = 10 
     
-    # === [GÜNCELLENDİ] ORAN ÇEKME ===
-    # Görseldeki tablo yapısına (Bet365 -> Initial -> Skip Asian -> Get 1x2) göre çeker
+    # === ORAN CEKME (1X2 + ALT/UST + KG) ===
     scraped_odds = fetch_real_odds(match_id, base_domain)
-    
+
     if scraped_odds and scraped_odds != [1.0, 1.0, 1.0]:
         odds = scraped_odds
-    elif manual_odds and len(manual_odds) >= 3:
-        odds = manual_odds
-        log_info(f"Siteden çekilemedi, manuel oran: {odds}")
+    elif isinstance(manual_odds, list) and len(manual_odds) >= 3:
+        odds = manual_odds[:3]
+        log_info(f"Siteden cekilemedi, manuel 1X2 oran: {odds}")
     else:
         odds = [1.0, 1.0, 1.0]
-        log_info("Oran bulunamadı, varsayılan [1.0, 1.0, 1.0]")
+        log_info("1X2 oran bulunamadi, varsayilan [1.0, 1.0, 1.0]")
+
+    # Alt/Ust 2.5 + KG Var/Yok oranlari
+    extra_market_odds = {}
+    ou_data = fetch_overunder_odds(match_id, base_domain)
+    if ou_data:
+        extra_market_odds['over25'] = ou_data['over25']
+        extra_market_odds['under25'] = ou_data['under25']
+        extra_market_odds['ou_company'] = ou_data.get('company', 'N/A')
+    btts_odds_data = fetch_btts_odds(match_id, base_domain)
+    if btts_odds_data:
+        extra_market_odds['btts_yes'] = btts_odds_data['btts_yes']
+        extra_market_odds['btts_no'] = btts_odds_data['btts_no']
+        extra_market_odds['btts_company'] = btts_odds_data.get('company', 'N/A')
+    if isinstance(manual_odds, dict):
+        if not extra_market_odds.get('over25') and manual_odds.get('over25'):
+            extra_market_odds['over25'] = float(manual_odds['over25'])
+            extra_market_odds['under25'] = float(manual_odds.get('under25', 0))
+            extra_market_odds['ou_company'] = 'Manuel'
+        if not extra_market_odds.get('btts_yes') and manual_odds.get('btts_yes'):
+            extra_market_odds['btts_yes'] = float(manual_odds['btts_yes'])
+            extra_market_odds['btts_no'] = float(manual_odds.get('btts_no', 0))
+            extra_market_odds['btts_company'] = 'Manuel'
+    log_info(f"Extra market oranlari: {extra_market_odds}")
 
     # 2. HESAPLAMALAR
     lam_home = calculate_weighted_pss_goals(prev_home_list, home_team, True)
@@ -1497,7 +1549,7 @@ def analyze_nowgoal(url: str, manual_odds=None) -> Dict[str, Any]:
     m_corn['away_o45'] = 1.0 - sum(a_corn_dist_trunc[:5])
     m_corn['away_o55'] = 1.0 - sum(a_corn_dist_trunc[:6])
     
-    # Extra Value Bet
+    # Extra Value Bet hesaplama
     extra_value_data = calculate_extra_value_bets(m_goals, extra_market_odds)
 
     # Simulations
@@ -1569,14 +1621,12 @@ def analizet_route():
             return jsonify({"ok": False, "error": f"JSON hatası: {e}"}), 400
         
         url = (payload.get("url") or '').strip()
-
-        # 1X2 + Extra oran desteği
         odds_1x2 = payload.get("odds", [2.50, 3.20, 2.50])
         extra_manual = {}
-        if payload.get("over25_odds"): extra_manual['over25'] = float(payload['over25_odds'])
-        if payload.get("under25_odds"): extra_manual['under25'] = float(payload['under25_odds'])
-        if payload.get("btts_yes_odds"): extra_manual['btts_yes'] = float(payload['btts_yes_odds'])
-        if payload.get("btts_no_odds"): extra_manual['btts_no'] = float(payload['btts_no_odds'])
+        if payload.get('over25_odds'): extra_manual['over25'] = float(payload['over25_odds'])
+        if payload.get('under25_odds'): extra_manual['under25'] = float(payload['under25_odds'])
+        if payload.get('btts_yes_odds'): extra_manual['btts_yes'] = float(payload['btts_yes_odds'])
+        if payload.get('btts_no_odds'): extra_manual['btts_no'] = float(payload['btts_no_odds'])
         odds = extra_manual if extra_manual else odds_1x2
         
         if not url:
