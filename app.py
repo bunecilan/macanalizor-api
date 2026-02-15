@@ -1002,7 +1002,6 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
             lines.append(f"      Kelly: %{kelly*100:.1f} (maks %2-5 onerilir)")
     lines.append("")
     
-
     # --- ALT/UST + KG VALUE ---
     if data.get('extra_value'):
         ev = data['extra_value']
@@ -1033,7 +1032,6 @@ def generate_vba_report(data: Dict[str, Any]) -> str:
             lines.append("")
             has_value = True
             best_value = max(best_value, max(v for _, _, v, _ in ev['best_bets']))
-
     lines.append("="*55)
     lines.append("G) NET SONUC VE ONERILER")
     lines.append("="*55 + "\n")
@@ -1277,68 +1275,108 @@ def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
 
 
 # ============================================================================
-# 9.6 ALT/UST 2.5 & KG VAR/YOK ORAN CEKME + VALUE BET
+# ALT/UST 2.5 & KG VAR/YOK ORAN CEKME + VALUE BET
 # ============================================================================
 
-def fetch_overunder_odds(match_id: str, base_url: str) -> Optional[Dict[str, float]]:
+def fetch_overunder_odds(match_id, base_url):
     """NowGoal Over/Under sayfasindan 2.5 Alt/Ust oranlarini ceker."""
     def parse_ou_js(text):
-        if not text or len(text) < 100: return None
+        if not text or len(text) < 100:
+            return None
         gm = re.search(r'var\s+game\s*=\s*Array\s*\((.*?)\)\s*;', text, re.DOTALL)
-        if not gm: return None
+        if not gm:
+            return None
         entries = re.findall(r'"([^"]+)"', gm.group(1))
-        bet365 = None; first_valid = None
+        bet365 = None
+        first_valid = None
         for entry in entries:
             parts = entry.split('|')
-            if len(parts) < 6: continue
+            if len(parts) < 6:
+                continue
             company = parts[2].strip() if len(parts) > 2 else ''
             try:
                 line_val = float(parts[3])
-                if abs(line_val - 2.5) > 0.01: continue
-                over_o = float(parts[4]); under_o = float(parts[5])
-                if not (1.01 < over_o < 15.0 and 1.01 < under_o < 15.0): continue
+                if abs(line_val - 2.5) > 0.01:
+                    continue
+                over_o = float(parts[4])
+                under_o = float(parts[5])
+                if not (1.01 < over_o < 15.0 and 1.01 < under_o < 15.0):
+                    continue
                 res = {"over25": over_o, "under25": under_o, "company": company}
-                if first_valid is None: first_valid = res
+                if first_valid is None:
+                    first_valid = res
                 if 'bet' in company.lower() and '365' in company:
-                    bet365 = res; break
-            except (ValueError, IndexError): continue
+                    bet365 = res
+                    break
+            except (ValueError, IndexError):
+                continue
         return bet365 or first_valid
 
     try:
         log_info(f"=== ALT/UST ORAN CEKME: match_id={match_id} ===")
+
+        # ADIM 1: Data JS domainleri
         for suffix in ["29", "26", "28", "25"]:
-            data_url = f"https://data.nowgoal{suffix}.com/OddsData/overunder/{match_id}.js"
+            for pattern in [
+                f"https://data.nowgoal{suffix}.com/OddsData/overunder/{match_id}.js",
+                f"https://ou.nowgoal{suffix}.com/{match_id}.js",
+                f"https://overunder.nowgoal{suffix}.com/{match_id}.js",
+            ]:
+                try:
+                    hdr = dict(HEADERS)
+                    hdr['Referer'] = f"{base_url}/over-under-odds/{match_id}"
+                    r = requests.get(pattern, headers=hdr, timeout=8)
+                    if r.status_code == 200 and len(r.text) > 100:
+                        result = parse_ou_js(r.text)
+                        if result:
+                            log_info(f"ALT/UST bulundu ({result['company']}): U {result['over25']} / A {result['under25']}")
+                            return result
+                except Exception:
+                    continue
+
+        # ADIM 2: HTML sayfasindan JS URL bul
+        # Dogru format: /over-under-odds/{match_id}
+        page_urls = []
+        for suffix in ["26", "29", "28", "25"]:
+            for prefix in ["live4", "live3"]:
+                page_urls.append(f"https://{prefix}.nowgoal{suffix}.com/over-under-odds/{match_id}")
+
+        for ou_url in page_urls:
             try:
-                hdr = dict(HEADERS); hdr['Referer'] = f"{base_url}/odds/overunder/{match_id}"
-                r = requests.get(data_url, headers=hdr, timeout=10)
-                if r.status_code == 200 and len(r.text) > 100:
-                    result = parse_ou_js(r.text)
-                    if result:
-                        log_info(f"ALT/UST bulundu ({result['company']}): U {result['over25']} / A {result['under25']}")
-                        return result
-            except Exception: continue
-        try:
-            ou_url = f"{base_url}/odds/overunder/{match_id}"
-            html_ou = safe_get(ou_url, timeout=12, referer=base_url)
-            if html_ou:
+                log_info(f"OU sayfa deneniyor: {ou_url}")
+                r = requests.get(ou_url, headers=HEADERS, timeout=10)
+                if r.status_code != 200 or len(r.text) < 200:
+                    continue
+                html_ou = r.text
+
                 result = parse_ou_js(html_ou)
                 if result:
-                    log_info(f"ALT/UST (inline) bulundu")
+                    log_info("ALT/UST (inline) bulundu")
                     return result
-                srcs = re.findall(r'<script[^>]+src=["\'](.*?)["\'\s]', html_ou, re.IGNORECASE)
+
+                srcs = re.findall(r'<script[^>]+src=["\'](.*?)["\'\\s]', html_ou, re.IGNORECASE)
                 for src in srcs:
-                    if match_id in src or 'overunder' in src.lower():
+                    if match_id in src or 'overunder' in src.lower() or 'bigsmall' in src.lower():
                         full = src.strip()
-                        if full.startswith('//'): full = 'https:' + full
-                        elif full.startswith('/'): full = base_url + full
+                        if full.startswith('//'):
+                            full = 'https:' + full
+                        elif full.startswith('/'):
+                            full = base_url + full
+                        elif not full.startswith('http'):
+                            continue
                         try:
-                            r2 = requests.get(full, headers=HEADERS, timeout=10)
+                            r2 = requests.get(full, headers=HEADERS, timeout=8)
                             if r2.status_code == 200:
                                 result = parse_ou_js(r2.text)
-                                if result: return result
-                        except: continue
-        except Exception as e:
-            log_error(f"OU sayfa hatasi: {e}")
+                                if result:
+                                    log_info(f"ALT/UST (JS) bulundu: {full}")
+                                    return result
+                        except Exception:
+                            continue
+                break
+            except Exception:
+                continue
+
         log_info("ALT/UST oranlari bulunamadi")
         return None
     except Exception as e:
@@ -1346,36 +1384,52 @@ def fetch_overunder_odds(match_id: str, base_url: str) -> Optional[Dict[str, flo
         return None
 
 
-def fetch_btts_odds(match_id: str, base_url: str) -> Optional[Dict[str, float]]:
+def fetch_btts_odds(match_id, base_url):
     """NowGoal BTTS (KG Var/Yok) oranlarini ceker."""
+    def parse_btts_js(text):
+        if not text or len(text) < 100:
+            return None
+        gm = re.search(r'var\s+game\s*=\s*Array\s*\((.*?)\)\s*;', text, re.DOTALL)
+        if not gm:
+            return None
+        entries = re.findall(r'"([^"]+)"', gm.group(1))
+        bet365 = None
+        first_valid = None
+        for entry in entries:
+            parts = entry.split('|')
+            if len(parts) < 5:
+                continue
+            company = parts[2].strip() if len(parts) > 2 else ''
+            try:
+                yes_o = float(parts[3])
+                no_o = float(parts[4])
+                if 1.01 < yes_o < 15.0 and 1.01 < no_o < 15.0:
+                    res = {"btts_yes": yes_o, "btts_no": no_o, "company": company}
+                    if first_valid is None:
+                        first_valid = res
+                    if 'bet' in company.lower() and '365' in company:
+                        bet365 = res
+                        break
+            except (ValueError, IndexError):
+                continue
+        return bet365 or first_valid
+
     try:
         log_info(f"=== KG ORAN CEKME: match_id={match_id} ===")
         for suffix in ["29", "26", "28", "25"]:
-            data_url = f"https://data.nowgoal{suffix}.com/OddsData/btts/{match_id}.js"
-            try:
-                r = requests.get(data_url, headers=HEADERS, timeout=8)
-                if r.status_code == 200 and len(r.text) > 100:
-                    gm = re.search(r'var\s+game\s*=\s*Array\s*\((.*?)\)\s*;', r.text, re.DOTALL)
-                    if gm:
-                        entries = re.findall(r'"([^"]+)"', gm.group(1))
-                        bet365 = None; first_valid = None
-                        for entry in entries:
-                            parts = entry.split('|')
-                            if len(parts) < 5: continue
-                            company = parts[2].strip() if len(parts) > 2 else ''
-                            try:
-                                yes_o = float(parts[3]); no_o = float(parts[4])
-                                if 1.01 < yes_o < 15.0 and 1.01 < no_o < 15.0:
-                                    res = {"btts_yes": yes_o, "btts_no": no_o, "company": company}
-                                    if first_valid is None: first_valid = res
-                                    if 'bet' in company.lower() and '365' in company:
-                                        bet365 = res; break
-                            except (ValueError, IndexError): continue
-                        found = bet365 or first_valid
-                        if found:
-                            log_info(f"KG bulundu ({found['company']}): Var {found['btts_yes']} / Yok {found['btts_no']}")
-                            return found
-            except Exception: continue
+            for pattern in [
+                f"https://data.nowgoal{suffix}.com/OddsData/btts/{match_id}.js",
+                f"https://btts.nowgoal{suffix}.com/{match_id}.js",
+            ]:
+                try:
+                    r = requests.get(pattern, headers=HEADERS, timeout=8)
+                    if r.status_code == 200 and len(r.text) > 100:
+                        result = parse_btts_js(r.text)
+                        if result:
+                            log_info(f"KG bulundu ({result['company']}): Var {result['btts_yes']} / Yok {result['btts_no']}")
+                            return result
+                except Exception:
+                    continue
         log_info("KG oranlari bulunamadi")
         return None
     except Exception as e:
@@ -1383,42 +1437,55 @@ def fetch_btts_odds(match_id: str, base_url: str) -> Optional[Dict[str, float]]:
         return None
 
 
-def calculate_extra_value_bets(model_probs: Dict, market_odds: Dict) -> Dict:
+def calculate_extra_value_bets(model_probs, market_odds):
     """Alt/Ust 2.5 ve KG Var/Yok value bet hesaplama."""
     def _ev(odds, prob):
-        if not odds or not prob or odds <= 1: return None, "N/A"
+        if not odds or not prob or odds <= 1:
+            return None, "N/A"
         v = (odds * prob) - 1
         return v, "TICK DEGER VAR" if v >= 0.05 else "CROSS"
+
     def _kelly(odds, prob):
-        if not odds or not prob or odds <= 1: return 0.0
+        if not odds or not prob or odds <= 1:
+            return 0.0
         k = ((odds - 1) * prob - (1 - prob)) / (odds - 1)
         return max(0.0, k * 0.25)
 
     results = {"ou": None, "btts": None, "best_bets": []}
 
-    o25 = market_odds.get('over25'); u25 = market_odds.get('under25')
+    o25 = market_odds.get('over25')
+    u25 = market_odds.get('under25')
     if o25 and u25:
-        o25_p = model_probs.get('o25', 0.3); u25_p = 1.0 - o25_p
-        o25_ev, o25_t = _ev(o25, o25_p); u25_ev, u25_t = _ev(u25, u25_p)
+        o25_p = model_probs.get('o25', 0.3)
+        u25_p = 1.0 - o25_p
+        o25_ev, o25_t = _ev(o25, o25_p)
+        u25_ev, u25_t = _ev(u25, u25_p)
         results['ou'] = {
             'over': {'odds': o25, 'prob': o25_p, 'value': o25_ev, 'tag': o25_t, 'kelly': _kelly(o25, o25_p)},
             'under': {'odds': u25, 'prob': u25_p, 'value': u25_ev, 'tag': u25_t, 'kelly': _kelly(u25, u25_p)},
             'source': market_odds.get('ou_company', 'N/A')
         }
-        if o25_ev and o25_ev >= 0.05: results['best_bets'].append(("2.5 UST", o25, o25_ev, _kelly(o25, o25_p)))
-        if u25_ev and u25_ev >= 0.05: results['best_bets'].append(("2.5 ALT", u25, u25_ev, _kelly(u25, u25_p)))
+        if o25_ev and o25_ev >= 0.05:
+            results['best_bets'].append(("2.5 UST", o25, o25_ev, _kelly(o25, o25_p)))
+        if u25_ev and u25_ev >= 0.05:
+            results['best_bets'].append(("2.5 ALT", u25, u25_ev, _kelly(u25, u25_p)))
 
-    ky = market_odds.get('btts_yes'); kn = market_odds.get('btts_no')
+    ky = market_odds.get('btts_yes')
+    kn = market_odds.get('btts_no')
     if ky and kn:
-        ky_p = model_probs.get('btts', 0.3); kn_p = 1.0 - ky_p
-        ky_ev, ky_t = _ev(ky, ky_p); kn_ev, kn_t = _ev(kn, kn_p)
+        ky_p = model_probs.get('btts', 0.3)
+        kn_p = 1.0 - ky_p
+        ky_ev, ky_t = _ev(ky, ky_p)
+        kn_ev, kn_t = _ev(kn, kn_p)
         results['btts'] = {
             'yes': {'odds': ky, 'prob': ky_p, 'value': ky_ev, 'tag': ky_t, 'kelly': _kelly(ky, ky_p)},
             'no': {'odds': kn, 'prob': kn_p, 'value': kn_ev, 'tag': kn_t, 'kelly': _kelly(kn, kn_p)},
             'source': market_odds.get('btts_company', 'N/A')
         }
-        if ky_ev and ky_ev >= 0.05: results['best_bets'].append(("KG VAR", ky, ky_ev, _kelly(ky, ky_p)))
-        if kn_ev and kn_ev >= 0.05: results['best_bets'].append(("KG YOK", kn, kn_ev, _kelly(kn, kn_p)))
+        if ky_ev and ky_ev >= 0.05:
+            results['best_bets'].append(("KG VAR", ky, ky_ev, _kelly(ky, ky_p)))
+        if kn_ev and kn_ev >= 0.05:
+            results['best_bets'].append(("KG YOK", kn, kn_ev, _kelly(kn, kn_p)))
 
     results['best_bets'].sort(key=lambda x: x[2], reverse=True)
     return results
@@ -1472,6 +1539,7 @@ def analyze_nowgoal(url: str, manual_odds=None) -> Dict[str, Any]:
         extra_market_odds['btts_yes'] = btts_odds_data['btts_yes']
         extra_market_odds['btts_no'] = btts_odds_data['btts_no']
         extra_market_odds['btts_company'] = btts_odds_data.get('company', 'N/A')
+    # Manuel oran fallback
     if isinstance(manual_odds, dict):
         if not extra_market_odds.get('over25') and manual_odds.get('over25'):
             extra_market_odds['over25'] = float(manual_odds['over25'])
