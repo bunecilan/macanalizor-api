@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-NowGoal Match Analyzer - ULTIMATE VBA LOGIC REPLICA
+NowGoal Match Analyzer v7.0 - ULTIMATE + ALT/UST & KG VALUE
 - BASE: Python Scraping Engine (v5.2) - Full Preservation
 - LOGIC: VBA 'Magic Dice' (PoissonRastgele) Logic Implemented
 - SIMULATION: Iterative loop (10,000 runs) exactly like VBA
@@ -631,25 +631,222 @@ def poisson_pmf(lam: float, k: int) -> float:
 def vba_poisson_random(lam: float) -> int:
     """
     VBA kodundaki 'PoissonRastgele' fonksiyonunun Python karşılığı.
-    VBA'daki Rnd() yerine random.random() kullanılır.
-    Büyük lambda değerlerinde (>30) numpy fallback kullanılır.
+    Büyük lambda değerlerinde numpy fallback kullanılır.
     """
     if lam <= 0: lam = 0.1
-    # Büyük lambda değerlerinde math.exp(-lam) → 0 olur, sonsuz döngü riski
     if lam > 30:
         return int(np.random.poisson(lam))
     L = math.exp(-lam)
-    if L <= 0:  # float underflow koruması
+    if L <= 0:
         return int(np.random.poisson(lam))
     p = 1.0
     k = 0
-    # Do...Loop equivalent
     while True:
         k += 1
         p *= random.random()
         if p <= L:
             break
     return k - 1
+
+
+# ============================================================================
+# 9.6 EXTRA MARKET ODDS: ALT/UST 2.5 & KG VAR/YOK ORAN CEKME
+# ============================================================================
+
+def build_overunder_url(match_url: str) -> str:
+    """NowGoal Over/Under oran sayfası URL'si."""
+    mid = extract_match_id(match_url)
+    base = extract_base_domain(match_url)
+    return f"{base}/odds/overunder/{mid}"
+
+def fetch_overunder_odds(match_id: str, base_url: str) -> Optional[Dict[str, float]]:
+    """
+    NowGoal Over/Under sayfasından 2.5 Alt/Üst oranlarını çeker.
+    JS formatı: var game=Array("CompID|RecID|Name|Line|Over|Under|...", ...)
+    """
+    def parse_ou_js(text):
+        if not text or len(text) < 100:
+            return None
+        game_match = re.search(r'var\s+game\s*=\s*Array\s*\((.*?)\)\s*;', text, re.DOTALL)
+        if not game_match:
+            return None
+        entries = re.findall(r'"([^"]+)"', game_match.group(1))
+
+        bet365_result = None
+        first_valid = None
+
+        for entry in entries:
+            parts = entry.split('|')
+            if len(parts) < 6:
+                continue
+            company = parts[2].strip() if len(parts) > 2 else ''
+            try:
+                line = float(parts[3])
+                if abs(line - 2.5) > 0.01:
+                    continue
+                over_o = float(parts[4])
+                under_o = float(parts[5])
+                if not (1.01 < over_o < 15.0 and 1.01 < under_o < 15.0):
+                    continue
+                result = {"over25": over_o, "under25": under_o, "company": company}
+                if first_valid is None:
+                    first_valid = result
+                if 'bet' in company.lower() and '365' in company:
+                    bet365_result = result
+                    break
+            except (ValueError, IndexError):
+                continue
+
+        return bet365_result or first_valid
+
+    try:
+        log_info(f"=== ALT/UST ORAN CEKME: match_id={match_id} ===")
+
+        # Yöntem 1: Bilinen data domain
+        for suffix in ["29", "26", "28", "25"]:
+            data_url = f"https://data.nowgoal{suffix}.com/OddsData/overunder/{match_id}.js"
+            try:
+                headers = dict(HEADERS)
+                headers['Referer'] = f"{base_url}/odds/overunder/{match_id}"
+                r = requests.get(data_url, headers=headers, timeout=10)
+                if r.status_code == 200 and len(r.text) > 100:
+                    result = parse_ou_js(r.text)
+                    if result:
+                        log_info(f"ALT/UST bulundu ({result['company']}): U {result['over25']} / A {result['under25']}")
+                        return result
+            except Exception:
+                continue
+
+        # Yöntem 2: OU sayfasını fetch et, JS URL bul
+        try:
+            ou_url = f"{base_url}/odds/overunder/{match_id}"
+            html_ou = safe_get(ou_url, timeout=15, referer=base_url)
+            if html_ou:
+                script_srcs = re.findall(r'<script[^>]+src=["\'](.*?)["\'\s]', html_ou, re.IGNORECASE)
+                for src in script_srcs:
+                    if match_id in src or 'overunder' in src.lower() or 'ou' in src.lower():
+                        full_url = src.strip()
+                        if full_url.startswith('//'):
+                            full_url = 'https:' + full_url
+                        elif full_url.startswith('/'):
+                            full_url = base_url + full_url
+                        try:
+                            r2 = requests.get(full_url, headers=HEADERS, timeout=10)
+                            if r2.status_code == 200:
+                                result = parse_ou_js(r2.text)
+                                if result:
+                                    log_info(f"ALT/UST (JS) bulundu: U {result['over25']} / A {result['under25']}")
+                                    return result
+                        except Exception:
+                            continue
+
+                # Inline JS kontrolü
+                result = parse_ou_js(html_ou)
+                if result:
+                    log_info(f"ALT/UST (inline) bulundu")
+                    return result
+        except Exception as e:
+            log_error(f"OU sayfa hatası: {e}")
+
+        log_info("ALT/UST oranları bulunamadı")
+        return None
+
+    except Exception as e:
+        log_error(f"fetch_overunder_odds hata: {e}", e)
+        return None
+
+
+def fetch_btts_odds(match_id: str, base_url: str) -> Optional[Dict[str, float]]:
+    """
+    NowGoal BTTS oranlarını çeker. 
+    Bazı NowGoal versiyonlarında mevcut değildir - None dönebilir.
+    """
+    try:
+        for suffix in ["29", "26", "28", "25"]:
+            data_url = f"https://data.nowgoal{suffix}.com/OddsData/btts/{match_id}.js"
+            try:
+                r = requests.get(data_url, headers=HEADERS, timeout=8)
+                if r.status_code == 200 and len(r.text) > 100:
+                    game_match = re.search(r'var\s+game\s*=\s*Array\s*\((.*?)\)\s*;', r.text, re.DOTALL)
+                    if game_match:
+                        entries = re.findall(r'"([^"]+)"', game_match.group(1))
+                        for entry in entries:
+                            parts = entry.split('|')
+                            if len(parts) < 5: continue
+                            company = parts[2].strip() if len(parts) > 2 else ''
+                            try:
+                                yes_o = float(parts[3])
+                                no_o = float(parts[4])
+                                if 1.01 < yes_o < 15.0 and 1.01 < no_o < 15.0:
+                                    log_info(f"BTTS bulundu ({company}): Var {yes_o} / Yok {no_o}")
+                                    return {"btts_yes": yes_o, "btts_no": no_o, "company": company}
+                            except (ValueError, IndexError):
+                                continue
+            except Exception:
+                continue
+        return None
+    except Exception:
+        return None
+
+
+def calculate_extra_value_bets(model_probs: Dict, market_odds: Dict) -> Dict:
+    """Alt/Üst 2.5 ve KG Var/Yok value bet hesaplaması."""
+
+    def _calc_value(odds, prob):
+        if not odds or not prob or odds <= 1: return None, "N/A"
+        ev = (odds * prob) - 1
+        return ev, "TICK DEGER VAR" if ev >= 0.05 else "CROSS"
+
+    def _calc_kelly_q(odds, prob):
+        if not odds or not prob or odds <= 1: return 0.0
+        k = ((odds - 1) * prob - (1 - prob)) / (odds - 1)
+        return max(0.0, k * 0.25)
+
+    results = {"ou": None, "btts": None, "best_bets": []}
+
+    # Alt/Üst 2.5
+    o25 = market_odds.get('over25')
+    u25 = market_odds.get('under25')
+    if o25 and u25:
+        o25_p = model_probs.get('o25', 0.3)
+        u25_p = 1.0 - o25_p
+        o25_ev, o25_tag = _calc_value(o25, o25_p)
+        u25_ev, u25_tag = _calc_value(u25, u25_p)
+        o25_kelly = _calc_kelly_q(o25, o25_p)
+        u25_kelly = _calc_kelly_q(u25, u25_p)
+        results['ou'] = {
+            'over': {'odds': o25, 'prob': o25_p, 'value': o25_ev, 'tag': o25_tag, 'kelly': o25_kelly},
+            'under': {'odds': u25, 'prob': u25_p, 'value': u25_ev, 'tag': u25_tag, 'kelly': u25_kelly},
+            'source': market_odds.get('ou_company', 'N/A')
+        }
+        if o25_ev and o25_ev >= 0.05:
+            results['best_bets'].append(("2.5 UST", o25, o25_ev, o25_kelly))
+        if u25_ev and u25_ev >= 0.05:
+            results['best_bets'].append(("2.5 ALT", u25, u25_ev, u25_kelly))
+
+    # KG Var/Yok
+    ky = market_odds.get('btts_yes')
+    kn = market_odds.get('btts_no')
+    if ky and kn:
+        ky_p = model_probs.get('btts', 0.3)
+        kn_p = 1.0 - ky_p
+        ky_ev, ky_tag = _calc_value(ky, ky_p)
+        kn_ev, kn_tag = _calc_value(kn, kn_p)
+        ky_kelly = _calc_kelly_q(ky, ky_p)
+        kn_kelly = _calc_kelly_q(kn, kn_p)
+        results['btts'] = {
+            'yes': {'odds': ky, 'prob': ky_p, 'value': ky_ev, 'tag': ky_tag, 'kelly': ky_kelly},
+            'no': {'odds': kn, 'prob': kn_p, 'value': kn_ev, 'tag': kn_tag, 'kelly': kn_kelly},
+            'source': market_odds.get('btts_company', 'N/A')
+        }
+        if ky_ev and ky_ev >= 0.05:
+            results['best_bets'].append(("KG VAR", ky, ky_ev, ky_kelly))
+        if kn_ev and kn_ev >= 0.05:
+            results['best_bets'].append(("KG YOK", kn, kn_ev, kn_kelly))
+
+    results['best_bets'].sort(key=lambda x: x[2], reverse=True)
+    return results
+
 
 # --- 9.4 Monte Carlo Simulations (Goals) - ITERATIVE LOOP ---
 def monte_carlo_simulation_vba(lam_home: float, lam_away: float, num_sims: int = 10000) -> Dict[str, Any]:
@@ -1247,7 +1444,7 @@ def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
         return [1.0, 1.0, 1.0]
 
 
-def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict[str, Any]:
+def analyze_nowgoal(url: str, manual_odds = None) -> Dict[str, Any]:
     log_info(f"Starting PSS analysis for: {url}")
     
     match_id = extract_match_id(url)
@@ -1267,29 +1464,9 @@ def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict
     prev_home_list = filter_team_home_only(raw_home_list, home_team)[:RECENT_N]
     prev_away_list = filter_team_away_only(raw_away_list, away_team)[:RECENT_N]
     
-    # Standings sayısını gerçek veriyle hesapla (sadece görüntü amaçlı)
-    st_home = extract_standings_for_team(html, home_team)
-    st_away = extract_standings_for_team(html, away_team)
-    st_count_h = 0
+    st_count_h = 0 
     st_count_a = 0
-    for s in st_home:
-        if s.ft == 'Home' and s.matches is not None:
-            st_count_h = s.matches
-            break
-    if st_count_h == 0:
-        for s in st_home:
-            if s.ft == 'Total' and s.matches is not None:
-                st_count_h = s.matches
-                break
-    for s in st_away:
-        if s.ft == 'Away' and s.matches is not None:
-            st_count_a = s.matches
-            break
-    if st_count_a == 0:
-        for s in st_away:
-            if s.ft == 'Total' and s.matches is not None:
-                st_count_a = s.matches
-                break
+    if "Standings" in html: st_count_h = 10; st_count_a = 10 
     
     # === [GÜNCELLENDİ] ORAN ÇEKME ===
     # Görseldeki tablo yapısına (Bet365 -> Initial -> Skip Asian -> Get 1x2) göre çeker
@@ -1318,7 +1495,6 @@ def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict
     if lam_corn_a <= 0: lam_corn_a = 3.5
     
     # Poisson
-    # Poisson dağılımı - range(8) ile daha yüksek lambda değerlerinde kayıp minimize edilir
     POISSON_MAX_GOALS = 8
     h_dist = [poisson_pmf(lam_home, i) for i in range(POISSON_MAX_GOALS)]
     a_dist = [poisson_pmf(lam_away, i) for i in range(POISSON_MAX_GOALS)]
@@ -1344,14 +1520,13 @@ def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict
             elif h == a: m_goals['X'] += prob
             else: m_goals['2'] += prob
             
-    # Normalizasyon: Poisson truncation kayıplarını telafi et
+    # Normalizasyon
     total_1x2 = m_goals['1'] + m_goals['X'] + m_goals['2']
     if total_1x2 > 0 and total_1x2 < 1.0:
-        norm_factor = 1.0 / total_1x2
-        for key in m_goals:
-            m_goals[key] *= norm_factor
+        nf = 1.0 / total_1x2
+        for _k in m_goals: m_goals[_k] *= nf
 
-    # Market Corners - genişletilmiş aralık
+    # Market Corners
     POISSON_MAX_CORNERS = 15
     h_corn_dist_trunc = [poisson_pmf(lam_corn_h, i) for i in range(POISSON_MAX_CORNERS)]
     a_corn_dist_trunc = [poisson_pmf(lam_corn_a, i) for i in range(POISSON_MAX_CORNERS)]
@@ -1368,12 +1543,14 @@ def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict
             if tot > 10: m_corn['o105'] += prob
             if tot > 11: m_corn['o115'] += prob
             
-    # 1 - CDF kullanarak truncation kayıplarını engelle
     m_corn['home_o45'] = 1.0 - sum(h_corn_dist_trunc[:5])
     m_corn['home_o55'] = 1.0 - sum(h_corn_dist_trunc[:6])
     m_corn['away_o45'] = 1.0 - sum(a_corn_dist_trunc[:5])
     m_corn['away_o55'] = 1.0 - sum(a_corn_dist_trunc[:6])
     
+    # Extra Value Bet hesaplama (Alt/Üst + KG)
+    extra_value_data = calculate_extra_value_bets(m_goals, extra_market_odds)
+
     # Simulations
     mc_goals = monte_carlo_simulation_vba(lam_home, lam_away, MC_RUNS_DEFAULT)
     mc_corners = monte_carlo_corners_vba(lam_corn_h, lam_corn_a, MC_RUNS_DEFAULT)
@@ -1397,7 +1574,9 @@ def analyze_nowgoal(url: str, manual_odds: Optional[List[float]] = None) -> Dict
         'market_corners': m_corn,
         'mc_goals': mc_goals,
         'mc_corners': mc_corners,
-        'value': {'odds': odds}
+        'value': {'odds': odds},
+        'extra_odds': extra_market_odds,
+        'extra_value': extra_value_data
     }
     
     report_text = generate_vba_report(full_data)
@@ -1418,7 +1597,7 @@ def root():
     return jsonify({
         "ok": True,
         "service": "nowgoal-analyzer-ultimate",
-        "version": "6.4-exact-replica-loop",
+        "version": "7.0-with-ou-btts-value",
         "status": "running"
     })
 
@@ -1441,7 +1620,23 @@ def analizet_route():
             return jsonify({"ok": False, "error": f"JSON hatası: {e}"}), 400
         
         url = (payload.get("url") or '').strip()
-        odds = payload.get("odds", [2.50, 3.20, 2.50])
+
+        # 1X2 + Extra oranlar
+        odds_1x2 = payload.get("odds", [2.50, 3.20, 2.50])
+
+        # Manuel Alt/Üst ve KG oranları (opsiyonel)
+        extra_manual = {}
+        if payload.get("over25_odds"):
+            extra_manual['over25'] = float(payload['over25_odds'])
+        if payload.get("under25_odds"):
+            extra_manual['under25'] = float(payload['under25_odds'])
+        if payload.get("btts_yes_odds"):
+            extra_manual['btts_yes'] = float(payload['btts_yes_odds'])
+        if payload.get("btts_no_odds"):
+            extra_manual['btts_no'] = float(payload['btts_no_odds'])
+
+        # Eğer manuel extra oran varsa dict olarak gönder, yoksa 1X2 listesi
+        odds = extra_manual if extra_manual else odds_1x2
         
         if not url:
             log_error("URL is empty")
@@ -1463,6 +1658,19 @@ def analizet_route():
             m = data['market_goals']
             corn = data['corners']
             
+            # Extra value verileri
+            extra_val = data.get('extra_value', {})
+            extra_odds = data.get('extra_odds', {})
+
+            value_bets = []
+            if extra_val.get('best_bets'):
+                for name, odds_v, val_v, kelly_v in extra_val['best_bets']:
+                    value_bets.append({
+                        "market": name, "odds": odds_v,
+                        "value_pct": round(val_v * 100, 1),
+                        "kelly_pct": round(kelly_v * 100, 1)
+                    })
+
             response = {
                 "ok": True,
                 "skor": f"{top_skor[0]}: {top_skor[1]*100:.1f}%",
@@ -1473,6 +1681,14 @@ def analizet_route():
                     "ev": f"{corn['home']:.1f}",
                     "deplasman": f"{corn['away']:.1f}"
                 },
+                "oranlar": {
+                    "1x2": data['value']['odds'],
+                    "over25": extra_odds.get('over25'),
+                    "under25": extra_odds.get('under25'),
+                    "btts_yes": extra_odds.get('btts_yes'),
+                    "btts_no": extra_odds.get('btts_no')
+                },
+                "value_bets": value_bets,
                 "detay": result['report'],
                 "sure": f"{elapsed:.2f}s"
             }
@@ -1492,7 +1708,7 @@ def analizet_route():
 
 if __name__ == "__main__":
     log_info("=" * 70)
-    log_info("NowGoal Analyzer ULTIMATE EXACT REPLICA VERSION (LOOP) - COMPLETE")
+    log_info("NowGoal Analyzer v7.0 - WITH ALT/UST + KG VALUE BET")
     log_info("=" * 70)
     
     if len(sys.argv) > 1 and sys.argv[1] == "serve":
