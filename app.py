@@ -1275,166 +1275,140 @@ def fetch_real_odds(match_id: str, base_url: str) -> List[float]:
 
 
 # ============================================================================
-# ALT/UST 2.5 & KG VAR/YOK ORAN CEKME + VALUE BET
+# NESINE ORAN CEKME + VALUE BET HESAPLAMA
 # ============================================================================
 
-def fetch_overunder_odds(match_id, base_url):
-    """NowGoal Over/Under sayfasindan 2.5 Alt/Ust oranlarini ceker."""
-    def parse_ou_js(text):
-        if not text or len(text) < 100:
-            return None
-        gm = re.search(r'var\s+game\s*=\s*Array\s*\((.*?)\)\s*;', text, re.DOTALL)
-        if not gm:
-            return None
-        entries = re.findall(r'"([^"]+)"', gm.group(1))
-        bet365 = None
-        first_valid = None
-        for entry in entries:
-            parts = entry.split('|')
-            if len(parts) < 6:
-                continue
-            company = parts[2].strip() if len(parts) > 2 else ''
-            try:
-                line_val = float(parts[3])
-                if abs(line_val - 2.5) > 0.01:
-                    continue
-                over_o = float(parts[4])
-                under_o = float(parts[5])
-                if not (1.01 < over_o < 15.0 and 1.01 < under_o < 15.0):
-                    continue
-                res = {"over25": over_o, "under25": under_o, "company": company}
-                if first_valid is None:
-                    first_valid = res
-                if 'bet' in company.lower() and '365' in company:
-                    bet365 = res
-                    break
-            except (ValueError, IndexError):
-                continue
-        return bet365 or first_valid
-
+def fetch_nesine_odds(home_team, away_team):
+    """Nesine.com iddaa bulteninden Alt/Ust 2.5 ve KG oranlarini ceker.
+    Bulunamazsa None doner. Timeout 4s - worker oldurmez."""
     try:
-        log_info(f"=== ALT/UST ORAN CEKME: match_id={match_id} ===")
-
-        # ADIM 1: Data JS domainleri
-        for suffix in ["29", "26", "28", "25"]:
-            for pattern in [
-                f"https://data.nowgoal{suffix}.com/OddsData/overunder/{match_id}.js",
-                f"https://ou.nowgoal{suffix}.com/{match_id}.js",
-                f"https://overunder.nowgoal{suffix}.com/{match_id}.js",
-            ]:
-                try:
-                    hdr = dict(HEADERS)
-                    hdr['Referer'] = f"{base_url}/over-under-odds/{match_id}"
-                    r = requests.get(pattern, headers=hdr, timeout=8)
-                    if r.status_code == 200 and len(r.text) > 100:
-                        result = parse_ou_js(r.text)
-                        if result:
-                            log_info(f"ALT/UST bulundu ({result['company']}): U {result['over25']} / A {result['under25']}")
-                            return result
-                except Exception:
-                    continue
-
-        # ADIM 2: HTML sayfasindan JS URL bul
-        # Dogru format: /over-under-odds/{match_id}
-        page_urls = []
-        for suffix in ["26", "29", "28", "25"]:
-            for prefix in ["live4", "live3"]:
-                page_urls.append(f"https://{prefix}.nowgoal{suffix}.com/over-under-odds/{match_id}")
-
-        for ou_url in page_urls:
+        log_info(f"=== NESINE ORAN CEKME: {home_team} vs {away_team} ===")
+        hdr = {
+            "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36",
+            "Accept": "application/json, text/html, */*",
+            "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8",
+            "Referer": "https://www.nesine.com/iddaa",
+        }
+        bulten_urls = [
+            "https://bulten.nesine.com/w/program.json",
+            "https://www.nesine.com/iddaa/futbol/tum-maclar",
+        ]
+        for url in bulten_urls:
             try:
-                log_info(f"OU sayfa deneniyor: {ou_url}")
-                r = requests.get(ou_url, headers=HEADERS, timeout=10)
-                if r.status_code != 200 or len(r.text) < 200:
+                r = requests.get(url, headers=hdr, timeout=4)
+                if r.status_code != 200:
                     continue
-                html_ou = r.text
-
-                result = parse_ou_js(html_ou)
-                if result:
-                    log_info("ALT/UST (inline) bulundu")
-                    return result
-
-                srcs = re.findall(r'<script[^>]+src=["\'](.*?)["\'\\s]', html_ou, re.IGNORECASE)
-                for src in srcs:
-                    if match_id in src or 'overunder' in src.lower() or 'bigsmall' in src.lower():
-                        full = src.strip()
-                        if full.startswith('//'):
-                            full = 'https:' + full
-                        elif full.startswith('/'):
-                            full = base_url + full
-                        elif not full.startswith('http'):
-                            continue
-                        try:
-                            r2 = requests.get(full, headers=HEADERS, timeout=8)
-                            if r2.status_code == 200:
-                                result = parse_ou_js(r2.text)
-                                if result:
-                                    log_info(f"ALT/UST (JS) bulundu: {full}")
-                                    return result
-                        except Exception:
-                            continue
-                break
-            except Exception:
-                continue
-
-        log_info("ALT/UST oranlari bulunamadi")
+                text = r.text
+                if text.strip().startswith('{') or text.strip().startswith('['):
+                    try:
+                        import json as _json
+                        data = _json.loads(text)
+                        result = _search_nesine_json(data, home_team, away_team)
+                        if result:
+                            return result
+                    except Exception:
+                        pass
+                hk = norm_key(home_team)
+                ak = norm_key(away_team)
+                if hk in norm_key(text) or ak in norm_key(text):
+                    log_info("Nesine sayfasinda takim bulundu")
+                    result = _parse_nesine_html(text, home_team, away_team)
+                    if result:
+                        return result
+            except requests.exceptions.Timeout:
+                log_info(f"Nesine timeout: {url}")
+            except Exception as e:
+                log_info(f"Nesine hata: {e}")
+        log_info("Nesine oranlari bulunamadi - manuel giris kullanilacak")
         return None
     except Exception as e:
-        log_error(f"fetch_overunder_odds hata: {e}", e)
+        log_error(f"fetch_nesine_odds hata: {e}")
         return None
 
 
-def fetch_btts_odds(match_id, base_url):
-    """NowGoal BTTS (KG Var/Yok) oranlarini ceker."""
-    def parse_btts_js(text):
-        if not text or len(text) < 100:
-            return None
-        gm = re.search(r'var\s+game\s*=\s*Array\s*\((.*?)\)\s*;', text, re.DOTALL)
-        if not gm:
-            return None
-        entries = re.findall(r'"([^"]+)"', gm.group(1))
-        bet365 = None
-        first_valid = None
-        for entry in entries:
-            parts = entry.split('|')
-            if len(parts) < 5:
-                continue
-            company = parts[2].strip() if len(parts) > 2 else ''
-            try:
-                yes_o = float(parts[3])
-                no_o = float(parts[4])
-                if 1.01 < yes_o < 15.0 and 1.01 < no_o < 15.0:
-                    res = {"btts_yes": yes_o, "btts_no": no_o, "company": company}
-                    if first_valid is None:
-                        first_valid = res
-                    if 'bet' in company.lower() and '365' in company:
-                        bet365 = res
-                        break
-            except (ValueError, IndexError):
-                continue
-        return bet365 or first_valid
-
-    try:
-        log_info(f"=== KG ORAN CEKME: match_id={match_id} ===")
-        for suffix in ["29", "26", "28", "25"]:
-            for pattern in [
-                f"https://data.nowgoal{suffix}.com/OddsData/btts/{match_id}.js",
-                f"https://btts.nowgoal{suffix}.com/{match_id}.js",
-            ]:
-                try:
-                    r = requests.get(pattern, headers=HEADERS, timeout=8)
-                    if r.status_code == 200 and len(r.text) > 100:
-                        result = parse_btts_js(r.text)
-                        if result:
-                            log_info(f"KG bulundu ({result['company']}): Var {result['btts_yes']} / Yok {result['btts_no']}")
-                            return result
-                except Exception:
+def _search_nesine_json(data, home_team, away_team):
+    """Nesine JSON verisinde mac bul, oranlarini don."""
+    hk = norm_key(home_team)
+    ak = norm_key(away_team)
+    events = []
+    if isinstance(data, dict):
+        for key, val in data.items():
+            if isinstance(val, list):
+                events.extend(val)
+            elif isinstance(val, dict):
+                sub = _search_nesine_json(val, home_team, away_team)
+                if sub:
+                    return sub
+    elif isinstance(data, list):
+        events = data
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        ev_str = str(ev).lower()
+        if hk[:6] not in ev_str and ak[:6] not in ev_str:
+            continue
+        result = {}
+        for key in ['au', 'ou', 'overUnder', 'altUst', 'totalGoals']:
+            if key in ev and isinstance(ev[key], dict):
+                ov = ev[key].get('over') or ev[key].get('ust') or ev[key].get('o')
+                un = ev[key].get('under') or ev[key].get('alt') or ev[key].get('u')
+                if ov and un:
+                    try:
+                        result['over25'] = float(ov)
+                        result['under25'] = float(un)
+                        result['ou_company'] = 'Nesine'
+                    except (ValueError, TypeError):
+                        pass
+        for key in ['kg', 'btts', 'bothToScore', 'karpilikliGol']:
+            if key in ev and isinstance(ev[key], dict):
+                y = ev[key].get('yes') or ev[key].get('var') or ev[key].get('y')
+                n = ev[key].get('no') or ev[key].get('yok') or ev[key].get('n')
+                if y and n:
+                    try:
+                        result['btts_yes'] = float(y)
+                        result['btts_no'] = float(n)
+                        result['btts_company'] = 'Nesine'
+                    except (ValueError, TypeError):
+                        pass
+        markets = ev.get('markets') or ev.get('odds') or ev.get('oranlar') or []
+        if isinstance(markets, list):
+            for mkt in markets:
+                if not isinstance(mkt, dict):
                     continue
-        log_info("KG oranlari bulunamadi")
-        return None
-    except Exception as e:
-        log_error(f"fetch_btts_odds hata: {e}", e)
-        return None
+                mtype = str(mkt.get('type', '') or mkt.get('name', '') or mkt.get('tip', '')).lower()
+                outcomes = mkt.get('outcomes') or mkt.get('selections') or mkt.get('secenekler') or []
+                if not isinstance(outcomes, list) or len(outcomes) < 2:
+                    continue
+                try:
+                    if 'alt' in mtype or 'over' in mtype or 'total' in mtype:
+                        result['over25'] = float(outcomes[0].get('odds') or outcomes[0].get('oran', 0))
+                        result['under25'] = float(outcomes[1].get('odds') or outcomes[1].get('oran', 0))
+                        result['ou_company'] = 'Nesine'
+                    if 'kg' in mtype or 'btts' in mtype or 'karsi' in mtype:
+                        result['btts_yes'] = float(outcomes[0].get('odds') or outcomes[0].get('oran', 0))
+                        result['btts_no'] = float(outcomes[1].get('odds') or outcomes[1].get('oran', 0))
+                        result['btts_company'] = 'Nesine'
+                except (ValueError, TypeError, IndexError):
+                    pass
+        if result.get('over25') or result.get('btts_yes'):
+            log_info(f"Nesine JSON oran bulundu: {result}")
+            return result
+    return None
+
+
+def _parse_nesine_html(html, home_team, away_team):
+    """Nesine HTML sayfasindan oran cikarmaya calis."""
+    json_blobs = re.findall(r'(?:var\s+\w+\s*=\s*|data-config=["\']\s*)(\{.*?\}|\[.*?\])', html[:50000])
+    for blob in json_blobs:
+        try:
+            import json as _json
+            data = _json.loads(blob)
+            result = _search_nesine_json(data, home_team, away_team)
+            if result:
+                return result
+        except Exception:
+            continue
+    return None
 
 
 def calculate_extra_value_bets(model_probs, market_odds):
@@ -1444,15 +1418,12 @@ def calculate_extra_value_bets(model_probs, market_odds):
             return None, "N/A"
         v = (odds * prob) - 1
         return v, "TICK DEGER VAR" if v >= 0.05 else "CROSS"
-
     def _kelly(odds, prob):
         if not odds or not prob or odds <= 1:
             return 0.0
         k = ((odds - 1) * prob - (1 - prob)) / (odds - 1)
         return max(0.0, k * 0.25)
-
     results = {"ou": None, "btts": None, "best_bets": []}
-
     o25 = market_odds.get('over25')
     u25 = market_odds.get('under25')
     if o25 and u25:
@@ -1469,7 +1440,6 @@ def calculate_extra_value_bets(model_probs, market_odds):
             results['best_bets'].append(("2.5 UST", o25, o25_ev, _kelly(o25, o25_p)))
         if u25_ev and u25_ev >= 0.05:
             results['best_bets'].append(("2.5 ALT", u25, u25_ev, _kelly(u25, u25_p)))
-
     ky = market_odds.get('btts_yes')
     kn = market_odds.get('btts_no')
     if ky and kn:
@@ -1486,7 +1456,6 @@ def calculate_extra_value_bets(model_probs, market_odds):
             results['best_bets'].append(("KG VAR", ky, ky_ev, _kelly(ky, ky_p)))
         if kn_ev and kn_ev >= 0.05:
             results['best_bets'].append(("KG YOK", kn, kn_ev, _kelly(kn, kn_p)))
-
     results['best_bets'].sort(key=lambda x: x[2], reverse=True)
     return results
 
@@ -1515,41 +1484,30 @@ def analyze_nowgoal(url: str, manual_odds=None) -> Dict[str, Any]:
     st_count_a = 0
     if "Standings" in html: st_count_h = 10; st_count_a = 10 
     
-    # === ORAN CEKME (1X2 + ALT/UST + KG) ===
+    # === ORAN CEKME (1X2 NowGoal + Nesine ALT/UST KG) ===
     scraped_odds = fetch_real_odds(match_id, base_domain)
-
     if scraped_odds and scraped_odds != [1.0, 1.0, 1.0]:
         odds = scraped_odds
     elif isinstance(manual_odds, list) and len(manual_odds) >= 3:
         odds = manual_odds[:3]
-        log_info(f"Siteden cekilemedi, manuel 1X2 oran: {odds}")
+        log_info(f"Manuel 1X2 oran: {odds}")
     else:
         odds = [1.0, 1.0, 1.0]
-        log_info("1X2 oran bulunamadi, varsayilan [1.0, 1.0, 1.0]")
+        log_info("1X2 oran bulunamadi")
 
-    # Alt/Ust 2.5 + KG Var/Yok oranlari
+    # Nesine Alt/Ust + KG
     extra_market_odds = {}
-    ou_data = fetch_overunder_odds(match_id, base_domain)
-    if ou_data:
-        extra_market_odds['over25'] = ou_data['over25']
-        extra_market_odds['under25'] = ou_data['under25']
-        extra_market_odds['ou_company'] = ou_data.get('company', 'N/A')
-    btts_odds_data = fetch_btts_odds(match_id, base_domain)
-    if btts_odds_data:
-        extra_market_odds['btts_yes'] = btts_odds_data['btts_yes']
-        extra_market_odds['btts_no'] = btts_odds_data['btts_no']
-        extra_market_odds['btts_company'] = btts_odds_data.get('company', 'N/A')
-    # Manuel oran fallback
+    nesine_odds = fetch_nesine_odds(home_team, away_team)
+    if nesine_odds:
+        extra_market_odds.update(nesine_odds)
+    # Manuel fallback
     if isinstance(manual_odds, dict):
-        if not extra_market_odds.get('over25') and manual_odds.get('over25'):
-            extra_market_odds['over25'] = float(manual_odds['over25'])
-            extra_market_odds['under25'] = float(manual_odds.get('under25', 0))
-            extra_market_odds['ou_company'] = 'Manuel'
-        if not extra_market_odds.get('btts_yes') and manual_odds.get('btts_yes'):
-            extra_market_odds['btts_yes'] = float(manual_odds['btts_yes'])
-            extra_market_odds['btts_no'] = float(manual_odds.get('btts_no', 0))
-            extra_market_odds['btts_company'] = 'Manuel'
-    log_info(f"Extra market oranlari: {extra_market_odds}")
+        for mk in ['over25', 'under25', 'btts_yes', 'btts_no']:
+            if not extra_market_odds.get(mk) and manual_odds.get(mk):
+                extra_market_odds[mk] = float(manual_odds[mk])
+        if manual_odds.get('over25'): extra_market_odds['ou_company'] = 'Manuel'
+        if manual_odds.get('btts_yes'): extra_market_odds['btts_company'] = 'Manuel'
+    log_info(f"Extra oranlar: {extra_market_odds}")
 
     # 2. HESAPLAMALAR
     lam_home = calculate_weighted_pss_goals(prev_home_list, home_team, True)
@@ -1617,7 +1575,6 @@ def analyze_nowgoal(url: str, manual_odds=None) -> Dict[str, Any]:
     m_corn['away_o45'] = 1.0 - sum(a_corn_dist_trunc[:5])
     m_corn['away_o55'] = 1.0 - sum(a_corn_dist_trunc[:6])
     
-    # Extra Value Bet hesaplama
     extra_value_data = calculate_extra_value_bets(m_goals, extra_market_odds)
 
     # Simulations
@@ -1666,7 +1623,7 @@ def root():
     return jsonify({
         "ok": True,
         "service": "nowgoal-analyzer-ultimate",
-        "version": "7.0-with-ou-btts-value",
+        "version": "7.1-nesine-value",
         "status": "running"
     })
 
